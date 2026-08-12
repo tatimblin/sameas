@@ -45,9 +45,16 @@ pub struct KindSpec {
 
 /// The registry. Adding a key = adding one entry here + a normalizer.
 ///
-/// Anchor ranks (lower = stronger): wikidata(0) < placekey(1, reserved) <
-/// domain(2) < google_place_id(3) < yelp(4). Non-anchor kinds use `None`.
+/// Anchor ranks (lower = stronger): wikidata(0) < placekey(1) < domain(2) <
+/// google_place_id(3) < yelp(4). Non-anchor kinds use `None`.
 pub static KINDS: &[KindSpec] = &[
+    KindSpec {
+        tag: "placekey",
+        strong: true,
+        anchor_rank: Some(1),
+        normalize: normalize::placekey,
+        url_match: None, // Placekeys are not URL-shaped; no sameAs recognizer.
+    },
     KindSpec {
         tag: "domain",
         strong: true,
@@ -155,5 +162,14 @@ mod tests {
         assert!(spec.strong);
         assert_eq!(spec.anchor_rank, Some(4));
         assert!(spec.url_match.is_some());
+    }
+
+    #[test]
+    fn placekey_is_registered_in_reserved_slot() {
+        let spec = spec_for_tag("placekey").unwrap();
+        assert!(spec.strong);
+        // Rank 1: stronger than domain (2), weaker than wikidata (0).
+        assert_eq!(spec.anchor_rank, Some(1));
+        assert!(spec.url_match.is_none());
     }
 }

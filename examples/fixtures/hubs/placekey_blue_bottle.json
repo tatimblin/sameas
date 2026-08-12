@@ -1,0 +1,8 @@
+{
+  "method": "POST",
+  "url": "https://api.placekey.io/v1/placekey",
+  "response": {
+    "placekey": "227-223@5vg-7gq-tvz",
+    "query_id": "0"
+  }
+}

@@ -76,14 +76,34 @@ its documented output** — the showable result.
 **Objective:** Fill missing edges by reaching external identity hubs, so movies
 "just work" and places bootstrap without pre-seeding the graph.
 
-**Deliverables**
+**Deliverables** *(implemented)*
 - **Wikidata adapter** — `IMDb tt… / website → QID` via SPARQL; harvest P345,
-  P856, P1329, P4947 into the graph.
+  P856, P1329, P4947 into the graph. (`hubs/wikidata.rs`)
 - **TMDb Find-by-ID adapter** — crosswalk imdb_id ↔ tmdb_id ↔ wikidata_id.
+  (`hubs/tmdb.rs`)
 - **Google Place Details adapter** — `place_id → website, phone`.
-- **Reverse-resolvers** — `phone/domain → place_id` (text search) and
-  `address/name → Placekey`.
-- Confidence gradient + phone-as-corroborator gating in union logic.
+  (`hubs/places.rs`)
+- **Reverse-resolvers** — `name/address → Placekey` (`hubs/placekey.rs`, the
+  primary path for the name+city input) and `phone/domain → place_id`
+  (`hubs/places.rs`, `PlaceTextSearchResolver`). The name+address query resolves
+  to a **Placekey anchor** *and* a Google `place_id` (via text search) in one
+  record, so completion (website/phone via Place Details) fills in even from a
+  cold graph. Standalone `phone → place_id` merging is deferred to M3 (its
+  non-merge semantics need provisional entities).
+- **Confidence gradient** (`confidence.rs`) — a `0.0`–`1.0` score reflecting the
+  input→entity attachment (exact strong key ≈ 0.95; name+city ≈ 0.40; phone-only
+  ≈ 0.30). **Phone-as-corroborator gating** is structural (phone lives outside
+  the union-find); confidence labels it.
+- **Edge provenance** — a `source` column on `nodes`/`phone_edges` records where
+  each edge came from (`input`/`wikidata`/`tmdb`/`google_places`/…), surfaced in
+  `resolve`/`entity` output.
+
+**Delivery notes.** All hubs sit behind the [`Resolver`] trait and a
+`transport::HttpTransport` abstraction — `FixtureTransport` (offline, canned JSON
+under `examples/fixtures/hubs`) for CI + demo, `ReqwestTransport` behind the
+`live-fetch` feature for real HTTP. Completion is opt-in (`sameas resolve …
+--complete`), runs a bounded, idempotent BFS over the cluster, and is
+best-effort (an unavailable hub yields no completion, never an error).
 
 **Key components:** hub adapters behind the `Resolver` trait, SPARQL/HTTP
 clients, confidence scoring, edge provenance.

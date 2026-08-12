@@ -47,6 +47,12 @@ pub struct ResolveOutput {
     pub harvested: usize,
     /// New edges written to the graph by this resolution.
     pub new_edges: usize,
+    /// How well the input attaches to this entity, `0.0`–`1.0`. Reflects the
+    /// weakest link (the input→entity match), not cluster richness.
+    pub confidence: f32,
+    /// Per-member edge provenance: `(key, source)`, e.g.
+    /// `("wikidata:Q83495", Some("wikidata"))`.
+    pub provenance: Vec<(String, Option<String>)>,
 }
 
 /// Anything that can produce a record to resolve.
@@ -75,8 +81,20 @@ impl Resolver for DirectRecordResolver {
 /// Commit a harvested record into the graph and return the completed entity.
 ///
 /// This is the heart of "resolve = complete": whatever identifier came in, the
-/// returned `same_as` is the whole cluster from the local graph.
+/// returned `same_as` is the whole cluster from the local graph. Edges written
+/// here carry the provenance `"input"`; use [`commit_record_with_source`] to
+/// attribute edges to a specific hub.
 pub fn commit_record(graph: &Graph, record: &EntityRecord) -> Result<ResolveOutput> {
+    commit_record_with_source(graph, record, "input")
+}
+
+/// Like [`commit_record`], but tags every edge it writes with `source`
+/// (e.g. `"wikidata"`, `"google_places"`) for edge provenance.
+pub fn commit_record_with_source(
+    graph: &Graph,
+    record: &EntityRecord,
+    source: &str,
+) -> Result<ResolveOutput> {
     let strong_ids: Vec<&ExternalId> = record.strong_ids().collect();
     let phone_ids: Vec<&ExternalId> = record.phone_ids().collect();
     let harvested = record.same_as.len();
@@ -157,7 +175,7 @@ pub fn commit_record(graph: &Graph, record: &EntityRecord) -> Result<ResolveOutp
                 matched_via.push(id.kind_tag().to_string());
             }
             _ => {
-                graph.attach(&id.key(), &canonical_id)?;
+                graph.attach_with_source(&id.key(), &canonical_id, Some(source))?;
                 new_edges += 1;
             }
         }
@@ -170,7 +188,7 @@ pub fn commit_record(graph: &Graph, record: &EntityRecord) -> Result<ResolveOutp
         if already.iter().any(|c| c == &canonical_id) {
             matched_via.push("phone (corroborating)".into());
         } else {
-            graph.add_phone_edge(&id.key(), &canonical_id)?;
+            graph.add_phone_edge_with_source(&id.key(), &canonical_id, Some(source))?;
             new_edges += 1;
             if !already.is_empty() {
                 matched_via.push("phone (corroborating)".into());
@@ -200,6 +218,18 @@ pub fn commit_record(graph: &Graph, record: &EntityRecord) -> Result<ResolveOutp
 
     dedup(&mut matched_via);
 
+    // Confidence reflects the input→entity attachment strength (weakest link).
+    let confidence = if !strong_ids.is_empty() {
+        crate::confidence::EXACT_STRONG
+    } else if !phone_ids.is_empty() {
+        crate::confidence::PHONE_ONLY
+    } else if entity.anchor.starts_with("local:") {
+        crate::confidence::SYNTHETIC_ONLY
+    } else {
+        crate::confidence::NEW_PUBLIC_ANCHOR
+    };
+    let provenance = graph.member_sources(&canonical_id)?;
+
     Ok(ResolveOutput {
         canonical_id,
         anchor: entity.anchor,
@@ -210,6 +240,8 @@ pub fn commit_record(graph: &Graph, record: &EntityRecord) -> Result<ResolveOutp
         status,
         harvested,
         new_edges,
+        confidence,
+        provenance,
     })
 }
 
@@ -228,6 +260,7 @@ pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
         .get_entity(canonical_id)?
         .ok_or_else(|| anyhow!("no entity with canonical_id {canonical_id}"))?;
     let members = graph.members(canonical_id)?;
+    let provenance = graph.member_sources(canonical_id)?;
     Ok(ResolveOutput {
         canonical_id: entity.canonical_id,
         anchor: entity.anchor,
@@ -238,6 +271,9 @@ pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
         status: Status::Hit,
         harvested: 0,
         new_edges: 0,
+        // A direct canonical-id lookup: we were handed the identity.
+        confidence: crate::confidence::DIRECT_LOOKUP,
+        provenance,
     })
 }
 

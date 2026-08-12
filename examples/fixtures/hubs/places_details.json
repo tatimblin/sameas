@@ -1,0 +1,12 @@
+{
+  "method": "GET",
+  "url": "https://maps.googleapis.com/maps/api/place/details/json",
+  "response": {
+    "status": "OK",
+    "result": {
+      "name": "Blue Bottle Coffee",
+      "website": "https://bluebottlecoffee.com/",
+      "international_phone_number": "+1 510-653-3394"
+    }
+  }
+}

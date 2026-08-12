@@ -1,13 +1,15 @@
 //! `sameas` CLI — a thin front-end over `sameas-core`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use sameas_core::{
-    commit_record, load_entity, resolve_id, DirectRecordResolver, DomainResolver, EntityRecord,
-    ExternalId, Graph, Resolver, ResolveOutput, Status,
+    commit_record, complete_place_query, load_entity, resolve_and_complete, CompletionCtx,
+    DirectRecordResolver, DomainResolver, EntityRecord, ExternalId, FixtureTransport, Graph,
+    PlaceQuery, Resolver, ResolveOutput, Status,
 };
 
 #[derive(Parser)]
@@ -34,6 +36,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// `Resolve` carries the most flags, so it's the largest variant. The CLI parses
+// exactly one command per run, so the size difference is irrelevant here.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Resolve one identifier (or a record) to a canonical entity.
     Resolve(ResolveArgs),
@@ -54,7 +59,7 @@ enum Command {
     ArgGroup::new("source")
         .required(true)
         .multiple(false)
-        .args(["domain", "phone", "place_id", "imdb", "id", "input"])
+        .args(["domain", "phone", "place_id", "imdb", "id", "input", "name"])
 ))]
 struct ResolveArgs {
     #[arg(long)]
@@ -74,6 +79,23 @@ struct ResolveArgs {
     #[arg(long)]
     input: Option<PathBuf>,
 
+    /// Resolve a place by name (+ address/city). Reverse-resolves to a Placekey
+    /// anchor and a Google place_id; requires --complete.
+    #[arg(long)]
+    name: Option<String>,
+    /// Street address for --name (a full address yields a precise Placekey).
+    #[arg(long)]
+    address: Option<String>,
+    /// City for --name (a name+city query is coarse → low confidence).
+    #[arg(long)]
+    city: Option<String>,
+    /// Region/state for --name.
+    #[arg(long)]
+    region: Option<String>,
+    /// ISO country code for --name (e.g. `US`).
+    #[arg(long)]
+    country: Option<String>,
+
     /// Optional: harvest extra sameAs from a domain's page HTML fixture (offline
     /// enrichment). Without it, --domain is a plain graph key lookup.
     #[arg(long)]
@@ -83,6 +105,17 @@ struct ResolveArgs {
     /// (opt-in; requires building with `--features live-fetch`). Never implicit.
     #[arg(long)]
     fetch: bool,
+
+    /// Bootstrap missing edges from external hubs (Wikidata, TMDb, Google
+    /// Places, Placekey). Off by default — pure local-graph resolution.
+    #[arg(long)]
+    complete: bool,
+
+    /// Serve hub responses from a directory of canned JSON fixtures (offline,
+    /// deterministic). Without it, --complete goes live (needs --features
+    /// live-fetch + API-key env vars).
+    #[arg(long = "hub-fixtures")]
+    hub_fixtures: Option<PathBuf>,
 }
 
 fn main() {
@@ -116,24 +149,52 @@ fn run() -> Result<()> {
 }
 
 fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
+    // Name/address is a reverse-resolution path: it needs the hubs.
+    if let Some(name) = &args.name {
+        if !args.complete {
+            bail!("--name requires --complete (name/address is resolved via hub reverse-resolvers)");
+        }
+        let query = PlaceQuery {
+            name: Some(name.clone()),
+            street: args.address.clone(),
+            city: args.city.clone(),
+            region: args.region.clone(),
+            country: args.country.clone(),
+            entity_type: None,
+        };
+        let ctx = build_completion_ctx(args)?;
+        return complete_place_query(graph, &query, &ctx);
+    }
+
+    // Build an EntityRecord from whichever typed source was given.
+    let record = build_input_record(graph, args)?;
+
+    if args.complete {
+        let ctx = build_completion_ctx(args)?;
+        return resolve_and_complete(graph, &record, &ctx);
+    }
+    commit_record(graph, &record)
+}
+
+/// Build the input record for a non-name source. `--domain` without page
+/// harvesting is just a single domain key; everything else is a one-id record
+/// (or a harvested/loaded record).
+fn build_input_record(_graph: &Graph, args: &ResolveArgs) -> Result<EntityRecord> {
     if let Some(domain) = &args.domain {
-        // Page-harvesting is strictly opt-in. By default a domain is just a key.
         if args.fixture.is_some() || args.fetch {
             let resolver = build_domain_resolver(domain, args.fixture.as_deref(), args.fetch)?;
-            let record = resolver.harvest()?;
-            return commit_record(graph, &record);
+            return resolver.harvest();
         }
-        // Default: pure graph lookup / mint — no HTML, no network.
-        return resolve_id(graph, ExternalId::domain(domain)?);
+        return Ok(one_id(ExternalId::domain(domain)?));
     }
     if let Some(phone) = &args.phone {
-        return resolve_id(graph, ExternalId::phone(phone)?);
+        return Ok(one_id(ExternalId::phone(phone)?));
     }
     if let Some(place_id) = &args.place_id {
-        return resolve_id(graph, ExternalId::google_place_id(place_id)?);
+        return Ok(one_id(ExternalId::google_place_id(place_id)?));
     }
     if let Some(imdb) = &args.imdb {
-        return resolve_id(graph, ExternalId::imdb(imdb)?);
+        return Ok(one_id(ExternalId::imdb(imdb)?));
     }
     if let Some(id) = &args.id {
         // Generic path: KIND:VALUE, dispatched through the registry. No
@@ -141,13 +202,43 @@ fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
         let (tag, value) = id
             .split_once(':')
             .ok_or_else(|| anyhow!("--id must be KIND:VALUE, e.g. yelp:blue-bottle; got {id:?}"))?;
-        return resolve_id(graph, ExternalId::new(tag, value)?);
+        return Ok(one_id(ExternalId::new(tag, value)?));
     }
     if let Some(input) = &args.input {
-        let record = EntityRecord::from_path(input)?;
-        return commit_record(graph, &record);
+        return EntityRecord::from_path(input);
     }
     bail!("no resolve input provided");
+}
+
+fn one_id(id: ExternalId) -> EntityRecord {
+    EntityRecord {
+        same_as: vec![id],
+        ..Default::default()
+    }
+}
+
+/// Build the completion context: offline fixtures (`--hub-fixtures`) or live.
+fn build_completion_ctx(args: &ResolveArgs) -> Result<CompletionCtx> {
+    if let Some(dir) = &args.hub_fixtures {
+        let transport = FixtureTransport::from_dir(dir)?;
+        return Ok(CompletionCtx::new(Arc::new(transport)));
+    }
+    build_live_completion_ctx()
+}
+
+#[cfg(feature = "live-fetch")]
+fn build_live_completion_ctx() -> Result<CompletionCtx> {
+    let transport = sameas_core::transport::ReqwestTransport::new()?;
+    let mut ctx = CompletionCtx::new(Arc::new(transport));
+    ctx.tmdb_key = std::env::var("TMDB_API_KEY").unwrap_or_default();
+    ctx.google_key = std::env::var("GOOGLE_PLACES_API_KEY").unwrap_or_default();
+    ctx.placekey_key = std::env::var("PLACEKEY_API_KEY").unwrap_or_default();
+    Ok(ctx)
+}
+
+#[cfg(not(feature = "live-fetch"))]
+fn build_live_completion_ctx() -> Result<CompletionCtx> {
+    bail!("--complete without --hub-fixtures requires building with --features live-fetch");
 }
 
 #[cfg(feature = "live-fetch")]
@@ -218,6 +309,16 @@ fn print_output(out: &ResolveOutput, json: bool, action: &str) {
 
 fn to_json(out: &ResolveOutput, action: &str) -> String {
     let same_as: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+    let provenance: serde_json::Map<String, serde_json::Value> = out
+        .provenance
+        .iter()
+        .map(|(key, source)| {
+            (
+                key.clone(),
+                serde_json::Value::String(source.clone().unwrap_or_else(|| "unknown".into())),
+            )
+        })
+        .collect();
     let value = serde_json::json!({
         "action": action,
         "canonical_id": out.canonical_id,
@@ -225,8 +326,10 @@ fn to_json(out: &ResolveOutput, action: &str) -> String {
         "type": out.entity_type,
         "name": out.name,
         "status": out.status.as_str(),
+        "confidence": out.confidence,
         "matched_via": out.matched_via,
         "sameAs": same_as,
+        "provenance": provenance,
         "completion_count": same_as.len(),
         "harvested": out.harvested,
         "new_edges": out.new_edges,
@@ -253,6 +356,7 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
     if let Some(n) = &out.name {
         println!("  {:<12} {}", "name:", n);
     }
+    println!("  {:<12} {:.2}", "confidence:", out.confidence);
     println!("  {:<12} {}", "matched_via:", matched);
     println!(
         "  {:<12} {} identifiers",
@@ -267,7 +371,16 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
     }
     println!("  sameAs:");
     for id in &out.same_as {
-        println!("      - {}", id.key());
+        let key = id.key();
+        let source = out
+            .provenance
+            .iter()
+            .find(|(k, _)| k == &key)
+            .and_then(|(_, s)| s.as_deref());
+        match source {
+            Some(src) => println!("      - {key}  [{src}]"),
+            None => println!("      - {key}"),
+        }
     }
     println!();
 }

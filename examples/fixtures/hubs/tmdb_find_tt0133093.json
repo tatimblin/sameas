@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "url": "https://api.themoviedb.org/3/find/tt0133093",
+  "response": {
+    "movie_results": [
+      { "id": 603, "title": "The Matrix" }
+    ]
+  }
+}

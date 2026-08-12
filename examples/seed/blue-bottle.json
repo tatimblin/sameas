@@ -3,7 +3,7 @@
   "name": "Blue Bottle Coffee",
   "sameAs": [
     { "domain": "https://www.bluebottlecoffee.com" },
-    { "google_place_id": "ChIJN1t_tDeuEmsRUsoyG83frY4" },
+    { "google_place_id": "EXAMPLE_blue_bottle_oakland" },
     { "phone": "+1-510-653-3394" },
     { "wikidata": "https://www.wikidata.org/wiki/Q4926426" },
     { "yelp": "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco" }

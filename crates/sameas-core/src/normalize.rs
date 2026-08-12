@@ -102,8 +102,7 @@ pub fn tmdb(raw: &str) -> Result<String> {
     // Take the last all-digit path/token segment.
     let token = raw
         .split(['/', '-', '?', '#', '=', ' '])
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-        .last()
+        .rfind(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
         .ok_or_else(|| anyhow!("could not find a TMDb numeric id in {raw:?}"))?;
     Ok(token.to_string())
 }
@@ -137,6 +136,35 @@ pub fn yelp(raw: &str) -> Result<String> {
         bail!("could not find a Yelp biz slug in {raw:?}");
     }
     Ok(slug.to_string())
+}
+
+/// Placekey → canonical form. A Placekey is `What@Where` or `@Where`, where the
+/// segments are dash-joined base-32-ish tokens (e.g. `223-227@5vg-7gq-tvz` or
+/// `@5vg-7gq-tvz`). We validate the `@`-delimited shape and lowercase it; we do
+/// not call the Placekey API here.
+pub fn placekey(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("empty placekey");
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (what, wher) = lower
+        .split_once('@')
+        .ok_or_else(|| anyhow!("placekey must be What@Where or @Where, got {raw:?}"))?;
+    // Each part is a dash-joined run of non-empty alphanumeric segments. The
+    // What part may be empty (leading `@`); the Where part must be present.
+    let ok_part = |p: &str| {
+        !p.is_empty()
+            && p.split('-')
+                .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric()))
+    };
+    if !what.is_empty() && !ok_part(what) {
+        bail!("invalid placekey What part in {raw:?}");
+    }
+    if !ok_part(wher) {
+        bail!("invalid placekey Where part in {raw:?}");
+    }
+    Ok(lower)
 }
 
 /// Find a `prefix…`-shaped token in a raw string or URL (case-sensitive on the
@@ -223,5 +251,17 @@ mod tests {
         assert!(yelp("").is_err());
         // A Yelp URL that is not a /biz/ page has no derivable slug.
         assert!(yelp("https://www.yelp.com/search?find_desc=coffee").is_err());
+    }
+
+    #[test]
+    fn placekey_normalization() {
+        assert_eq!(placekey("223-227@5vg-7gq-tvz").unwrap(), "223-227@5vg-7gq-tvz");
+        assert_eq!(placekey("@5vg-7gq-tvz").unwrap(), "@5vg-7gq-tvz");
+        // Case-normalized.
+        assert_eq!(placekey("@5VG-7GQ-TVZ").unwrap(), "@5vg-7gq-tvz");
+        // Missing '@', empty Where, and empty input are rejected.
+        assert!(placekey("5vg-7gq-tvz").is_err());
+        assert!(placekey("223-227@").is_err());
+        assert!(placekey("").is_err());
     }
 }

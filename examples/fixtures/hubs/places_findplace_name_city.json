@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+  "response": {
+    "status": "OK",
+    "candidates": [
+      { "place_id": "EXAMPLE_blue_bottle_oakland" }
+    ]
+  }
+}

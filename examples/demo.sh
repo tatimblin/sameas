@@ -36,8 +36,11 @@ sameas resolve --phone "+1-510-653-3394"
 
 hr
 echo "STEP 3  A DIFFERENT partial input resolves to the SAME entity (stable identity)"
-echo "\$ sameas resolve --place-id 'ChIJN1t_tDeuEmsRUsoyG83frY4'"
-sameas resolve --place-id "ChIJN1t_tDeuEmsRUsoyG83frY4"
+# NOTE: the place_id here is an illustrative placeholder, not a real Google id.
+# Offline fixtures are matched by endpoint path, so the value is arbitrary; a
+# live run (--fetch) would use a real place_id from Google.
+echo "\$ sameas resolve --place-id 'EXAMPLE_blue_bottle_oakland'"
+sameas resolve --place-id "EXAMPLE_blue_bottle_oakland"
 
 hr
 echo "STEP 4  Domain resolver harvests sameAs from a page fixture and links it in"
@@ -51,7 +54,7 @@ sameas resolve --id yelp:blue-bottle-coffee-san-francisco
 
 hr
 echo "STEP 5  Show the completed cluster"
-RESTAURANT_ID="$(sameas --json resolve --place-id 'ChIJN1t_tDeuEmsRUsoyG83frY4' | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
+RESTAURANT_ID="$(sameas --json resolve --place-id 'EXAMPLE_blue_bottle_oakland' | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
 echo "\$ sameas entity $RESTAURANT_ID"
 sameas entity "$RESTAURANT_ID"
 
@@ -65,7 +68,7 @@ sameas resolve --imdb tt0133093
 hr
 echo "Identity stability check across steps 2-4b (phone / place_id / domain / yelp):"
 PHONE_ID="$(sameas --json resolve --phone '+1-510-653-3394'          | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
-PLACE_ID="$(sameas --json resolve --place-id 'ChIJN1t_tDeuEmsRUsoyG83frY4' | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
+PLACE_ID="$(sameas --json resolve --place-id 'EXAMPLE_blue_bottle_oakland' | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
 DOMAIN_ID="$(sameas --json resolve --domain bluebottlecoffee.com --fixture "$FIXTURES/blue-bottle.html" | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
 YELP_ID="$(sameas --json resolve --id yelp:blue-bottle-coffee-san-francisco | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "(.*)",?/\1/')"
 echo "  phone    -> $PHONE_ID"
@@ -80,4 +83,38 @@ else
 fi
 
 hr
-echo "Demo complete. Throwaway DB: $DB"
+echo "STEP 7  M2 — Hub bootstrapping: complete from external hubs, NO prior graph state"
+echo "        (offline: hub responses served from examples/fixtures/hubs)"
+DB2="${TMPDIR:-/tmp}/sameas-demo-hubs.db"
+rm -f "$DB2"
+HUBS="$ROOT/examples/fixtures/hubs"
+sameas2() { "$BIN" --db "$DB2" "$@"; }
+
+echo
+echo "\$ sameas resolve --imdb tt0133093 --complete --hub-fixtures examples/fixtures/hubs"
+sameas2 resolve --imdb tt0133093 --complete --hub-fixtures "$HUBS"
+echo "  ^ IMDb id alone -> Wikidata QID + TMDb + website, from an EMPTY graph."
+
+hr
+echo "STEP 7b place_id -> website + phone via Google Place Details"
+echo "\$ sameas resolve --place-id EXAMPLE_blue_bottle_oakland --complete --hub-fixtures examples/fixtures/hubs"
+sameas2 resolve --place-id EXAMPLE_blue_bottle_oakland --complete --hub-fixtures "$HUBS"
+
+hr
+echo "STEP 7c name + city -> Placekey anchor + place_id (reverse) then website + phone"
+echo "        (coarse input -> low confidence; identity is only as good as the match)"
+echo "\$ sameas resolve --name 'Blue Bottle Coffee' --city Oakland --region CA --country US --complete --hub-fixtures examples/fixtures/hubs"
+sameas2 resolve --name "Blue Bottle Coffee" --city Oakland --region CA --country US --complete --hub-fixtures "$HUBS"
+
+hr
+echo "Exit-criteria check: IMDb completes to a QID + TMDb from an empty graph:"
+IMDB_OUT="$(sameas2 --json resolve --imdb tt0133093 --complete --hub-fixtures "$HUBS")"
+if echo "$IMDB_OUT" | grep -q '"wikidata:Q83495"' && echo "$IMDB_OUT" | grep -q '"tmdb:603"'; then
+  echo "  RESULT: OK ✓ (imdb -> wikidata:Q83495 + tmdb:603 + website)"
+else
+  echo "  RESULT: FAIL ✗"
+  exit 1
+fi
+
+hr
+echo "Demo complete. Throwaway DBs: $DB , $DB2"

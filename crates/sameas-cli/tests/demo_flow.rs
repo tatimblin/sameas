@@ -71,6 +71,22 @@ fn fixture(name: &str) -> String {
         .into_owned()
 }
 
+fn hub_fixtures() -> String {
+    workspace_root()
+        .join("examples/fixtures/hubs")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn same_as_of(value: &serde_json::Value) -> Vec<String> {
+    value["sameAs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
 #[test]
 fn resolve_is_stable_and_completes() {
     let h = Harness::new();
@@ -83,7 +99,7 @@ fn resolve_is_stable_and_completes() {
     let place_id = h.canonical_id(&[
         "resolve",
         "--place-id",
-        "ChIJN1t_tDeuEmsRUsoyG83frY4",
+        "EXAMPLE_blue_bottle_oakland",
     ]);
     let domain_id = h.canonical_id(&[
         "resolve",
@@ -106,7 +122,7 @@ fn resolve_is_stable_and_completes() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()));
-    assert!(same_as.contains(&"google_place_id:ChIJN1t_tDeuEmsRUsoyG83frY4".to_string()));
+    assert!(same_as.contains(&"google_place_id:EXAMPLE_blue_bottle_oakland".to_string()));
     assert!(same_as.contains(&"phone:+15106533394".to_string()));
     assert!(same_as.contains(&"wikidata:Q4926426".to_string()));
     assert_eq!(value["anchor"].as_str().unwrap(), "wikidata:Q4926426");
@@ -119,7 +135,7 @@ fn resolve_by_generic_id_flag_hits_same_entity() {
 
     // The generic --id flag resolves a kind (yelp) that has no named CLI flag.
     let yelp_id = h.canonical_id(&["resolve", "--id", "yelp:blue-bottle-coffee-san-francisco"]);
-    let place_id = h.canonical_id(&["resolve", "--place-id", "ChIJN1t_tDeuEmsRUsoyG83frY4"]);
+    let place_id = h.canonical_id(&["resolve", "--place-id", "EXAMPLE_blue_bottle_oakland"]);
     assert_eq!(
         yelp_id, place_id,
         "--id yelp:... must resolve to the same entity as --place-id"
@@ -155,4 +171,74 @@ fn movie_completes_from_imdb() {
     assert!(same_as.contains(&"imdb:tt0133093".to_string()));
     assert!(same_as.contains(&"tmdb:603".to_string()));
     assert!(same_as.contains(&"wikidata:Q83495".to_string()));
+}
+
+// --- M2: hub bootstrapping (offline via examples/fixtures/hubs) -----------
+
+#[test]
+fn imdb_completes_from_hubs_with_empty_graph() {
+    // Exit criterion 1: an IMDb id resolves to a QID and completes to
+    // website + TMDb with NO prior graph state.
+    let h = Harness::new();
+    let fx = hub_fixtures();
+    let out = h.run(&[
+        "--json", "resolve", "--imdb", "tt0133093", "--complete", "--hub-fixtures", &fx,
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["anchor"].as_str().unwrap(), "wikidata:Q83495");
+    assert!(value["confidence"].as_f64().unwrap() >= 0.9);
+    let same_as = same_as_of(&value);
+    assert!(same_as.contains(&"wikidata:Q83495".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"tmdb:603".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"domain:warnerbros.com".to_string()), "{same_as:?}");
+}
+
+#[test]
+fn place_id_completes_website_and_phone_from_hubs() {
+    // Exit criterion 2: a place_id completes to website + phone.
+    let h = Harness::new();
+    let fx = hub_fixtures();
+    let out = h.run(&[
+        "--json", "resolve", "--place-id", "EXAMPLE_blue_bottle_oakland", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let same_as = same_as_of(&value);
+    assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"phone:+15106533394".to_string()), "{same_as:?}");
+    // The website's provenance is the hub.
+    assert_eq!(
+        value["provenance"]["domain:bluebottlecoffee.com"].as_str().unwrap(),
+        "google_places"
+    );
+}
+
+#[test]
+fn name_city_resolves_to_placekey_anchor_at_low_confidence() {
+    let h = Harness::new();
+    let fx = hub_fixtures();
+    let out = h.run(&[
+        "--json", "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region",
+        "CA", "--country", "US", "--complete", "--hub-fixtures", &fx,
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    // Placekey (rank 1) is the anchor; a name+city query is coarse → low confidence.
+    assert_eq!(value["anchor"].as_str().unwrap(), "placekey:227-223@5vg-7gq-tvz");
+    assert!((value["confidence"].as_f64().unwrap() - 0.40).abs() < 1e-3);
+    let same_as = same_as_of(&value);
+    assert!(same_as.contains(&"google_place_id:EXAMPLE_blue_bottle_oakland".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"phone:+15106533394".to_string()), "{same_as:?}");
+}
+
+#[test]
+fn name_without_complete_is_rejected() {
+    let h = Harness::new();
+    let output = std::process::Command::new(bin())
+        .arg("--db")
+        .arg(&h.db)
+        .args(["resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland"])
+        .output()
+        .expect("failed to run sameas");
+    assert!(!output.status.success(), "--name without --complete should fail");
 }

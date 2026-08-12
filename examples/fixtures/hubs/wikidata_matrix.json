@@ -1,0 +1,16 @@
+{
+  "method": "GET",
+  "url": "https://query.wikidata.org/sparql",
+  "response": {
+    "results": {
+      "bindings": [
+        {
+          "item":    { "type": "uri",    "value": "http://www.wikidata.org/entity/Q83495" },
+          "imdb":    { "type": "literal", "value": "tt0133093" },
+          "website": { "type": "literal", "value": "https://www.warnerbros.com/movies/matrix" },
+          "tmdb":    { "type": "literal", "value": "603" }
+        }
+      ]
+    }
+  }
+}
