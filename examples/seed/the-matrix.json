@@ -1,0 +1,9 @@
+{
+  "type": "Movie",
+  "name": "The Matrix",
+  "sameAs": [
+    { "imdb": "tt0133093" },
+    { "tmdb": "https://www.themoviedb.org/movie/603-the-matrix" },
+    { "wikidata": "https://www.wikidata.org/wiki/Q83495" }
+  ]
+}

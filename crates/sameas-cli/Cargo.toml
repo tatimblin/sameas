@@ -1,0 +1,24 @@
+[package]
+name = "sameas-cli"
+description = "sameas CLI: resolve a partial identifier into a canonical entity + completed sameAs set."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sameas"
+path = "src/main.rs"
+
+[dependencies]
+sameas-core = { path = "../sameas-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[features]
+live-fetch = ["sameas-core/live-fetch"]
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }
