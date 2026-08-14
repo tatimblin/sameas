@@ -197,22 +197,86 @@ pub fn resolve_and_complete(
 /// `Some(unresolved+candidates)` when several distinct entities match (ambiguous
 /// — reaching out wouldn't disambiguate what we already know is plural), or
 /// `None` on a miss (the caller may then reach out via [`resolve_name`]).
+///
+/// The rule is purely (name, qualifier-token-set) based and **type-agnostic** —
+/// street/city/region/country/`--qualifier`/year are all opaque normalized
+/// tokens (see [`NameQuery::establishing_qualifiers`]). Specificity is monotonic:
+/// a cached entity with establishing set S is a confident, unique hit ONLY for a
+/// query whose token set Q ⊇ S. A query that under-specifies (S ⊄ Q) is never
+/// answered by confidently returning that entity — conservative misses are
+/// acceptable (worst case a hub re-call); a wrong confident hit is not.
 pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<ResolveOutput>> {
     let name = query.match_name();
     if name.is_empty() {
         return Ok(None);
     }
-    let quals = query.qualifier_tokens();
-    let hits = graph.find_by_name(&name, &quals)?;
-    if hits.len() == 1 {
-        let mut out = load_entity(graph, &hits[0])?;
+    let quals = query.establishing_qualifiers();
+
+    // 1. Cardinality / negative memory: if a prior hub search proved (name, Q) is
+    //    ambiguous, answer from local memory (zero external) rather than re-calling
+    //    the hub or wrong-binding. Exact qualifier-set match only, so a coarse
+    //    ambiguity never masks a finer, resolvable query.
+    if let Some(stored) = graph.name_cardinality(&name, &quals)? {
+        let candidates: Vec<Candidate> = stored
+            .into_iter()
+            .map(|(canonical_id, anchor, name)| Candidate {
+                canonical_id,
+                anchor,
+                name,
+            })
+            .collect();
+        return Ok(Some(ambiguous_output(query, candidates)));
+    }
+
+    // 2. Gather same-name entities with their establishing sets S_i.
+    let entities = graph.name_entities(&name)?;
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    let qset: std::collections::HashSet<&str> = quals.iter().map(|s| s.as_str()).collect();
+
+    // Bare query (no qualifiers): name-only semantics — every same-name entity is
+    // a candidate (one → hit, several → ambiguous). This is what makes a bare
+    // `--name Nova` over two qualified "Nova" entities ambiguous, not a wrong pick.
+    let matched: Vec<String> = if quals.is_empty() {
+        entities.into_iter().map(|(cid, _)| cid).collect()
+    } else {
+        // SupersetMatches = { E_i : S_i ⊆ Q }. A bare-established entity (S_i = {})
+        // is a subset of any Q, so it still hits (empty ⊆ anything).
+        let superset: Vec<String> = entities
+            .iter()
+            .filter(|(_, s)| s.iter().all(|t| qset.contains(t.as_str())))
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        if !superset.is_empty() {
+            superset
+        } else {
+            // No entity is fully covered by Q, but if ≥2 same-name entities are
+            // each under-specified by Q while sharing ≥1 token with it (i.e. Q is
+            // a coarse query over several known specifics), surface them as
+            // candidates rather than missing (contract point 4).
+            let overlapping: Vec<String> = entities
+                .iter()
+                .filter(|(_, s)| s.iter().any(|t| qset.contains(t.as_str())))
+                .map(|(cid, _)| cid.clone())
+                .collect();
+            if overlapping.len() >= 2 {
+                overlapping
+            } else {
+                Vec::new()
+            }
+        }
+    };
+
+    if matched.len() == 1 {
+        let mut out = load_entity(graph, &matched[0])?;
         out.confidence_reason = ConfidenceReason::LocalNameMatch;
         out.confidence = score(&out.confidence_reason);
         return Ok(Some(out));
     }
-    if hits.len() > 1 {
+    if matched.len() > 1 {
         let mut candidates: Vec<Candidate> = Vec::new();
-        for cid in &hits {
+        for cid in &matched {
             if let Some(e) = graph.get_entity(cid)? {
                 candidates.push(Candidate {
                     canonical_id: e.canonical_id,
@@ -221,25 +285,30 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
                 });
             }
         }
-        let reason = ConfidenceReason::AmbiguousAmongN(candidates.len());
-        return Ok(Some(ResolveOutput {
-            canonical_id: None,
-            anchor: String::new(),
-            entity_type: query.entity_type.clone(),
-            name: query.name.clone(),
-            same_as: Vec::new(),
-            matched_via: Vec::new(),
-            status: Status::Unresolved,
-            harvested: 0,
-            new_edges: 0,
-            confidence: score(&reason),
-            confidence_reason: reason,
-            candidates,
-            provenance: Vec::new(),
-            hint: None,
-        }));
+        return Ok(Some(ambiguous_output(query, candidates)));
     }
     Ok(None)
+}
+
+/// Build an `Unresolved` + `AmbiguousAmongN` output carrying `candidates`.
+fn ambiguous_output(query: &NameQuery, candidates: Vec<Candidate>) -> ResolveOutput {
+    let reason = ConfidenceReason::AmbiguousAmongN(candidates.len());
+    ResolveOutput {
+        canonical_id: None,
+        anchor: String::new(),
+        entity_type: query.entity_type.clone(),
+        name: query.name.clone(),
+        same_as: Vec::new(),
+        matched_via: Vec::new(),
+        status: Status::Unresolved,
+        harvested: 0,
+        new_edges: 0,
+        confidence: score(&reason),
+        confidence_reason: reason,
+        candidates,
+        provenance: Vec::new(),
+        hint: None,
+    }
 }
 
 /// A structured "not found in the local graph" result — used when a name query
@@ -281,7 +350,7 @@ pub fn resolve_name(
         return Ok(out);
     }
     let name = query.match_name();
-    let quals = query.qualifier_tokens();
+    let quals = query.establishing_qualifiers();
 
     // Google place_id candidates via text search (best-effort). We look at
     // *all* candidates: more than one means the query is ambiguous.
@@ -330,23 +399,17 @@ pub fn resolve_name(
                 }),
             }
         }
-        let reason = ConfidenceReason::AmbiguousAmongN(candidates.len());
-        return Ok(ResolveOutput {
-            canonical_id: None,
-            anchor: String::new(),
-            entity_type: query.entity_type.clone(),
-            name: query.name.clone(),
-            same_as: Vec::new(),
-            matched_via: Vec::new(),
-            status: Status::Unresolved,
-            harvested: 0,
-            new_edges: 0,
-            confidence: score(&reason),
-            confidence_reason: reason,
-            candidates,
-            provenance: Vec::new(),
-            hint: None,
-        });
+        // Cardinality memory: record that (name, Q) is ambiguous, so a later
+        // identical coarse query is answered from local memory (zero external)
+        // instead of re-calling the hub or wrong-binding to one candidate.
+        if !name.is_empty() {
+            let triples: Vec<(String, String, Option<String>)> = candidates
+                .iter()
+                .map(|c| (c.canonical_id.clone(), c.anchor.clone(), c.name.clone()))
+                .collect();
+            graph.record_name_cardinality(&name, &quals, &triples)?;
+        }
+        return Ok(ambiguous_output(query, candidates));
     }
 
     // Unambiguous (exactly one place_id, or none + a Placekey). Build one record
@@ -489,17 +552,33 @@ impl NameQuery {
             .unwrap_or_default()
     }
 
-    /// Normalized qualifier tokens for the local name index: the free-form
-    /// `qualifiers` plus `city`/`region`/`country` when present. `street` is
-    /// excluded (too specific; it only feeds Placekey). Deduped, non-empty.
-    pub fn qualifier_tokens(&self) -> Vec<String> {
+    /// The FULL set of normalized qualifier tokens this query carries — the
+    /// generic union of `qualifiers ∪ city ∪ region ∪ country ∪ street`, each run
+    /// through `normalize::name_key`. Deduped, sorted, non-empty.
+    ///
+    /// This is the establishing set an entity is cached under, and the match key
+    /// a later query is tested against. Every facet — including the street — is
+    /// treated as an opaque token: the matcher is purely (name, token-set) based
+    /// and type-agnostic. The street is NOT special-cased here (it only plays a
+    /// distinct role in `has_street`, the Placekey gate). Folding it in is the fix
+    /// for the coarse-cache mis-bind: a name+street entity is no longer served to
+    /// a later name+city (no street) query, because its establishing set is not a
+    /// subset of the coarser query's tokens.
+    pub fn establishing_qualifiers(&self) -> Vec<String> {
         let mut toks: Vec<String> = self
             .qualifiers
             .iter()
             .map(|q| q.as_str())
-            .chain([self.city.as_deref(), self.region.as_deref(), self.country.as_deref()]
+            .chain(
+                [
+                    self.city.as_deref(),
+                    self.region.as_deref(),
+                    self.country.as_deref(),
+                    self.street.as_deref(),
+                ]
                 .into_iter()
-                .flatten())
+                .flatten(),
+            )
             .map(crate::normalize::name_key)
             .filter(|t| !t.is_empty())
             .collect();
@@ -996,5 +1075,186 @@ mod tests {
             .unwrap()
             .expect("boston hits");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_bos"));
+    }
+
+    #[test]
+    fn t1_identical_repeat_with_street_hits_locally_zero_external() {
+        // T1 (regression): name+street+city establishes E; the IDENTICAL repeat
+        // (same street) still hits locally with zero external calls — the cache
+        // value prop is preserved for a same-or-more-specific query.
+        let g = Graph::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Blue Bottle Coffee".into()),
+            street: Some("1 Ferry Building".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        let text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(query.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let details_url = PlaceDetailsResolver::new(
+            ExternalId::google_place_id("PID_FERRY").unwrap(),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("POST", "https://api.placekey.io/v1/placekey", json!({"placekey": "222-227@5vg-7gr-abc"})),
+            ("POST", &text_url, json!({"places": [{"id": "PID_FERRY"}]})),
+            ("GET", &details_url, json!({"websiteUri": "https://bluebottlecoffee.com/"})),
+        ]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let cid = first.canonical_id.clone().expect("establish E");
+
+        // Local-only (no transport at all) → proves zero external calls.
+        let second = resolve_name_local(&g, &query).unwrap().expect("cached local hit");
+        assert_eq!(second.canonical_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(second.confidence_reason, ConfidenceReason::LocalNameMatch);
+    }
+
+    #[test]
+    fn t2_local_name_street_entity_not_served_to_coarser_city_query() {
+        // THE FIX (local half): an entity established under {street, city} must NOT
+        // be confidently returned to a later name+city (no street) query — its
+        // establishing set is not a subset of the coarser query's tokens, so the
+        // lookup misses locally (deferring to a hub) rather than wrong-binding.
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_ferry", "google_place_id:FERRY", None, Some("Blue Bottle Coffee"))
+            .unwrap();
+        // Established with the full set (street folded in), as resolve_name now does.
+        g.index_name(
+            "blue bottle coffee",
+            &["1 ferry building".into(), "san francisco".into()],
+            "cx_ferry",
+            Some("t"),
+        )
+        .unwrap();
+
+        // Coarser query (no street) under-specifies the establishing set → miss.
+        let coarse = NameQuery {
+            name: Some("Blue Bottle Coffee".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        assert!(
+            resolve_name_local(&g, &coarse).unwrap().is_none(),
+            "a name+city query must not be confidently served a name+street entity"
+        );
+
+        // The same-or-more-specific query still hits (Q ⊇ S).
+        let specific = NameQuery {
+            name: Some("Blue Bottle Coffee".into()),
+            street: Some("1 Ferry Building".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        let hit = resolve_name_local(&g, &specific).unwrap().expect("specific hits");
+        assert_eq!(hit.canonical_id.as_deref(), Some("cx_ferry"));
+    }
+
+    #[test]
+    fn t5_coarse_query_over_multiple_known_specifics_returns_candidates() {
+        // T5: two specific entities under the SAME name+city but different streets.
+        // A coarse name+city query (no street) under-specifies both → returns BOTH
+        // as candidates locally, zero external (not a pick, not a miss).
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_a", "google_place_id:A", None, Some("Blue Bottle Coffee"))
+            .unwrap();
+        g.create_entity("cx_b", "google_place_id:B", None, Some("Blue Bottle Coffee"))
+            .unwrap();
+        g.index_name(
+            "blue bottle coffee",
+            &["100 a st".into(), "san francisco".into()],
+            "cx_a",
+            Some("t"),
+        )
+        .unwrap();
+        g.index_name(
+            "blue bottle coffee",
+            &["200 b st".into(), "san francisco".into()],
+            "cx_b",
+            Some("t"),
+        )
+        .unwrap();
+
+        let coarse = NameQuery {
+            name: Some("Blue Bottle Coffee".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        let out = resolve_name_local(&g, &coarse).unwrap().expect("ambiguous");
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        assert_eq!(out.candidates.len(), 2);
+    }
+
+    #[test]
+    fn t6_type_agnostic_qualifier_only_no_confident_pick() {
+        // T6: type-agnostic proof using ONLY --qualifier tokens (no street/city).
+        // "Nova" established under {2019} and under {2021}. A bare `--name Nova`
+        // must NOT confidently return one — the rule is generic, not geo.
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_2019", "wikidata:Q19", Some("Movie"), Some("Nova"))
+            .unwrap();
+        g.create_entity("cx_2021", "wikidata:Q21", Some("Movie"), Some("Nova"))
+            .unwrap();
+        g.index_name("nova", &["2019".into()], "cx_2019", Some("t")).unwrap();
+        g.index_name("nova", &["2021".into()], "cx_2021", Some("t")).unwrap();
+
+        let bare = NameQuery { name: Some("Nova".into()), ..Default::default() };
+        let out = resolve_name_local(&g, &bare).unwrap().expect("ambiguous, not a pick");
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.candidates.len(), 2);
+
+        // A disambiguating qualifier narrows to the one entity (same machinery).
+        let y2019 = NameQuery {
+            name: Some("Nova".into()),
+            qualifiers: vec!["2019".into()],
+            ..Default::default()
+        };
+        let hit = resolve_name_local(&g, &y2019).unwrap().expect("unique");
+        assert_eq!(hit.canonical_id.as_deref(), Some("cx_2019"));
+    }
+
+    #[test]
+    fn cardinality_memory_serves_repeat_ambiguous_query_locally() {
+        // T3 (unit): a name+city hub search that returns MULTIPLE records the
+        // ambiguity; a later IDENTICAL query is answered from local memory with
+        // zero external calls (no transport at all on the repeat).
+        let g = Graph::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Joe's Pizza".into()),
+            city: Some("New York".into()),
+            ..Default::default()
+        };
+        let text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(query.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("POST", "https://api.placekey.io/v1/placekey", json!({})),
+            (
+                "POST",
+                &text_url,
+                json!({"places": [{"id": "JOE_A"}, {"id": "JOE_B"}, {"id": "JOE_C"}]}),
+            ),
+        ]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let first = resolve_name(&g, &query, &ctx).unwrap();
+        assert_eq!(first.confidence_reason, ConfidenceReason::AmbiguousAmongN(3));
+        assert!(first.canonical_id.is_none());
+
+        // Local-only repeat (no transport) → ambiguous from memory, zero external.
+        let repeat = resolve_name_local(&g, &query).unwrap().expect("from memory");
+        assert_eq!(repeat.confidence_reason, ConfidenceReason::AmbiguousAmongN(3));
+        assert_eq!(repeat.candidates.len(), 3);
+        assert_eq!(repeat.harvested, 0);
+        assert_eq!(repeat.new_edges, 0);
     }
 }

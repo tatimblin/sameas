@@ -490,6 +490,149 @@ fn name_city_ambiguous_returns_candidates() {
     assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
 }
 
+// --- coarse-cache mis-bind fix: specificity-monotonic name index ----------
+
+#[test]
+fn name_street_establishes_then_coarse_city_query_does_not_wrong_bind() {
+    // THE FIX (T2): name+street+city pins ONE location (unique text-search
+    // result). A later name+city (no street) query, whose hub text-search now
+    // returns MULTIPLE Blue Bottles, must return `ambiguous_among_n` — it must
+    // NOT be confidently served the single specific location learned first.
+    let h = Harness::new();
+
+    // Fixtures dir #1: the specific query resolves to exactly ONE place.
+    let one = h.hub_dir(
+        "hubs_one",
+        &[
+            (
+                "findplace_one.json",
+                r#"{ "method": "POST",
+                     "url": "https://places.googleapis.com/v1/places:searchText",
+                     "response": { "places": [ {"id": "BLUE_FERRY"} ] } }"#,
+            ),
+            (
+                "placekey_hit.json",
+                r#"{ "method": "POST",
+                     "url": "https://api.placekey.io/v1/placekey",
+                     "response": { "placekey": "222-227@5vg-7gr-abc" } }"#,
+            ),
+            (
+                "details_ferry.json",
+                r#"{ "method": "GET",
+                     "url": "https://places.googleapis.com/v1/places/BLUE_FERRY",
+                     "response": { "displayName": {"text": "Blue Bottle Coffee"},
+                                   "websiteUri": "https://bluebottlecoffee.com/" } }"#,
+            ),
+        ],
+    );
+    let established = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--address", "1 Ferry Building", "--city",
+        "San Francisco", "--complete", "--hub-fixtures", &one,
+    ]);
+    let e_id = established["canonical_id"].as_str().expect("establish E").to_string();
+
+    // Fixtures dir #2: the coarse (name+city, no street) query returns MULTIPLE.
+    let many = h.hub_dir(
+        "hubs_many",
+        &[
+            (
+                "findplace_many.json",
+                r#"{ "method": "POST",
+                     "url": "https://places.googleapis.com/v1/places:searchText",
+                     "response": { "places": [ {"id": "BLUE_FERRY"}, {"id": "BLUE_MISSION"} ] } }"#,
+            ),
+            (
+                "placekey_miss.json",
+                r#"{ "method": "POST",
+                     "url": "https://api.placekey.io/v1/placekey",
+                     "response": {} }"#,
+            ),
+        ],
+    );
+    let coarse = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "San Francisco", "--complete",
+        "--hub-fixtures", &many,
+    ]);
+    assert_eq!(coarse["status"].as_str().unwrap(), "unresolved");
+    assert_eq!(coarse["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
+    assert!(coarse["canonical_id"].is_null(), "must NOT confidently bind to E: {coarse}");
+    assert_ne!(coarse["canonical_id"].as_str(), Some(e_id.as_str()));
+
+    // And a name+city query WITHOUT --complete (pure local) does not confidently
+    // return E either — it is ambiguous from memory now (recorded above).
+    let local = h.value(&["resolve", "--name", "Blue Bottle Coffee", "--city", "San Francisco"]);
+    assert!(local["canonical_id"].is_null(), "local must not wrong-bind: {local}");
+    assert_eq!(local["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
+}
+
+#[test]
+fn cardinality_memory_answers_repeat_coarse_query_with_zero_hub_calls() {
+    // T3: a name+city --complete query where the hub returns 3 → ambiguous AND
+    // recorded. A later IDENTICAL query (WITHOUT --complete, so NO hub fixtures at
+    // all → any hub call would error) is answered from local memory: ambiguous,
+    // harvested 0, no hub call.
+    let h = Harness::new();
+    let three = h.hub_dir(
+        "hubs_three",
+        &[
+            (
+                "findplace_three.json",
+                r#"{ "method": "POST",
+                     "url": "https://places.googleapis.com/v1/places:searchText",
+                     "response": { "places": [ {"id": "A"}, {"id": "B"}, {"id": "C"} ] } }"#,
+            ),
+            (
+                "placekey_miss.json",
+                r#"{ "method": "POST",
+                     "url": "https://api.placekey.io/v1/placekey",
+                     "response": {} }"#,
+            ),
+        ],
+    );
+    let first = h.value(&[
+        "resolve", "--name", "Joe's Pizza", "--city", "New York", "--complete",
+        "--hub-fixtures", &three,
+    ]);
+    assert_eq!(first["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
+    assert_eq!(first["candidates"].as_array().unwrap().len(), 3);
+
+    // Identical repeat, NO --complete and NO --hub-fixtures → zero network.
+    let repeat = h.value(&["resolve", "--name", "Joe's Pizza", "--city", "New York"]);
+    assert_eq!(repeat["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
+    assert_eq!(repeat["candidates"].as_array().unwrap().len(), 3);
+    assert_eq!(repeat["harvested"].as_u64().unwrap(), 0);
+    assert_eq!(repeat["new_edges"].as_u64().unwrap(), 0);
+
+    // A repeat WITH --complete but the SAME (would-error) fixtures also short-
+    // circuits from memory before any hub call.
+    let repeat_complete = h.value(&[
+        "resolve", "--name", "Joe's Pizza", "--city", "New York", "--complete",
+        "--hub-fixtures", &three,
+    ]);
+    assert_eq!(repeat_complete["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
+}
+
+#[test]
+fn name_city_unique_match_repeat_is_local_hit() {
+    // T4: name+city --complete where the hub returns exactly ONE → hit; the
+    // repeat name+city query resolves locally (zero external) to the same entity.
+    let h = Harness::new();
+    let fx = hub_fixtures();
+    let first = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "--country", "US", "--complete", "--hub-fixtures", &fx,
+    ]);
+    let id = first["canonical_id"].as_str().expect("unique hit").to_string();
+    assert_eq!(first["confidence_reason"].as_str().unwrap(), "place_unique_match");
+
+    let repeat = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "--country", "US",
+    ]);
+    assert_eq!(repeat["canonical_id"].as_str(), Some(id.as_str()));
+    assert_eq!(repeat["confidence_reason"].as_str().unwrap(), "local_name_match");
+}
+
 // --- M5: resilient directory ingest ---------------------------------------
 
 #[test]

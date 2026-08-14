@@ -21,6 +21,10 @@ pub struct Graph {
     conn: Connection,
 }
 
+/// A stored ambiguity candidate: `(canonical_id, anchor, name)`. `canonical_id`
+/// is usually empty (these are un-committed candidates surfaced by a hub search).
+pub type NameCandidate = (String, String, Option<String>);
+
 /// A stored entity row.
 #[derive(Clone, Debug)]
 pub struct EntityRow {
@@ -61,6 +65,12 @@ CREATE TABLE IF NOT EXISTS name_index (
     FOREIGN KEY(canonical_id) REFERENCES entities(canonical_id)
 );
 CREATE INDEX IF NOT EXISTS idx_name_index_name ON name_index(name_norm);
+CREATE TABLE IF NOT EXISTS name_cardinality (
+    name_norm     TEXT NOT NULL,
+    qualifier_set TEXT NOT NULL,
+    candidates    TEXT NOT NULL,
+    PRIMARY KEY (name_norm, qualifier_set)
+);
 "#;
 
 impl Graph {
@@ -411,6 +421,132 @@ impl Graph {
         Ok(rows)
     }
 
+    /// Every entity indexed under `name_norm`, paired with the non-empty
+    /// qualifier tokens it was established under (the union of all facets ever
+    /// indexed for it — its "establishing set"). The always-present `""` bare
+    /// row is excluded. Used by the specificity-monotonic local matcher: an
+    /// entity is a confident hit only for a query whose token set is a superset
+    /// of its establishing set. Sorted by canonical id (tokens sorted) for
+    /// determinism.
+    pub fn name_entities(&self, name_norm: &str) -> Result<Vec<(String, Vec<String>)>> {
+        if name_norm.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT canonical_id, qualifier FROM name_index WHERE name_norm = ?1")?;
+        let rows = stmt
+            .query_map(params![name_norm], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        use std::collections::BTreeMap;
+        let mut by_cid: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (cid, qual) in rows {
+            let entry = by_cid.entry(cid).or_default();
+            if !qual.is_empty() && !entry.contains(&qual) {
+                entry.push(qual);
+            }
+        }
+        Ok(by_cid
+            .into_iter()
+            .map(|(cid, mut quals)| {
+                quals.sort();
+                (cid, quals)
+            })
+            .collect())
+    }
+
+    // --- cardinality / negative memory ----------------------------------
+    //
+    // What a hub text-search revealed about the uniqueness of (name, Q). When a
+    // search returned MULTIPLE candidates we persist that (name, normalized-Q) is
+    // ambiguous, so a later identical coarse query is answered from local memory
+    // (zero external calls) instead of re-calling the hub or wrong-binding.
+    //
+    // Candidates are stored as opaque `(canonical_id, anchor, name)` triples
+    // (canonical_id is usually empty — these are un-committed candidates), keyed
+    // by (name, qualifier-set). `merge_into` intentionally does NOT touch this
+    // table: rows key on the query text, not a canonical id, so a merge leaves
+    // them harmlessly (a stale canonical_id inside a candidate blob would at worst
+    // be re-verified on the next completion).
+
+    /// A stable, canonical serialization of a normalized qualifier set for use as
+    /// a table key. Callers pass an already-normalized, sorted, deduped set
+    /// (`NameQuery::establishing_qualifiers`); we join with `\n` (never a token
+    /// char) so distinct sets never collide.
+    fn qualifier_set_key(qualifiers: &[String]) -> String {
+        qualifiers.join("\n")
+    }
+
+    /// Record that (name, Q) is ambiguous among `candidates` (hub returned >1).
+    pub fn record_name_cardinality(
+        &self,
+        name_norm: &str,
+        qualifiers: &[String],
+        candidates: &[NameCandidate],
+    ) -> Result<()> {
+        if name_norm.is_empty() {
+            return Ok(());
+        }
+        let blob = serde_json::to_string(
+            &candidates
+                .iter()
+                .map(|(cid, anchor, name)| serde_json::json!({
+                    "canonical_id": cid,
+                    "anchor": anchor,
+                    "name": name,
+                }))
+                .collect::<Vec<_>>(),
+        )?;
+        self.conn.execute(
+            "INSERT INTO name_cardinality(name_norm, qualifier_set, candidates)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(name_norm, qualifier_set) DO UPDATE SET candidates = excluded.candidates",
+            params![name_norm, Self::qualifier_set_key(qualifiers), blob],
+        )?;
+        Ok(())
+    }
+
+    /// The stored ambiguous candidate list for (name, Q), if any — an EXACT
+    /// qualifier-set match (specificity-preserving: a coarse ambiguity never
+    /// answers a finer query).
+    pub fn name_cardinality(
+        &self,
+        name_norm: &str,
+        qualifiers: &[String],
+    ) -> Result<Option<Vec<NameCandidate>>> {
+        if name_norm.is_empty() {
+            return Ok(None);
+        }
+        let blob: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT candidates FROM name_cardinality WHERE name_norm = ?1 AND qualifier_set = ?2",
+                params![name_norm, Self::qualifier_set_key(qualifiers)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let blob = match blob {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&blob)?;
+        Ok(Some(
+            parsed
+                .into_iter()
+                .map(|v| {
+                    (
+                        v.get("canonical_id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                        v.get("anchor").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                        v.get("name").and_then(|x| x.as_str()).map(|s| s.to_string()),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
     // --- union ----------------------------------------------------------
 
     /// Merge `loser` into `winner`: re-point all strong nodes and phone edges,
@@ -586,6 +722,47 @@ mod tests {
             g.find_by_name("cafe x", &["oakland".into()]).unwrap(),
             vec!["cx_sea".to_string()]
         );
+    }
+
+    #[test]
+    fn name_entities_reports_establishing_sets() {
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_a", "google_place_id:A", None, Some("X")).unwrap();
+        g.create_entity("cx_b", "google_place_id:B", None, Some("X")).unwrap();
+        g.index_name("x", &["100 a st".into(), "sf".into()], "cx_a", Some("t")).unwrap();
+        g.index_name("x", &["sf".into()], "cx_b", Some("t")).unwrap();
+
+        let ents = g.name_entities("x").unwrap();
+        // Sorted by canonical id; the always-present "" bare row is excluded.
+        assert_eq!(ents[0].0, "cx_a");
+        assert_eq!(ents[0].1, vec!["100 a st".to_string(), "sf".to_string()]);
+        assert_eq!(ents[1].0, "cx_b");
+        assert_eq!(ents[1].1, vec!["sf".to_string()]);
+        assert!(g.name_entities("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cardinality_memory_roundtrips_and_is_specificity_exact() {
+        let g = Graph::open_in_memory().unwrap();
+        let cands = vec![
+            (String::new(), "google_place_id:A".into(), None),
+            (String::new(), "google_place_id:B".into(), Some("Joe's".into())),
+        ];
+        g.record_name_cardinality("joe's pizza", &["new york".into()], &cands)
+            .unwrap();
+
+        let got = g.name_cardinality("joe's pizza", &["new york".into()]).unwrap().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].1, "google_place_id:B");
+        assert_eq!(got[1].2.as_deref(), Some("Joe's"));
+
+        // A DIFFERENT (finer/coarser) qualifier set does not match — the coarse
+        // ambiguity never answers a more-specific query.
+        assert!(g
+            .name_cardinality("joe's pizza", &["brooklyn".into(), "new york".into()])
+            .unwrap()
+            .is_none());
+        assert!(g.name_cardinality("joe's pizza", &[]).unwrap().is_none());
     }
 
     #[test]
