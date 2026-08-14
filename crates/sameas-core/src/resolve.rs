@@ -72,6 +72,9 @@ pub struct ResolveOutput {
     pub confidence_reason: ConfidenceReason,
     /// When unresolved/ambiguous, the distinct entities the input could match.
     pub candidates: Vec<Candidate>,
+    /// Optional human-readable guidance (e.g. what to do on a local name miss).
+    /// Distinct from `matched_via`, which is strictly identifier-kind tags.
+    pub hint: Option<String>,
     /// Per-member edge provenance: `(key, source)`, e.g.
     /// `("wikidata:Q83495", Some("wikidata"))`.
     pub provenance: Vec<(String, Option<String>)>,
@@ -190,6 +193,7 @@ pub fn commit_record_with_source(
             confidence_reason: reason,
             candidates,
             provenance: Vec::new(),
+            hint: None,
         });
     }
 
@@ -357,6 +361,7 @@ pub fn commit_record_with_source(
         confidence_reason: reason,
         candidates: Vec::new(),
         provenance,
+        hint: None,
     })
 }
 
@@ -422,6 +427,7 @@ pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
         confidence_reason: ConfidenceReason::DirectLookup,
         candidates: Vec::new(),
         provenance,
+        hint: None,
     })
 }
 

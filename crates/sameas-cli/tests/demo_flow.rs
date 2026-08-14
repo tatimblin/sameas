@@ -46,6 +46,31 @@ impl Harness {
         String::from_utf8(output.stdout).unwrap()
     }
 
+    /// Run without asserting success; return (success, stdout, stderr).
+    fn run_raw(&self, args: &[&str]) -> (bool, String, String) {
+        let output = Command::new(bin())
+            .arg("--db")
+            .arg(&self.db)
+            .args(args)
+            .output()
+            .expect("failed to run sameas");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// Create a subdir with the given `(filename, content)` files; returns its path.
+    fn make_dir(&self, dirname: &str, files: &[(&str, &str)]) -> String {
+        let dir = self._dir.path().join(dirname);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        dir.to_string_lossy().into_owned()
+    }
+
     fn canonical_id(&self, args: &[&str]) -> String {
         self.value(args)["canonical_id"]
             .as_str()
@@ -291,6 +316,14 @@ fn name_local_only_miss_is_unresolved() {
     assert_eq!(v["status"].as_str().unwrap(), "unresolved");
     assert!(v["canonical_id"].is_null());
     assert_eq!(v["confidence_reason"].as_str().unwrap(), "needs_stronger_identifier");
+    // M9: `matched_via` is strictly identifier-kind tags — empty on a miss. The
+    // human guidance lives in the dedicated `hint` field, not polluting matched_via.
+    assert!(v["matched_via"].as_array().unwrap().is_empty(), "matched_via={:?}", v["matched_via"]);
+    assert!(
+        v["hint"].as_str().unwrap_or_default().contains("--complete"),
+        "expected a --complete hint, got {:?}",
+        v["hint"]
+    );
 }
 
 #[test]
@@ -455,4 +488,106 @@ fn name_city_ambiguous_returns_candidates() {
     assert_eq!(v["status"].as_str().unwrap(), "unresolved");
     assert_eq!(v["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
     assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
+}
+
+// --- M5: resilient directory ingest ---------------------------------------
+
+#[test]
+fn dir_ingest_continues_past_a_bad_file_and_reports_it() {
+    // A directory with one valid record and one malformed one: the good record
+    // must still be committed (batch not aborted), the failure reported, and the
+    // process exits non-zero (never a silent half-done batch).
+    let h = Harness::new();
+    let dir = h.make_dir(
+        "batch",
+        &[
+            (
+                "good.json",
+                r#"{ "type": "LocalBusiness", "name": "Good Cafe",
+                     "sameAs": [ {"google_place_id": "GOOD_PLACE"} ] }"#,
+            ),
+            ("bad.json", r#"{ not valid json "#),
+        ],
+    );
+
+    let (ok, stdout, stderr) = h.run_raw(&["ingest", &dir]);
+    assert!(!ok, "exit should be non-zero when a file fails");
+    assert!(
+        stdout.contains("ingested 1, skipped/failed 1"),
+        "summary missing, stdout={stdout}"
+    );
+    assert!(stderr.contains("bad.json"), "failure not listed, stderr={stderr}");
+
+    // The good record was committed despite the bad file — resolving it hits.
+    let v = h.value(&["resolve", "--place-id", "GOOD_PLACE"]);
+    assert_eq!(v["status"].as_str().unwrap(), "hit");
+    assert!(v["canonical_id"].as_str().is_some());
+}
+
+#[test]
+fn dir_ingest_skips_subdirectory_named_dot_json() {
+    // A subdirectory literally named `x.json` must be skipped (not treated as a
+    // record file, which used to error the whole batch).
+    let h = Harness::new();
+    let dir = h.make_dir(
+        "batch2",
+        &[(
+            "good.json",
+            r#"{ "type": "LocalBusiness", "name": "Cafe",
+                 "sameAs": [ {"google_place_id": "P2"} ] }"#,
+        )],
+    );
+    std::fs::create_dir_all(std::path::Path::new(&dir).join("nested.json")).unwrap();
+
+    let (ok, stdout, _stderr) = h.run_raw(&["ingest", &dir]);
+    assert!(ok, "a subdir named *.json must be skipped, not fail the batch");
+    assert!(stdout.contains("ingested 1"), "stdout={stdout}");
+}
+
+#[test]
+fn empty_dir_ingest_reports_zero_records() {
+    // An empty directory (no *.json) prints explicit feedback, not silent success.
+    let h = Harness::new();
+    let dir = h.make_dir("empty", &[]);
+    let (ok, stdout, _stderr) = h.run_raw(&["ingest", &dir]);
+    assert!(ok, "empty dir is not an error");
+    assert!(stdout.contains("0 records ingested"), "stdout={stdout}");
+}
+
+#[test]
+fn single_bad_file_ingest_errors_loudly() {
+    // A single file passed directly still errors loudly (exit non-zero), naming it.
+    let h = Harness::new();
+    let bad = h.write_file("solo_bad.json", r#"{ nope "#);
+    let (ok, _stdout, stderr) = h.run_raw(&["ingest", &bad]);
+    assert!(!ok, "a single malformed file must error");
+    assert!(stderr.contains("solo_bad.json"), "stderr={stderr}");
+}
+
+// --- M10 + lows: input guards ---------------------------------------------
+
+#[test]
+fn geo_args_with_typed_source_are_rejected() {
+    // Geo/qualifier args apply only to --name. Combining them with a typed source
+    // (here --imdb) is rejected up-front rather than silently ignored.
+    let h = Harness::new();
+    let (ok, _stdout, stderr) = h.run_raw(&["resolve", "--imdb", "tt0133093", "--city", "Oakland"]);
+    assert!(!ok, "geo args with a typed source must be rejected");
+    assert!(
+        stderr.contains("--name") || stderr.contains("name"),
+        "error should reference --name, stderr={stderr}"
+    );
+
+    // The legitimate --name + geo path is unaffected (local miss, but accepted).
+    let v = h.value(&["resolve", "--name", "Somewhere", "--city", "Oakland"]);
+    assert_eq!(v["status"].as_str().unwrap(), "unresolved");
+}
+
+#[test]
+fn empty_name_is_rejected() {
+    // Parity with typed sources: a whitespace-only --name is rejected clearly.
+    let h = Harness::new();
+    let (ok, _stdout, stderr) = h.run_raw(&["resolve", "--name", "   "]);
+    assert!(!ok, "empty --name must be rejected");
+    assert!(stderr.contains("empty"), "stderr={stderr}");
 }

@@ -236,6 +236,7 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
             confidence_reason: reason,
             candidates,
             provenance: Vec::new(),
+            hint: None,
         }));
     }
     Ok(None)
@@ -252,9 +253,7 @@ pub fn name_not_found(query: &NameQuery) -> ResolveOutput {
         entity_type: query.entity_type.clone(),
         name: query.name.clone(),
         same_as: Vec::new(),
-        matched_via: vec![
-            "not in local graph — re-run with --complete to reach external hubs".into(),
-        ],
+        matched_via: Vec::new(),
         status: Status::Unresolved,
         harvested: 0,
         new_edges: 0,
@@ -262,6 +261,9 @@ pub fn name_not_found(query: &NameQuery) -> ResolveOutput {
         confidence_reason: reason,
         candidates: Vec::new(),
         provenance: Vec::new(),
+        hint: Some(
+            "not in local graph — re-run with --complete to reach external hubs".into(),
+        ),
     }
 }
 
@@ -343,6 +345,7 @@ pub fn resolve_name(
             confidence_reason: reason,
             candidates,
             provenance: Vec::new(),
+            hint: None,
         });
     }
 

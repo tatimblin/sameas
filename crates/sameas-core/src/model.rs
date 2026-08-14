@@ -143,7 +143,7 @@ impl EntityRecord {
     pub fn from_path(path: &Path) -> Result<EntityRecord> {
         let s = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        Self::from_json_str(&s)
+        Self::from_json_str(&s).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
     }
 
     /// Strong identifiers only (everything except phone).

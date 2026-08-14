@@ -85,6 +85,7 @@ struct ResolveArgs {
     #[arg(long)]
     name: Option<String>,
     /// Street address for --name (a full address yields a precise Placekey).
+    /// Applies ONLY to --name; combining it with a typed source is rejected.
     #[arg(long)]
     address: Option<String>,
     /// City for --name (a name+city query is coarse → low confidence).
@@ -145,18 +146,47 @@ fn run() -> Result<()> {
             print_output(&out, cli.json, "entity");
         }
         Command::Ingest { path } => {
-            let outs = do_ingest(&graph, path)?;
-            for out in &outs {
-                print_output(out, cli.json, "ingest");
-            }
+            do_ingest(&graph, path, cli.json)?;
         }
     }
     Ok(())
 }
 
 fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
+    // Geo/qualifier facets apply ONLY to the --name reverse-resolution path.
+    // Combined with a typed source they would be silently ignored, so reject.
+    if args.name.is_none() {
+        let mut offenders: Vec<&str> = Vec::new();
+        if args.address.is_some() {
+            offenders.push("--address");
+        }
+        if args.city.is_some() {
+            offenders.push("--city");
+        }
+        if args.region.is_some() {
+            offenders.push("--region");
+        }
+        if args.country.is_some() {
+            offenders.push("--country");
+        }
+        if !args.qualifiers.is_empty() {
+            offenders.push("--qualifier");
+        }
+        if !offenders.is_empty() {
+            bail!(
+                "{} appl{} only to --name; combine with --name or drop {}",
+                offenders.join(", "),
+                if offenders.len() == 1 { "ies" } else { "y" },
+                if offenders.len() == 1 { "it" } else { "them" }
+            );
+        }
+    }
+
     // Name/address is a reverse-resolution path: it needs the hubs.
     if let Some(name) = &args.name {
+        if name.trim().is_empty() {
+            bail!("--name must not be empty");
+        }
         let query = NameQuery {
             name: Some(name.clone()),
             qualifiers: args.qualifiers.clone(),
@@ -279,30 +309,78 @@ fn build_domain_resolver(
     bail!("no fixture or --fetch given for --domain harvest");
 }
 
-fn do_ingest(graph: &Graph, path: &Path) -> Result<Vec<ResolveOutput>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                files.push(p);
-            }
-        }
-        files.sort();
-    } else {
-        files.push(path.to_path_buf());
+/// Ingest one record file into the graph and return the resolution output.
+fn ingest_one(graph: &Graph, file: &Path) -> Result<ResolveOutput> {
+    let record = EntityRecord::from_path(file)
+        .with_context(|| format!("ingesting {}", file.display()))?;
+    let resolver = DirectRecordResolver::new(record);
+    let record = resolver.harvest()?;
+    commit_record(graph, &record)
+}
+
+/// Ingest a single file or a directory of `*.json` records.
+///
+/// A single file passed directly errors loudly (any parse/commit failure aborts
+/// with a non-zero exit). A directory is processed **resiliently and atomically
+/// per file**: subdirectories and non-`.json` entries are skipped, each file is
+/// committed independently, and a failing file is recorded and the batch
+/// continues rather than aborting mid-way. A summary is always printed; if any
+/// file failed, the failures are listed and the process exits non-zero (but the
+/// good records are already committed — never a silent half-done batch).
+fn do_ingest(graph: &Graph, path: &Path, json: bool) -> Result<()> {
+    if !path.is_dir() {
+        // Single file: error loudly on any failure (unchanged behavior).
+        let out = ingest_one(graph, path)?;
+        print_output(&out, json, "ingest");
+        return Ok(());
     }
 
-    let mut outs = Vec::new();
-    for file in files {
-        let record = EntityRecord::from_path(&file)
-            .with_context(|| format!("ingesting {}", file.display()))?;
-        let resolver = DirectRecordResolver::new(record);
-        let record = resolver.harvest()?;
-        outs.push(commit_record(graph, &record)?);
+    // Directory: only *.json *files* (a subdir literally named `x.json` is not a
+    // record and must be skipped, not treated as a file).
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("json") {
+            files.push(p);
+        }
     }
-    Ok(outs)
+    files.sort();
+
+    if files.is_empty() {
+        println!("0 records ingested from {}", path.display());
+        return Ok(());
+    }
+
+    let mut ingested = 0usize;
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
+    for file in &files {
+        match ingest_one(graph, file) {
+            Ok(out) => {
+                print_output(&out, json, "ingest");
+                ingested += 1;
+            }
+            Err(err) => failures.push((file.clone(), format!("{err:#}"))),
+        }
+    }
+
+    println!(
+        "ingested {}, skipped/failed {} (from {})",
+        ingested,
+        failures.len(),
+        path.display()
+    );
+    for (file, err) in &failures {
+        eprintln!("  failed: {} — {}", file.display(), err);
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} of {} file(s) failed to ingest",
+            failures.len(),
+            files.len()
+        );
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
@@ -315,6 +393,11 @@ fn print_output(out: &ResolveOutput, json: bool, action: &str) {
     } else {
         print_pretty(out, action);
     }
+}
+
+/// Round a confidence to 2 decimals for display (f32 → clean f64).
+fn round2(v: f32) -> f64 {
+    ((v as f64) * 100.0).round() / 100.0
 }
 
 fn to_json(out: &ResolveOutput, action: &str) -> String {
@@ -347,9 +430,12 @@ fn to_json(out: &ResolveOutput, action: &str) -> String {
         "type": out.entity_type,
         "name": out.name,
         "status": out.status.as_str(),
-        "confidence": out.confidence,
+        // Round the raw f32 to 2 decimals for stable, human-friendly JSON
+        // (the core struct keeps full precision).
+        "confidence": round2(out.confidence),
         "confidence_reason": reason_tag(&out.confidence_reason),
         "matched_via": out.matched_via,
+        "hint": out.hint,
         "sameAs": same_as,
         "provenance": provenance,
         "candidates": candidates,
@@ -390,6 +476,9 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
         reason_tag(&out.confidence_reason)
     );
     println!("  {:<12} {}", "matched_via:", matched);
+    if let Some(hint) = &out.hint {
+        println!("  {:<12} {}", "hint:", hint);
+    }
     println!(
         "  {:<12} {} identifiers",
         "completion:",
