@@ -633,6 +633,68 @@ fn name_city_unique_match_repeat_is_local_hit() {
     assert_eq!(repeat["confidence_reason"].as_str().unwrap(), "local_name_match");
 }
 
+#[test]
+fn name_city_hub_confirmed_unique_coarse_repeat_hits_locally() {
+    // Kibatsu unique flow (the core new behavior): a single-location entity is
+    // first established WITH a street. A later coarse name+city query (no street)
+    // can't be served from the street-established entity (superset rule), so it
+    // misses locally. WITH --complete the hub returns exactly ONE → it resolves
+    // AND records the coarse (name, city) as unique. The coarse query repeated
+    // LOCAL-ONLY then HITS from that memory (zero external calls).
+    let h = Harness::new();
+    let fx = h.hub_dir(
+        "hubs_kibatsu",
+        &[
+            (
+                "placekey.json",
+                r#"{ "method": "POST",
+                     "url": "https://api.placekey.io/v1/placekey",
+                     "response": {} }"#,
+            ),
+            (
+                "searchtext_one.json",
+                r#"{ "method": "POST",
+                     "url": "https://places.googleapis.com/v1/places:searchText",
+                     "response": { "places": [ {"id": "KIBATSU_MAIN"} ] } }"#,
+            ),
+            (
+                "details.json",
+                r#"{ "method": "GET",
+                     "url": "https://places.googleapis.com/v1/places/KIBATSU_MAIN",
+                     "response": { "displayName": {"text": "Kibatsu"},
+                                   "websiteUri": "https://kibatsu.example/" } }"#,
+            ),
+        ],
+    );
+
+    // Step 1: name + street + city, --complete → mint cx (indexed WITH the street).
+    let step1 = h.value(&[
+        "resolve", "--name", "Kibatsu", "--address", "500 Main St", "--city",
+        "San Francisco", "--complete", "--hub-fixtures", &fx,
+    ]);
+    let cid = step1["canonical_id"].as_str().expect("step 1 resolves").to_string();
+
+    // Step 2: coarse city-only query, LOCAL ONLY → miss (uniqueness never confirmed).
+    let step2 = h.value(&["resolve", "--name", "Kibatsu", "--city", "San Francisco"]);
+    assert_eq!(step2["status"].as_str().unwrap(), "unresolved");
+    assert!(step2["canonical_id"].is_null(), "step 2 must miss: {step2}");
+
+    // Step 3: coarse city-only query WITH --complete, hub returns ONE → hits cx and
+    // records the coarse (name, city) unique.
+    let step3 = h.value(&[
+        "resolve", "--name", "Kibatsu", "--city", "San Francisco", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    assert_eq!(step3["canonical_id"].as_str(), Some(cid.as_str()));
+
+    // Step 4: coarse city-only query, LOCAL ONLY repeat → HITS from memory
+    // (local_name_match, harvested 0), zero external calls.
+    let step4 = h.value(&["resolve", "--name", "Kibatsu", "--city", "San Francisco"]);
+    assert_eq!(step4["canonical_id"].as_str(), Some(cid.as_str()));
+    assert_eq!(step4["confidence_reason"].as_str().unwrap(), "local_name_match");
+    assert_eq!(step4["harvested"].as_u64().unwrap(), 0);
+}
+
 // --- M5: resilient directory ingest ---------------------------------------
 
 #[test]

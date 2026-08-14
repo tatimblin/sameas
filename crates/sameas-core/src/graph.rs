@@ -25,6 +25,16 @@ pub struct Graph {
 /// is usually empty (these are un-committed candidates surfaced by a hub search).
 pub type NameCandidate = (String, String, Option<String>);
 
+/// What a hub text-search revealed about the uniqueness of a `(name, Q)` query,
+/// as remembered locally. `Unique` carries the resolved `canonical_id` (so a
+/// later coarse repeat can hit locally with zero external calls); `Ambiguous`
+/// carries the candidate list surfaced when the hub returned more than one.
+#[derive(Clone, Debug)]
+pub enum NameCardinality {
+    Unique(String),
+    Ambiguous(Vec<NameCandidate>),
+}
+
 /// A stored entity row.
 #[derive(Clone, Debug)]
 pub struct EntityRow {
@@ -69,6 +79,8 @@ CREATE TABLE IF NOT EXISTS name_cardinality (
     name_norm     TEXT NOT NULL,
     qualifier_set TEXT NOT NULL,
     candidates    TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'ambiguous',
+    canonical_id  TEXT,
     PRIMARY KEY (name_norm, qualifier_set)
 );
 "#;
@@ -98,6 +110,18 @@ impl Graph {
             if !Self::has_column(conn, table, "source")? {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN source TEXT;"))?;
             }
+        }
+        // A pre-existing (M2-early) `name_cardinality` recorded only the ambiguous
+        // case, with no uniqueness column. Add `status` (defaulting existing rows
+        // to 'ambiguous', which is all they ever were) and a nullable
+        // `canonical_id` (populated only for 'unique' rows).
+        if !Self::has_column(conn, "name_cardinality", "status")? {
+            conn.execute_batch(
+                "ALTER TABLE name_cardinality ADD COLUMN status TEXT NOT NULL DEFAULT 'ambiguous';",
+            )?;
+        }
+        if !Self::has_column(conn, "name_cardinality", "canonical_id")? {
+            conn.execute_batch("ALTER TABLE name_cardinality ADD COLUMN canonical_id TEXT;")?;
         }
         Ok(())
     }
@@ -460,17 +484,25 @@ impl Graph {
 
     // --- cardinality / negative memory ----------------------------------
     //
-    // What a hub text-search revealed about the uniqueness of (name, Q). When a
-    // search returned MULTIPLE candidates we persist that (name, normalized-Q) is
-    // ambiguous, so a later identical coarse query is answered from local memory
-    // (zero external calls) instead of re-calling the hub or wrong-binding.
+    // What a hub text-search revealed about the uniqueness of (name, Q):
+    //   * MULTIPLE candidates → the query is ambiguous; we persist the candidate
+    //     list so a later identical coarse query is answered from local memory
+    //     (zero external calls) instead of re-calling the hub or wrong-binding.
+    //   * EXACTLY ONE result that resolved → the query is unique; we persist the
+    //     resolved canonical_id so a later coarse repeat that under-specifies the
+    //     entity's establishing set (and so misses the superset scan) still hits
+    //     locally instead of re-calling the hub every time.
     //
-    // Candidates are stored as opaque `(canonical_id, anchor, name)` triples
-    // (canonical_id is usually empty — these are un-committed candidates), keyed
-    // by (name, qualifier-set). `merge_into` intentionally does NOT touch this
-    // table: rows key on the query text, not a canonical id, so a merge leaves
-    // them harmlessly (a stale canonical_id inside a candidate blob would at worst
-    // be re-verified on the next completion).
+    // Both key on (name, qualifier-set) via INSERT OR REPLACE semantics, so the
+    // newest hub truth wins: a later MULTIPLE overwrites a unique row with an
+    // ambiguous one, and a later single overwrites an ambiguous row with a unique
+    // one.
+    //
+    // Ambiguous candidates are stored as opaque `(canonical_id, anchor, name)`
+    // triples (canonical_id is usually empty — un-committed candidates). Unique
+    // rows carry a real `canonical_id`; `merge_into` re-points those to the union
+    // winner, and reads validate the id still resolves (a merged/deleted id is
+    // treated as a miss).
 
     /// A stable, canonical serialization of a normalized qualifier set for use as
     /// a table key. Callers pass an already-normalized, sorted, deduped set
@@ -481,6 +513,8 @@ impl Graph {
     }
 
     /// Record that (name, Q) is ambiguous among `candidates` (hub returned >1).
+    /// Overwrites any prior row for (name, Q) — including a stale `unique` row —
+    /// clearing its `canonical_id`, so the newest hub truth wins.
     pub fn record_name_cardinality(
         &self,
         name_norm: &str,
@@ -501,39 +535,86 @@ impl Graph {
                 .collect::<Vec<_>>(),
         )?;
         self.conn.execute(
-            "INSERT INTO name_cardinality(name_norm, qualifier_set, candidates)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(name_norm, qualifier_set) DO UPDATE SET candidates = excluded.candidates",
+            "INSERT INTO name_cardinality(name_norm, qualifier_set, candidates, status, canonical_id)
+             VALUES (?1, ?2, ?3, 'ambiguous', NULL)
+             ON CONFLICT(name_norm, qualifier_set) DO UPDATE SET
+                 candidates = excluded.candidates,
+                 status = excluded.status,
+                 canonical_id = excluded.canonical_id",
             params![name_norm, Self::qualifier_set_key(qualifiers), blob],
         )?;
         Ok(())
     }
 
-    /// The stored ambiguous candidate list for (name, Q), if any — an EXACT
-    /// qualifier-set match (specificity-preserving: a coarse ambiguity never
-    /// answers a finer query).
+    /// Record that (name, Q) resolved UNIQUELY to `canonical_id` (hub returned
+    /// exactly one). Overwrites any prior row for (name, Q) — including a stale
+    /// `ambiguous` row — so the newest hub truth wins.
+    pub fn record_name_unique(
+        &self,
+        name_norm: &str,
+        qualifiers: &[String],
+        canonical_id: &str,
+    ) -> Result<()> {
+        if name_norm.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO name_cardinality(name_norm, qualifier_set, candidates, status, canonical_id)
+             VALUES (?1, ?2, '[]', 'unique', ?3)
+             ON CONFLICT(name_norm, qualifier_set) DO UPDATE SET
+                 candidates = excluded.candidates,
+                 status = excluded.status,
+                 canonical_id = excluded.canonical_id",
+            params![name_norm, Self::qualifier_set_key(qualifiers), canonical_id],
+        )?;
+        Ok(())
+    }
+
+    /// The stored cardinality for (name, Q), if any — an EXACT qualifier-set
+    /// match (specificity-preserving: a coarse fact never answers a finer query).
+    /// A `unique` row whose `canonical_id` no longer resolves to a live entity is
+    /// treated as a miss (returns `None`), so a merged/deleted id is never served.
     pub fn name_cardinality(
         &self,
         name_norm: &str,
         qualifiers: &[String],
-    ) -> Result<Option<Vec<NameCandidate>>> {
+    ) -> Result<Option<NameCardinality>> {
         if name_norm.is_empty() {
             return Ok(None);
         }
-        let blob: Option<String> = self
+        let row: Option<(String, Option<String>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT candidates FROM name_cardinality WHERE name_norm = ?1 AND qualifier_set = ?2",
+                "SELECT candidates, status, canonical_id \
+                 FROM name_cardinality WHERE name_norm = ?1 AND qualifier_set = ?2",
                 params![name_norm, Self::qualifier_set_key(qualifiers)],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let blob = match blob {
-            Some(b) => b,
+        let (blob, status, canonical_id) = match row {
+            Some(r) => r,
             None => return Ok(None),
         };
+        // A NULL status is a legacy (M2-early) row — those were only ever
+        // ambiguous.
+        if status.as_deref() == Some("unique") {
+            return Ok(match canonical_id {
+                Some(cid) if !cid.is_empty() && self.get_entity(&cid)?.is_some() => {
+                    Some(NameCardinality::Unique(cid))
+                }
+                // Malformed unique (no id) or a stale id pointing at a
+                // merged/deleted entity → treat as a miss, not a dead hit.
+                _ => None,
+            });
+        }
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&blob)?;
-        Ok(Some(
+        Ok(Some(NameCardinality::Ambiguous(
             parsed
                 .into_iter()
                 .map(|v| {
@@ -544,7 +625,7 @@ impl Graph {
                     )
                 })
                 .collect(),
-        ))
+        )))
     }
 
     // --- union ----------------------------------------------------------
@@ -578,6 +659,12 @@ impl Graph {
         self.conn.execute(
             "DELETE FROM name_index WHERE canonical_id = ?1",
             params![loser],
+        )?;
+        // Re-point unique cardinality rows that named the loser (ambiguous rows
+        // carry a NULL canonical_id, so this only touches unique memory).
+        self.conn.execute(
+            "UPDATE name_cardinality SET canonical_id = ?1 WHERE canonical_id = ?2",
+            params![winner, loser],
         )?;
         self.conn.execute(
             "DELETE FROM entities WHERE canonical_id = ?1",
@@ -751,7 +838,10 @@ mod tests {
         g.record_name_cardinality("joe's pizza", &["new york".into()], &cands)
             .unwrap();
 
-        let got = g.name_cardinality("joe's pizza", &["new york".into()]).unwrap().unwrap();
+        let got = match g.name_cardinality("joe's pizza", &["new york".into()]).unwrap().unwrap() {
+            NameCardinality::Ambiguous(c) => c,
+            other => panic!("expected ambiguous, got {other:?}"),
+        };
         assert_eq!(got.len(), 2);
         assert_eq!(got[1].1, "google_place_id:B");
         assert_eq!(got[1].2.as_deref(), Some("Joe's"));
@@ -763,6 +853,112 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(g.name_cardinality("joe's pizza", &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn unique_cardinality_roundtrips_and_validates_liveness() {
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_one", "google_place_id:ONE", None, Some("Kibatsu"))
+            .unwrap();
+        g.record_name_unique("kibatsu", &["san francisco".into()], "cx_one")
+            .unwrap();
+
+        match g.name_cardinality("kibatsu", &["san francisco".into()]).unwrap().unwrap() {
+            NameCardinality::Unique(cid) => assert_eq!(cid, "cx_one"),
+            other => panic!("expected unique, got {other:?}"),
+        }
+
+        // Exact qualifier-set match only.
+        assert!(g.name_cardinality("kibatsu", &[]).unwrap().is_none());
+
+        // A unique row whose id no longer resolves (deleted entity) is a miss,
+        // never a dead hit.
+        g.conn
+            .execute("DELETE FROM entities WHERE canonical_id = 'cx_one'", [])
+            .unwrap();
+        assert!(g.name_cardinality("kibatsu", &["san francisco".into()]).unwrap().is_none());
+    }
+
+    #[test]
+    fn cardinality_flips_between_unique_and_ambiguous() {
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_one", "google_place_id:ONE", None, Some("Nova"))
+            .unwrap();
+        // First: unique.
+        g.record_name_unique("nova", &["berlin".into()], "cx_one").unwrap();
+        assert!(matches!(
+            g.name_cardinality("nova", &["berlin".into()]).unwrap().unwrap(),
+            NameCardinality::Unique(_)
+        ));
+        // Later hub call says MULTIPLE → flips to ambiguous, clearing the id.
+        let cands = vec![
+            (String::new(), "google_place_id:X".into(), None),
+            (String::new(), "google_place_id:Y".into(), None),
+        ];
+        g.record_name_cardinality("nova", &["berlin".into()], &cands).unwrap();
+        match g.name_cardinality("nova", &["berlin".into()]).unwrap().unwrap() {
+            NameCardinality::Ambiguous(c) => assert_eq!(c.len(), 2),
+            other => panic!("expected ambiguous after flip, got {other:?}"),
+        }
+        // And back to unique again (newest truth wins).
+        g.record_name_unique("nova", &["berlin".into()], "cx_one").unwrap();
+        assert!(matches!(
+            g.name_cardinality("nova", &["berlin".into()]).unwrap().unwrap(),
+            NameCardinality::Unique(_)
+        ));
+    }
+
+    #[test]
+    fn merge_repoints_unique_cardinality_to_winner() {
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_loser", "google_place_id:L", None, Some("Kibatsu"))
+            .unwrap();
+        g.create_entity("cx_winner", "wikidata:Q1", None, Some("Kibatsu"))
+            .unwrap();
+        g.attach("google_place_id:L", "cx_loser").unwrap();
+        g.attach("wikidata:Q1", "cx_winner").unwrap();
+        g.record_name_unique("kibatsu", &["san francisco".into()], "cx_loser")
+            .unwrap();
+
+        g.merge_into("cx_winner", "cx_loser").unwrap();
+
+        // The unique row now names the winner and still resolves.
+        match g.name_cardinality("kibatsu", &["san francisco".into()]).unwrap().unwrap() {
+            NameCardinality::Unique(cid) => assert_eq!(cid, "cx_winner"),
+            other => panic!("expected unique pointing at winner, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migrates_old_name_cardinality_without_status_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old_card.db");
+        let path = path.to_str().unwrap();
+        // Simulate an M2-early DB: name_cardinality with only the 3 original
+        // columns (no status / canonical_id) and one recorded ambiguous row.
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE name_cardinality (name_norm TEXT NOT NULL, qualifier_set TEXT NOT NULL, candidates TEXT NOT NULL, PRIMARY KEY (name_norm, qualifier_set));
+                 INSERT INTO name_cardinality(name_norm, qualifier_set, candidates)
+                   VALUES ('joe''s pizza', 'new york', '[{\"canonical_id\":\"\",\"anchor\":\"google_place_id:A\",\"name\":null},{\"canonical_id\":\"\",\"anchor\":\"google_place_id:B\",\"name\":null}]');",
+            )
+            .unwrap();
+        }
+        // Opening through Graph::open migrates in status + canonical_id and the
+        // pre-existing row reads back as ambiguous (its historical meaning).
+        let g = Graph::open(path).unwrap();
+        match g.name_cardinality("joe's pizza", &["new york".into()]).unwrap().unwrap() {
+            NameCardinality::Ambiguous(c) => assert_eq!(c.len(), 2),
+            other => panic!("legacy row must read as ambiguous, got {other:?}"),
+        }
+        // And a fresh unique write works against the migrated table.
+        g.create_entity("cx_u", "google_place_id:U", None, Some("Solo")).unwrap();
+        g.record_name_unique("solo", &["reno".into()], "cx_u").unwrap();
+        assert!(matches!(
+            g.name_cardinality("solo", &["reno".into()]).unwrap().unwrap(),
+            NameCardinality::Unique(_)
+        ));
     }
 
     #[test]

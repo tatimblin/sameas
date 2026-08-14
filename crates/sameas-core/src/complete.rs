@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::confidence::{score, ConfidenceReason};
-use crate::graph::Graph;
+use crate::graph::{Graph, NameCardinality};
 use crate::hubs::{
     PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput, TmdbResolver, WikidataResolver,
 };
@@ -212,27 +212,38 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
     }
     let quals = query.establishing_qualifiers();
 
-    // 1. Cardinality / negative memory: if a prior hub search proved (name, Q) is
-    //    ambiguous, answer from local memory (zero external) rather than re-calling
-    //    the hub or wrong-binding. Exact qualifier-set match only, so a coarse
-    //    ambiguity never masks a finer, resolvable query.
-    if let Some(stored) = graph.name_cardinality(&name, &quals)? {
-        let candidates: Vec<Candidate> = stored
-            .into_iter()
-            .map(|(canonical_id, anchor, name)| Candidate {
-                canonical_id,
-                anchor,
-                name,
-            })
-            .collect();
-        return Ok(Some(ambiguous_output(query, candidates)));
+    // 1. Cardinality memory: what a prior hub search proved about (name, Q).
+    //    Exact qualifier-set match only, so a coarse fact never masks a finer,
+    //    resolvable query.
+    //      * Ambiguous is definitive — return it now (zero external) rather than
+    //        re-calling the hub or wrong-binding to one candidate.
+    //      * Unique is held as a fallback: it must win over a graph MISS (a coarse
+    //        repeat of a hub-confirmed single-location entity), but must NOT
+    //        override a genuine multi-entity ambiguity the graph itself reveals.
+    //        So we consult the establishing-set scan first and only fall back to
+    //        the unique fact when that scan misses.
+    let mut unique_fallback: Option<String> = None;
+    match graph.name_cardinality(&name, &quals)? {
+        Some(NameCardinality::Ambiguous(stored)) => {
+            let candidates: Vec<Candidate> = stored
+                .into_iter()
+                .map(|(canonical_id, anchor, name)| Candidate {
+                    canonical_id,
+                    anchor,
+                    name,
+                })
+                .collect();
+            return Ok(Some(ambiguous_output(query, candidates)));
+        }
+        // The stored id was already validated live by `name_cardinality` (a
+        // merged/deleted id reads back as `None`).
+        Some(NameCardinality::Unique(cid)) => unique_fallback = Some(cid),
+        None => {}
     }
 
-    // 2. Gather same-name entities with their establishing sets S_i.
+    // 2. Gather same-name entities with their establishing sets S_i. (An empty
+    //    set here is a graph miss — the unique fallback below still applies.)
     let entities = graph.name_entities(&name)?;
-    if entities.is_empty() {
-        return Ok(None);
-    }
     let qset: std::collections::HashSet<&str> = quals.iter().map(|s| s.as_str()).collect();
 
     // Bare query (no qualifiers): name-only semantics — every same-name entity is
@@ -286,6 +297,16 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
             }
         }
         return Ok(Some(ambiguous_output(query, candidates)));
+    }
+
+    // 3. Graph miss. A hub-confirmed unique memory hit wins over a miss: a coarse
+    //    repeat of a genuinely single-location entity resolves locally (zero
+    //    external) instead of re-calling the hub every time.
+    if let Some(cid) = unique_fallback {
+        let mut out = load_entity(graph, &cid)?;
+        out.confidence_reason = ConfidenceReason::LocalNameMatch;
+        out.confidence = score(&out.confidence_reason);
+        return Ok(Some(out));
     }
     Ok(None)
 }
@@ -502,6 +523,18 @@ pub fn resolve_name(
             if !alias.is_empty() && alias != name {
                 graph.index_name(&alias, &quals, &cid, Some("name_query"))?;
             }
+        }
+        // Record the UNIQUE side of the cardinality memory: the hub text-search
+        // returned exactly one place AND it resolved. A later coarse repeat of
+        // this (name, Q) — which under-specifies the entity's establishing set and
+        // so misses the superset scan — then hits locally instead of re-calling
+        // the hub. INSERT OR REPLACE on (name, Q): if a later hub call for the
+        // same (name, Q) returns MULTIPLE, it overwrites this with an ambiguous
+        // row (and vice-versa). Keyed identically to the ambiguous side (same
+        // `name`, same `quals`) so lookups line up. Type-agnostic — Q is any
+        // qualifier set.
+        if unique_place && !name.is_empty() {
+            graph.record_name_unique(&name, &quals, &cid)?;
         }
     }
     Ok(out)
@@ -1256,5 +1289,147 @@ mod tests {
         assert_eq!(repeat.candidates.len(), 3);
         assert_eq!(repeat.harvested, 0);
         assert_eq!(repeat.new_edges, 0);
+    }
+
+    #[test]
+    fn kibatsu_unique_flow_coarse_repeat_hits_locally() {
+        use crate::hubs::{PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
+
+        let g = Graph::open_in_memory().unwrap();
+
+        // Step 1: name + street + city, --complete. The hub text-search returns
+        // exactly ONE place → resolves + mints cx, indexed with the STREET folded
+        // into its establishing set {500 main st, san francisco}.
+        let specific = NameQuery {
+            name: Some("Kibatsu".into()),
+            street: Some("500 Main St".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        let text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(specific.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let details_url = PlaceDetailsResolver::new(
+            ExternalId::google_place_id("KIBATSU_MAIN").unwrap(),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let t1 = FixtureTransport::from_pairs(vec![
+            ("POST", "https://api.placekey.io/v1/placekey", json!({})),
+            ("POST", &text_url, json!({"places": [{"id": "KIBATSU_MAIN"}]})),
+            (
+                "GET",
+                &details_url,
+                json!({"displayName": {"text": "Kibatsu"}, "websiteUri": "https://kibatsu.example/"}),
+            ),
+        ]);
+        let step1 = resolve_name(&g, &specific, &CompletionCtx::new(Arc::new(t1))).unwrap();
+        let cid = step1.canonical_id.clone().expect("step 1 resolves");
+
+        // Step 2: coarse city-only query, LOCAL ONLY → MISS. Uniqueness of the
+        // coarse (name, city) query was never confirmed, and the street-
+        // established entity does not satisfy the superset rule.
+        let coarse = NameQuery {
+            name: Some("Kibatsu".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        assert!(
+            resolve_name_local(&g, &coarse).unwrap().is_none(),
+            "step 2 (coarse local-only, no memory yet) must miss"
+        );
+
+        // Step 3: coarse city-only query WITH --complete. Hub returns exactly ONE
+        // (the same place) → resolves to cx AND records the coarse (name, city)
+        // as unique. The place_id already carries a domain, so Place Details is
+        // skipped — the transport needs only the text search.
+        let coarse_text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(coarse.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let t3 = FixtureTransport::from_pairs(vec![(
+            "POST",
+            &coarse_text_url,
+            json!({"places": [{"id": "KIBATSU_MAIN"}]}),
+        )]);
+        let step3 = resolve_name(&g, &coarse, &CompletionCtx::new(Arc::new(t3))).unwrap();
+        assert_eq!(step3.canonical_id.as_deref(), Some(cid.as_str()), "step 3 resolves to cx");
+
+        // Step 4: coarse city-only query, LOCAL ONLY repeat → now HITS from unique
+        // memory (zero external), local_name_match, nothing harvested.
+        let step4 = resolve_name_local(&g, &coarse)
+            .unwrap()
+            .expect("step 4 hits from unique memory");
+        assert_eq!(step4.canonical_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(step4.confidence_reason, ConfidenceReason::LocalNameMatch);
+        assert_eq!(step4.harvested, 0);
+    }
+
+    #[test]
+    fn local_lookup_flips_from_unique_to_ambiguous() {
+        // Flip on change: a (name, Q) recorded UNIQUE (hub returned one) that a
+        // later hub call proves MULTIPLE must overwrite the unique row with an
+        // ambiguous one — a subsequent LOCAL query then returns ambiguous_among_n,
+        // never the stale unique hit. `resolve_name` short-circuits on the local
+        // unique hit, so the two hub outcomes are modeled by the two graph records
+        // they would write; the local-consult behavior across the flip is the
+        // subject under test.
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_one", "google_place_id:ONE", None, Some("Joe's Pizza"))
+            .unwrap();
+        let quals = vec!["new york".to_string()];
+        let q = NameQuery {
+            name: Some("Joe's Pizza".into()),
+            city: Some("New York".into()),
+            ..Default::default()
+        };
+
+        // Hub returned ONE → unique. A coarse local query hits it (via the unique
+        // fallback: nothing is indexed in name_index under this key).
+        g.record_name_unique("joe's pizza", &quals, "cx_one").unwrap();
+        let hit = resolve_name_local(&g, &q).unwrap().expect("unique local hit");
+        assert_eq!(hit.canonical_id.as_deref(), Some("cx_one"));
+        assert_eq!(hit.confidence_reason, ConfidenceReason::LocalNameMatch);
+
+        // Later hub call returns MULTIPLE → flips memory to ambiguous.
+        let cands = vec![
+            (String::new(), "google_place_id:ONE".into(), None),
+            (String::new(), "google_place_id:TWO".into(), None),
+        ];
+        g.record_name_cardinality("joe's pizza", &quals, &cands).unwrap();
+
+        let out = resolve_name_local(&g, &q).unwrap().expect("ambiguous from memory");
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        assert!(out.canonical_id.is_none(), "must not serve the stale unique hit");
+    }
+
+    #[test]
+    fn unique_memory_does_not_override_genuine_graph_ambiguity() {
+        // Safety: a stale unique fact for (name, Q) must NOT mask a genuine
+        // multi-entity ambiguity discoverable from the graph. Two same-name
+        // entities are indexed under the SAME establishing set = the query set, so
+        // the graph scan finds both; the unique fallback must lose to that.
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_a", "google_place_id:A", None, Some("Nova")).unwrap();
+        g.create_entity("cx_b", "google_place_id:B", None, Some("Nova")).unwrap();
+        g.index_name("nova", &["berlin".into()], "cx_a", Some("t")).unwrap();
+        g.index_name("nova", &["berlin".into()], "cx_b", Some("t")).unwrap();
+        // A stale unique fact naming just one of them.
+        g.record_name_unique("nova", &["berlin".into()], "cx_a").unwrap();
+
+        let q = NameQuery {
+            name: Some("Nova".into()),
+            city: Some("Berlin".into()),
+            ..Default::default()
+        };
+        let out = resolve_name_local(&g, &q).unwrap().expect("ambiguous from graph");
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        assert!(out.canonical_id.is_none());
     }
 }
