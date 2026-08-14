@@ -13,6 +13,7 @@
 //!     tag: "yelp",
 //!     strong: true,
 //!     anchor_rank: Some(4),
+//!     grain: Grain::Identity,
 //!     normalize: normalize::yelp,
 //!     url_match: Some(match_yelp),
 //! }
@@ -20,6 +21,18 @@
 
 use crate::normalize;
 use anyhow::Result;
+
+/// What an identifier says about the *thing* it labels — its role in
+/// disambiguation (M3, type-agnostic entity disambiguation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grain {
+    /// Names one specific real-world thing (drives identity).
+    Identity,
+    /// May be shared across many things (a chain/studio/brand domain).
+    Affiliation,
+    /// Corroborator only; lives outside the union-find (phone).
+    Weak,
+}
 
 /// Everything the rest of the system needs to know about one kind of external
 /// identifier. A single registry entry replaces what used to be ~16 edits
@@ -35,6 +48,9 @@ pub struct KindSpec {
     /// `Some(rank)` if this kind can serve as a **public anchor** (lower =
     /// stronger). `None` = never chosen as a public anchor.
     pub anchor_rank: Option<u8>,
+    /// What this kind says about the thing it labels: identity, affiliation, or
+    /// weak corroborator (drives type-agnostic disambiguation).
+    pub grain: Grain,
     /// Raw input → canonical value.
     pub normalize: fn(&str) -> Result<String>,
     /// Optional: recognize this kind inside a `sameAs` URL, returning the raw
@@ -52,6 +68,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "placekey",
         strong: true,
         anchor_rank: Some(1),
+        grain: Grain::Identity,
         normalize: normalize::placekey,
         url_match: None, // Placekeys are not URL-shaped; no sameAs recognizer.
     },
@@ -59,6 +76,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "domain",
         strong: true,
         anchor_rank: Some(2),
+        grain: Grain::Affiliation,
         normalize: normalize::registrable_domain,
         url_match: None, // domain is the URL-harvesting fallback, not a matcher
     },
@@ -66,6 +84,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "google_place_id",
         strong: true,
         anchor_rank: Some(3),
+        grain: Grain::Identity,
         normalize: normalize::place_id,
         url_match: None,
     },
@@ -73,6 +92,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "imdb",
         strong: true,
         anchor_rank: None,
+        grain: Grain::Identity,
         normalize: normalize::imdb,
         url_match: Some(match_imdb),
     },
@@ -80,6 +100,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "phone",
         strong: false,
         anchor_rank: None,
+        grain: Grain::Weak,
         normalize: normalize::phone_e164,
         url_match: None,
     },
@@ -87,6 +108,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "wikidata",
         strong: true,
         anchor_rank: Some(0),
+        grain: Grain::Identity,
         normalize: normalize::qid,
         url_match: Some(match_wikidata),
     },
@@ -94,6 +116,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "tmdb",
         strong: true,
         anchor_rank: None,
+        grain: Grain::Identity,
         normalize: normalize::tmdb,
         url_match: Some(match_tmdb),
     },
@@ -101,6 +124,7 @@ pub static KINDS: &[KindSpec] = &[
         tag: "yelp",
         strong: true,
         anchor_rank: Some(4),
+        grain: Grain::Identity,
         normalize: normalize::yelp,
         url_match: Some(match_yelp),
     },
@@ -171,5 +195,17 @@ mod tests {
         // Rank 1: stronger than domain (2), weaker than wikidata (0).
         assert_eq!(spec.anchor_rank, Some(1));
         assert!(spec.url_match.is_none());
+    }
+
+    #[test]
+    fn grains_are_assigned() {
+        // Identity kinds name one thing; a shared domain is only affiliation;
+        // phone is a weak corroborator outside the union-find.
+        assert_eq!(
+            spec_for_tag("google_place_id").unwrap().grain,
+            Grain::Identity
+        );
+        assert_eq!(spec_for_tag("domain").unwrap().grain, Grain::Affiliation);
+        assert_eq!(spec_for_tag("phone").unwrap().grain, Grain::Weak);
     }
 }

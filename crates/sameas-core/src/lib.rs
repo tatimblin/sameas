@@ -30,8 +30,9 @@ pub mod resolve;
 pub mod transport;
 
 pub use complete::{complete_place_query, resolve_and_complete, CompletionCtx, PlaceQuery};
+pub use confidence::ConfidenceReason;
 pub use graph::Graph;
-pub use kind::{spec_for_tag, KindSpec, KINDS};
+pub use kind::{spec_for_tag, Grain, KindSpec, KINDS};
 pub use model::{EntityRecord, ExternalId};
 pub use resolve::{
     commit_record, commit_record_with_source, load_entity, resolve_id, DirectRecordResolver,

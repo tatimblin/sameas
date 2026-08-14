@@ -20,12 +20,15 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::confidence::{score, ConfidenceReason};
 use crate::graph::Graph;
 use crate::hubs::{
     PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput, TmdbResolver, WikidataResolver,
 };
 use crate::model::{EntityRecord, ExternalId};
-use crate::resolve::{commit_record_with_source, load_entity, Resolver, ResolveOutput};
+use crate::resolve::{
+    commit_record_with_source, load_entity, Candidate, Resolver, ResolveOutput, Status,
+};
 use crate::transport::HttpTransport;
 
 /// Configuration for a completion run: the transport plus per-hub API keys and
@@ -112,7 +115,11 @@ pub fn resolve_and_complete(
 ) -> Result<ResolveOutput> {
     // 1. Local-first commit — establishes the canonical id + input confidence.
     let seed = commit_record_with_source(graph, input, "input")?;
-    let canonical_id = seed.canonical_id.clone();
+    // Refused (no strong key) → nothing resolvable to complete.
+    let canonical_id = match &seed.canonical_id {
+        Some(c) => c.clone(),
+        None => return Ok(seed),
+    };
     let mut total_new_edges = seed.new_edges;
 
     // 2. Bounded BFS over the cluster.
@@ -151,7 +158,24 @@ pub fn resolve_and_complete(
     out.matched_via = seed.matched_via;
     out.harvested = seed.harvested;
     out.new_edges = total_new_edges;
-    out.confidence = seed.confidence;
+
+    // When a hub crosslink grew the cluster, the completion was driven by a
+    // strong-key hub crosswalk (imdb/wikidata/tmdb/place_details). Otherwise
+    // keep the seed's own attachment reason.
+    let hub_added = total_new_edges > seed.new_edges;
+    let reason = if hub_added
+        && matches!(
+            seed.confidence_reason,
+            ConfidenceReason::ExactStrongKey
+                | ConfidenceReason::SyntheticStrongKey
+                | ConfidenceReason::NewPublicAnchor
+        ) {
+        ConfidenceReason::HubCrosswalk
+    } else {
+        seed.confidence_reason.clone()
+    };
+    out.confidence = score(&reason);
+    out.confidence_reason = reason;
     Ok(out)
 }
 
@@ -167,6 +191,67 @@ pub fn complete_place_query(
     query: &PlaceQuery,
     ctx: &CompletionCtx,
 ) -> Result<ResolveOutput> {
+    // Google place_id candidates via text search (best-effort). We look at
+    // *all* candidates: more than one means the query is ambiguous.
+    let ts = PlaceTextSearchResolver::new(
+        TextSearchInput::Text(query.text_query()),
+        ctx.google_key.clone(),
+        ctx.transport.clone(),
+    );
+    let place_ids: Vec<String> = match ctx.transport.get_json(&ts.url()) {
+        Ok(v) => PlaceTextSearchResolver::parse_all(&v).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    // Ambiguous on the place itself: refuse to commit a place_id (and keep the
+    // Placekey out, to avoid a half-built entity). Ask for a stronger query.
+    if place_ids.len() > 1 {
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for pid in &place_ids {
+            let key = ExternalId::google_place_id(pid)?.key();
+            match graph.find(&key)? {
+                Some(cid) => {
+                    if let Some(e) = graph.get_entity(&cid)? {
+                        candidates.push(Candidate {
+                            canonical_id: e.canonical_id,
+                            anchor: e.anchor,
+                            name: e.name,
+                        });
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        canonical_id: String::new(),
+                        anchor: key,
+                        name: None,
+                    });
+                }
+                None => candidates.push(Candidate {
+                    canonical_id: String::new(),
+                    anchor: key,
+                    name: None,
+                }),
+            }
+        }
+        let reason = ConfidenceReason::AmbiguousAmongN(candidates.len());
+        return Ok(ResolveOutput {
+            canonical_id: None,
+            anchor: String::new(),
+            entity_type: query.entity_type.clone(),
+            name: query.name.clone(),
+            same_as: Vec::new(),
+            matched_via: Vec::new(),
+            status: Status::Unresolved,
+            harvested: 0,
+            new_edges: 0,
+            confidence: score(&reason),
+            confidence_reason: reason,
+            candidates,
+            provenance: Vec::new(),
+        });
+    }
+
+    // Unambiguous (exactly one place_id, or none + a Placekey). Build one record
+    // and commit + forward-complete via the place_id.
     let mut record = EntityRecord {
         entity_type: query.entity_type.clone(),
         name: query.name.clone(),
@@ -185,30 +270,28 @@ pub fn complete_place_query(
     {
         record.same_as.push(pk);
     }
-
-    // Google place_id via text search (best-effort).
-    let text = query.text_query();
-    let ts = PlaceTextSearchResolver::new(
-        TextSearchInput::Text(text),
-        ctx.google_key.clone(),
-        ctx.transport.clone(),
-    );
-    if let Ok(r) = ts.harvest() {
-        for id in r.same_as {
-            if !record.same_as.iter().any(|e| e == &id) {
-                record.same_as.push(id);
-            }
+    if let Some(pid) = place_ids.into_iter().next() {
+        let id = ExternalId::google_place_id(&pid)?;
+        if !record.same_as.iter().any(|e| e == &id) {
+            record.same_as.push(id);
         }
     }
 
-    // Commit whatever we found (never fork; if both failed, this mints a
-    // name-only synthetic entity), then forward-complete via the place_id.
+    // If neither a Placekey nor a place_id was found, the record has no strong
+    // key: the commit refuses (Unresolved / NeedsStrongerIdentifier). Return it.
     let mut out = resolve_and_complete(graph, &record, ctx)?;
-    out.confidence = if query.is_city_only() {
-        crate::confidence::PLACEKEY_CITY
+    if out.canonical_id.is_none() {
+        return Ok(out);
+    }
+
+    // Confidence is bounded by the coarseness of the query, not cluster richness.
+    let reason = if query.is_city_only() {
+        ConfidenceReason::PlacekeyCityOnly
     } else {
-        crate::confidence::PLACEKEY_ADDRESS
+        ConfidenceReason::PlacekeyAddress
     };
+    out.confidence = score(&reason);
+    out.confidence_reason = reason;
     Ok(out)
 }
 
@@ -402,11 +485,42 @@ mod tests {
 
     #[test]
     fn reverse_place_id_does_not_merge_into_phone_only_entity() {
-        // A phone corroborating both a phone-only entity and a place entity must
-        // not merge them (union-find is strong-keys-only; phone never merges).
+        // Two place-bearing entities sharing the SAME phone but distinct
+        // place_ids stay distinct (phone never merges), and a phone-only commit
+        // refuses to mint anything at all (no strong key).
         let g = Graph::open_in_memory().unwrap();
 
-        // A phone-only entity (no strong key).
+        let place_a = commit_record_with_source(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::google_place_id("PLACE_A").unwrap(),
+                    ExternalId::phone("+1-510-653-3394").unwrap(),
+                ],
+                ..Default::default()
+            },
+            "reverse_search",
+        )
+        .unwrap();
+
+        let place_b = commit_record_with_source(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::google_place_id("PLACE_B").unwrap(),
+                    ExternalId::phone("+1-510-653-3394").unwrap(),
+                ],
+                ..Default::default()
+            },
+            "reverse_search",
+        )
+        .unwrap();
+
+        assert_ne!(place_a.canonical_id, place_b.canonical_id);
+        // The shared phone corroborates both, without merging them.
+        assert_eq!(g.find_phone("phone:+15106533394").unwrap().len(), 2);
+
+        // A phone-only commit has no strong key → refuse (no entity minted).
         let phone_only = commit_record_with_source(
             &g,
             &EntityRecord {
@@ -416,23 +530,7 @@ mod tests {
             "input",
         )
         .unwrap();
-
-        // A place entity that shares the phone (as a reverse-resolved place_id would).
-        let place = commit_record_with_source(
-            &g,
-            &EntityRecord {
-                same_as: vec![
-                    ExternalId::google_place_id("EXAMPLE_blue_bottle_oakland").unwrap(),
-                    ExternalId::phone("+1-510-653-3394").unwrap(),
-                ],
-                ..Default::default()
-            },
-            "reverse_search",
-        )
-        .unwrap();
-
-        assert_ne!(phone_only.canonical_id, place.canonical_id);
-        // The phone corroborates both, without merging them.
-        assert_eq!(g.find_phone("phone:+15106533394").unwrap().len(), 2);
+        assert_eq!(phone_only.status, Status::Unresolved);
+        assert!(phone_only.canonical_id.is_none());
     }
 }

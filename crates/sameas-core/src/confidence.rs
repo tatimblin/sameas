@@ -26,3 +26,82 @@ pub const PHONE_ONLY: f32 = 0.30;
 pub const SYNTHETIC_ONLY: f32 = 0.20;
 /// Direct lookup by canonical id (`entity <id>`) — we were handed the identity.
 pub const DIRECT_LOOKUP: f32 = 1.0;
+/// Strong key present but no public anchor — reproducible synthetic anchor.
+pub const SYNTHETIC_STRONG: f32 = 0.55;
+/// Weak/reverse signal matched several distinct entities — ambiguous.
+pub const AMBIGUOUS: f32 = 0.25;
+/// Nothing resolvable supplied — caller must provide a stronger identifier.
+pub const NEEDS_MORE: f32 = 0.15;
+
+/// Why a confidence score came out the way it did. Pairing the number with a
+/// reason is what makes a low score actionable — it says *what* to fix, not just
+/// that the attachment was weak.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfidenceReason {
+    DirectLookup,
+    ExactStrongKey,
+    HubCrosswalk,
+    PlacekeyAddress,
+    NewPublicAnchor,
+    PlacekeyCityOnly,
+    PhoneOnly,
+    SyntheticStrongKey,
+    AmbiguousAmongN(usize),
+    NeedsStrongerIdentifier,
+}
+
+/// Map a reason to its confidence score. The constants remain the single source
+/// of the numbers; the enum is what makes a low score actionable.
+pub fn score(reason: &ConfidenceReason) -> f32 {
+    match reason {
+        ConfidenceReason::DirectLookup => DIRECT_LOOKUP,
+        ConfidenceReason::ExactStrongKey => EXACT_STRONG,
+        ConfidenceReason::HubCrosswalk => HUB_CROSSWALK,
+        ConfidenceReason::PlacekeyAddress => PLACEKEY_ADDRESS,
+        ConfidenceReason::NewPublicAnchor => NEW_PUBLIC_ANCHOR,
+        ConfidenceReason::PlacekeyCityOnly => PLACEKEY_CITY,
+        ConfidenceReason::PhoneOnly => PHONE_ONLY,
+        ConfidenceReason::SyntheticStrongKey => SYNTHETIC_STRONG,
+        ConfidenceReason::AmbiguousAmongN(_) => AMBIGUOUS,
+        ConfidenceReason::NeedsStrongerIdentifier => NEEDS_MORE,
+    }
+}
+
+/// A stable snake_case tag for output (JSON/table).
+pub fn reason_tag(reason: &ConfidenceReason) -> &'static str {
+    match reason {
+        ConfidenceReason::DirectLookup => "direct_lookup",
+        ConfidenceReason::ExactStrongKey => "exact_strong_key",
+        ConfidenceReason::HubCrosswalk => "hub_crosswalk",
+        ConfidenceReason::PlacekeyAddress => "placekey_address",
+        ConfidenceReason::NewPublicAnchor => "new_public_anchor",
+        ConfidenceReason::PlacekeyCityOnly => "placekey_city_only",
+        ConfidenceReason::PhoneOnly => "phone_only",
+        ConfidenceReason::SyntheticStrongKey => "synthetic_strong_key",
+        ConfidenceReason::AmbiguousAmongN(_) => "ambiguous_among_n",
+        ConfidenceReason::NeedsStrongerIdentifier => "needs_stronger_identifier",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_maps_to_constant() {
+        assert_eq!(score(&ConfidenceReason::ExactStrongKey), EXACT_STRONG);
+    }
+
+    #[test]
+    fn ambiguous_ignores_count() {
+        assert_eq!(score(&ConfidenceReason::AmbiguousAmongN(3)), AMBIGUOUS);
+    }
+
+    #[test]
+    fn reason_tag_is_stable_snake_case() {
+        assert_eq!(
+            reason_tag(&ConfidenceReason::NeedsStrongerIdentifier),
+            "needs_stronger_identifier"
+        );
+    }
+}

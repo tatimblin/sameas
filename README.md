@@ -10,7 +10,8 @@ external identifiers, persisted in SQLite. Resolving an input attaches it to a
 cluster and returns the whole cluster — **resolve *is* completion**.
 
 See [`PROJECT_GOALS.md`](./PROJECT_GOALS.md) and [`ROADMAP.md`](./ROADMAP.md) for
-the full vision. This repository implements **Milestones M1 and M2**.
+the full vision. This repository implements **Milestones M1, M2, and the M3
+disambiguation core**.
 
 ## M1 scope
 
@@ -59,22 +60,52 @@ All adapters sit behind the M1 `Resolver` trait. Completion is opt-in, runs a
 bounded idempotent BFS over the cluster, and is best-effort (a hub that is
 unavailable yields no completion, never an error).
 
+### M3 scope — disambiguation (core)
+
+Keeps distinct real-world things distinct, and treats confidence as a control
+signal for the calling app. Type-agnostic — works for any schema.org Thing.
+
+- **Entity-grain rule** (`kind.rs` `Grain`) — each kind is `Identity` (names one
+  thing: `wikidata`/`imdb`/`tmdb`/`placekey`/`google_place_id`/`yelp`),
+  `Affiliation` (may be shared: `domain`), or `Weak` (`phone`). A shared domain
+  never merges two entities with disjoint identity keys, and anchor selection
+  prefers Identity keys — so two locations of a chain that share `kibatsu.com`
+  stay **distinct** (and don't collide on one canonical id).
+- **Resolve-or-refuse** — resolution needs ≥1 strong key. Name-only or phone-only
+  input **refuses**: `canonical_id: null`, `status: "unresolved"`, a
+  `confidence_reason`, and `candidates` to confirm. Strong-key entities with no
+  public anchor get a **deterministic** anchor (reproducible, no random UUID).
+- **Confidence + reason** (`confidence.rs`) — a `0.0`–`1.0` score with a
+  `confidence_reason` (`exact_strong_key`, `hub_crosswalk`, `placekey_city_only`,
+  `ambiguous_among_n`, `needs_stronger_identifier`, …). A low score says *what to
+  fix*, so an app can ask its user for a stronger identifier and re-resolve.
+
+Deferred to a later milestone: `link`/`merge`/`split` corrections and miss-rate
+metrics (`sameas stats`). Fuzzy/name-based matching stays deferred and
+evidence-gated.
+
 ### Correctness invariants
 
 - **Phone is a corroborator only.** Two otherwise-distinct entities are never
   merged on a shared phone. The phone edge is recorded, but only strong keys
-  (domain, place_id, imdb, wikidata, tmdb, yelp) drive merges.
+  (domain, place_id, imdb, wikidata, tmdb, yelp, placekey) drive merges.
+- **Entity grain (no false chain merges).** A shared **Affiliation** key (a
+  domain) never merges two entities with disjoint **Identity** keys; distinct
+  locations/things stay distinct even when they share a domain.
+- **Refuse over guess.** No strong key → no minted entity; return `unresolved` +
+  a reason instead of guessing (false-merge avoidance is the primary invariant).
 - **Stable identity.** Any identifier in a cluster resolves to the same
   `canonical_id`. Union-find is transitive through SQLite.
-- **Deterministic anchors.** Canonical id is derived from the anchor; a
-  synthetic `local:<uuid>` is minted only when no public anchor is present.
+- **Deterministic anchors.** Canonical id is derived from the anchor (Identity
+  key preferred); reproducible across runs.
 
 ### Not yet implemented
 
-No synthetic-ID corrections / `merge` / `split` / miss-rate metrics (M3), no HTTP
-API (M4), and **no ML / embeddings / ONNX / tokio / axum**. Standalone
-`phone → place_id` merging is deferred to M3 (its non-merge semantics need
-provisional entities).
+`link` / `merge` / `split` corrections and miss-rate metrics (`sameas stats`)
+remain (rest of M3); no HTTP API (M4); and **no ML / embeddings / ONNX / tokio /
+axum**. Standalone `phone → place_id` reverse resolution is deferred (its
+non-merge semantics need provisional entities). Fuzzy/name-based matching stays
+deferred and evidence-gated.
 
 ## Build
 
@@ -93,9 +124,10 @@ Covers registrable-domain extraction, phone→E.164, IMDb/QID/TMDb/Placekey
 normalization, JSON-LD `sameAs` extraction, union-find transitivity through
 SQLite, the `source`-column migration on a pre-M2 DB, anchor priority ordering,
 phone-alone-does-not-merge, the hub adapters' JSON parsing, the exit criteria
-(IMDb → QID + TMDb and place_id → website + phone from an empty graph), and a
-full CLI demo flow that asserts the same `canonical_id` across phone / place_id /
-domain resolves.
+(IMDb → QID + TMDb and place_id → website + phone from an empty graph), the
+entity-grain rule (two chain locations sharing a domain stay distinct; two movies
+sharing a studio domain stay distinct), resolve-or-refuse, ambiguity candidates,
+and a full CLI demo flow.
 
 ## Demo (offline, deterministic)
 
@@ -108,7 +140,10 @@ story: ingest a restaurant, resolve it by phone (completion), by place_id (same
 canonical id), by domain via an HTML fixture (harvest), show the cluster, then
 the movie path by IMDb. It ends with an identity-stability check, then an **M2
 hub-bootstrapping** section (offline via `examples/fixtures/hubs`) showing an
-IMDb id, a place_id, and a name+city all completing from an **empty** graph.
+IMDb id, a place_id, and a name+city all completing from an **empty** graph, and
+an **M3 disambiguation** section showing two chain locations that share a domain
+staying distinct and a too-thin query being refused with a "needs more info"
+signal.
 
 ## CLI usage
 

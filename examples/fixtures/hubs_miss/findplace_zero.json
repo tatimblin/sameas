@@ -1,0 +1,5 @@
+{
+  "method": "GET",
+  "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+  "response": { "status": "ZERO_RESULTS", "candidates": [] }
+}

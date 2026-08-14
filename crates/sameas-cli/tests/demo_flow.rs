@@ -47,11 +47,36 @@ impl Harness {
     }
 
     fn canonical_id(&self, args: &[&str]) -> String {
+        self.value(args)["canonical_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Run with `--json` and parse the output.
+    fn value(&self, args: &[&str]) -> serde_json::Value {
         let mut full = vec!["--json"];
         full.extend_from_slice(args);
         let out = self.run(&full);
-        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-        value["canonical_id"].as_str().unwrap().to_string()
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// Write a file under the throwaway dir; returns its path.
+    fn write_file(&self, name: &str, content: &str) -> String {
+        let p = self._dir.path().join(name);
+        std::fs::write(&p, content).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// Create a hub-fixtures subdir with the given `(filename, json)` files;
+    /// returns the dir path for `--hub-fixtures`.
+    fn hub_dir(&self, dirname: &str, files: &[(&str, &str)]) -> String {
+        let dir = self._dir.path().join(dirname);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        dir.to_string_lossy().into_owned()
     }
 }
 
@@ -94,13 +119,8 @@ fn resolve_is_stable_and_completes() {
     // Seed the restaurant.
     h.run(&["ingest", &seed("blue-bottle.json")]);
 
-    // The same entity must be reached from phone, place_id, and domain.
-    let phone_id = h.canonical_id(&["resolve", "--phone", "+1-510-653-3394"]);
-    let place_id = h.canonical_id(&[
-        "resolve",
-        "--place-id",
-        "EXAMPLE_blue_bottle_oakland",
-    ]);
+    // The same entity is reached from any strong key (place_id, domain).
+    let place_id = h.canonical_id(&["resolve", "--place-id", "EXAMPLE_blue_bottle_oakland"]);
     let domain_id = h.canonical_id(&[
         "resolve",
         "--domain",
@@ -108,24 +128,28 @@ fn resolve_is_stable_and_completes() {
         "--fixture",
         &fixture("blue-bottle.html"),
     ]);
-
-    assert_eq!(phone_id, place_id, "phone and place_id must resolve equal");
     assert_eq!(place_id, domain_id, "place_id and domain must resolve equal");
 
-    // Completion: the cluster carries all four identifiers.
-    let out = h.run(&["--json", "entity", &phone_id]);
-    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-    let same_as: Vec<String> = value["sameAs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+    // Completion: the cluster carries all four identifiers (phone included —
+    // it was seeded as a corroborator).
+    let value = h.value(&["entity", &place_id]);
+    let same_as = same_as_of(&value);
     assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()));
     assert!(same_as.contains(&"google_place_id:EXAMPLE_blue_bottle_oakland".to_string()));
     assert!(same_as.contains(&"phone:+15106533394".to_string()));
     assert!(same_as.contains(&"wikidata:Q4926426".to_string()));
     assert_eq!(value["anchor"].as_str().unwrap(), "wikidata:Q4926426");
+
+    // M3: phone alone is a corroborator, not an identity. Resolving by phone
+    // refuses (no strong key) and returns the entity as a candidate to confirm.
+    let phone = h.value(&["resolve", "--phone", "+1-510-653-3394"]);
+    assert_eq!(phone["status"].as_str().unwrap(), "unresolved");
+    assert!(phone["canonical_id"].is_null());
+    let cands = phone["candidates"].as_array().unwrap();
+    assert!(
+        cands.iter().any(|c| c["canonical_id"].as_str() == Some(place_id.as_str())),
+        "phone should surface the seeded entity as a candidate: {cands:?}"
+    );
 }
 
 #[test]
@@ -186,7 +210,9 @@ fn imdb_completes_from_hubs_with_empty_graph() {
     ]);
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(value["anchor"].as_str().unwrap(), "wikidata:Q83495");
-    assert!(value["confidence"].as_f64().unwrap() >= 0.9);
+    // Completed via a strong-key hub crosswalk (imdb → wikidata/tmdb).
+    assert_eq!(value["confidence_reason"].as_str().unwrap(), "hub_crosswalk");
+    assert!(value["confidence"].as_f64().unwrap() >= 0.85);
     let same_as = same_as_of(&value);
     assert!(same_as.contains(&"wikidata:Q83495".to_string()), "{same_as:?}");
     assert!(same_as.contains(&"tmdb:603".to_string()), "{same_as:?}");
@@ -241,4 +267,121 @@ fn name_without_complete_is_rejected() {
         .output()
         .expect("failed to run sameas");
     assert!(!output.status.success(), "--name without --complete should fail");
+}
+
+// --- M3: entity-grain, refuse, ambiguity ----------------------------------
+
+#[test]
+fn chain_locations_sharing_domain_stay_distinct() {
+    // Two locations of one chain share a domain (Affiliation) but have distinct
+    // place_ids (Identity) → they must NOT collapse into one entity.
+    let h = Harness::new();
+    let a = h.write_file(
+        "kibatsu_sf.json",
+        r#"{ "type": "LocalBusiness", "name": "Kibatsu SF",
+             "sameAs": [ {"domain": "kibatsu.com"}, {"google_place_id": "KIBATSU_SF"} ] }"#,
+    );
+    let b = h.write_file(
+        "kibatsu_oak.json",
+        r#"{ "type": "LocalBusiness", "name": "Kibatsu Oakland",
+             "sameAs": [ {"domain": "kibatsu.com"}, {"google_place_id": "KIBATSU_OAK"} ] }"#,
+    );
+    h.run(&["ingest", &a]);
+    h.run(&["ingest", &b]);
+
+    let sf = h.canonical_id(&["resolve", "--place-id", "KIBATSU_SF"]);
+    let oak = h.canonical_id(&["resolve", "--place-id", "KIBATSU_OAK"]);
+    assert_ne!(sf, oak, "two chain locations must stay distinct");
+
+    // The shared domain resolves (single-valued) to the first owner, as a hit.
+    let dom = h.value(&["resolve", "--domain", "kibatsu.com"]);
+    assert_eq!(dom["status"].as_str().unwrap(), "hit");
+    assert_eq!(dom["canonical_id"].as_str().unwrap(), sf);
+}
+
+#[test]
+fn distinct_movies_sharing_a_domain_stay_distinct() {
+    // Type-agnostic proof: two movies sharing a studio domain (Affiliation) but
+    // with distinct IMDb ids (Identity) stay distinct — the rule isn't geo.
+    let h = Harness::new();
+    let a = h.write_file(
+        "film_a.json",
+        r#"{ "type": "Movie", "name": "Film A",
+             "sameAs": [ {"domain": "studioexample.com"}, {"imdb": "tt1111111"} ] }"#,
+    );
+    let b = h.write_file(
+        "film_b.json",
+        r#"{ "type": "Movie", "name": "Film B",
+             "sameAs": [ {"domain": "studioexample.com"}, {"imdb": "tt2222222"} ] }"#,
+    );
+    h.run(&["ingest", &a]);
+    h.run(&["ingest", &b]);
+
+    let fa = h.canonical_id(&["resolve", "--imdb", "tt1111111"]);
+    let fb = h.canonical_id(&["resolve", "--imdb", "tt2222222"]);
+    assert_ne!(fa, fb, "two films sharing a studio domain must stay distinct");
+}
+
+#[test]
+fn name_city_with_no_hub_match_refuses() {
+    // No public identifier resolvable → refuse (needs a stronger identifier).
+    let h = Harness::new();
+    let fx = h.hub_dir(
+        "hubs_miss",
+        &[
+            (
+                "findplace_zero.json",
+                r#"{ "method": "GET",
+                     "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+                     "response": { "status": "ZERO_RESULTS", "candidates": [] } }"#,
+            ),
+            (
+                "placekey_miss.json",
+                r#"{ "method": "POST",
+                     "url": "https://api.placekey.io/v1/placekey",
+                     "response": {} }"#,
+            ),
+        ],
+    );
+    let v = h.value(&[
+        "resolve", "--name", "Nowhere Cafe", "--city", "Springfield", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    assert_eq!(v["status"].as_str().unwrap(), "unresolved");
+    assert!(v["canonical_id"].is_null());
+    assert_eq!(
+        v["confidence_reason"].as_str().unwrap(),
+        "needs_stronger_identifier"
+    );
+}
+
+#[test]
+fn name_city_ambiguous_returns_candidates() {
+    // Text search returns >1 candidate → refuse, surface all candidates.
+    let h = Harness::new();
+    let fx = h.hub_dir(
+        "hubs_ambiguous",
+        &[
+            (
+                "findplace_two.json",
+                r#"{ "method": "GET",
+                     "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+                     "response": { "status": "OK",
+                       "candidates": [ {"place_id": "CAND_A"}, {"place_id": "CAND_B"} ] } }"#,
+            ),
+            (
+                "placekey_miss.json",
+                r#"{ "method": "POST",
+                     "url": "https://api.placekey.io/v1/placekey",
+                     "response": {} }"#,
+            ),
+        ],
+    );
+    let v = h.value(&[
+        "resolve", "--name", "Joe's Pizza", "--city", "New York", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    assert_eq!(v["status"].as_str().unwrap(), "unresolved");
+    assert_eq!(v["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
+    assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
 }

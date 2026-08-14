@@ -15,7 +15,7 @@
 //! `Some(_)` (lower = stronger). Adding an anchor-eligible kind is just a
 //! registry entry with an `anchor_rank`.
 
-use crate::kind::spec_for_tag;
+use crate::kind::{spec_for_tag, Grain};
 use crate::model::ExternalId;
 
 /// Pick the strongest public anchor key among `ids`, if any. Deterministic:
@@ -28,22 +28,46 @@ pub fn public_anchor(ids: &[ExternalId]) -> Option<String> {
         .map(|(_, id)| id.key())
 }
 
-/// Mint a fresh synthetic anchor. Used only when no public anchor is present.
+/// The strongest strong key of a given grain, as a `kind:value`. Ranked by
+/// `anchor_key_rank` (public-anchor rank first, unranked kinds last), ties on the
+/// key string for determinism. `None` if the grain has no strong key.
+fn grain_anchor(members: &[ExternalId], grain: Grain) -> Option<String> {
+    members
+        .iter()
+        .filter(|id| id.is_strong() && id.spec().grain == grain)
+        .map(|id| id.key())
+        .min_by(|a, b| {
+            anchor_key_rank(a)
+                .cmp(&anchor_key_rank(b))
+                .then_with(|| a.cmp(b))
+        })
+}
+
+/// The anchor that uniquely identifies an entity. **Identity-grain keys win over
+/// Affiliation-grain keys**: a shared domain must never anchor (and thus
+/// canonical-id-collide) two distinct locations of one chain — it only anchors a
+/// single-location org that has no identity key of its own. `None` if there is no
+/// strong key at all (then a synthetic `local:` id is minted).
+pub fn entity_anchor(members: &[ExternalId]) -> Option<String> {
+    grain_anchor(members, Grain::Identity).or_else(|| grain_anchor(members, Grain::Affiliation))
+}
+
+/// Mint a fresh synthetic anchor. Used only when no strong key is present.
 pub fn mint_local() -> String {
     format!("local:{}", uuid::Uuid::new_v4())
 }
 
-/// Choose an anchor for a brand-new entity: strongest public anchor, else a
-/// freshly minted synthetic local id.
+/// Choose an anchor for a brand-new entity: its identifying key (Identity grain
+/// preferred over a shared Affiliation domain), else a freshly minted local id.
 pub fn choose_anchor(ids: &[ExternalId]) -> String {
-    public_anchor(ids).unwrap_or_else(mint_local)
+    entity_anchor(ids).unwrap_or_else(mint_local)
 }
 
 /// Recompute an entity's anchor from its current members, preserving the
-/// existing (synthetic) anchor when no public anchor is present. The canonical
-/// id never changes as a result — only the anchor label may sharpen.
+/// existing (synthetic) anchor when no strong key is present. The canonical id
+/// never changes as a result — only the anchor label may sharpen.
 pub fn recompute_anchor(members: &[ExternalId], current: &str) -> String {
-    public_anchor(members).unwrap_or_else(|| current.to_string())
+    entity_anchor(members).unwrap_or_else(|| current.to_string())
 }
 
 /// Priority rank of an existing anchor *key* (`kind:value`), used to pick the
@@ -58,6 +82,21 @@ pub fn anchor_key_rank(anchor: &str) -> u8 {
             .unwrap_or(200),
         None => 200,
     }
+}
+
+/// The strongest strong-key `kind:value` to use as a deterministic anchor when
+/// no public anchor exists. `None` if there is no strong key at all.
+/// Ranked by `anchor_key_rank` (lower = stronger), ties broken by the key string.
+pub fn synthetic_anchor(members: &[ExternalId]) -> Option<String> {
+    members
+        .iter()
+        .filter(|id| id.is_strong())
+        .map(|id| id.key())
+        .min_by(|a, b| {
+            anchor_key_rank(a)
+                .cmp(&anchor_key_rank(b))
+                .then_with(|| a.cmp(b))
+        })
 }
 
 /// FNV-1a 32-bit hash — small, dependency-free, stable across runs.
@@ -132,6 +171,36 @@ mod tests {
         let ids = vec![ExternalId::phone("+15106533394").unwrap()];
         assert_eq!(public_anchor(&ids), None);
         assert!(choose_anchor(&ids).starts_with("local:"));
+    }
+
+    #[test]
+    fn synthetic_anchor_uses_strongest_strong_key() {
+        // An imdb-only entity gets a deterministic synthetic anchor.
+        assert_eq!(
+            synthetic_anchor(&[ExternalId::imdb("tt0133093").unwrap()]),
+            Some("imdb:tt0133093".into())
+        );
+
+        // Stable: same input yields the same output across calls.
+        let members = vec![ExternalId::imdb("tt0133093").unwrap()];
+        assert_eq!(synthetic_anchor(&members), synthetic_anchor(&members));
+
+        // Phone is not strong, so there is no synthetic anchor.
+        assert_eq!(
+            synthetic_anchor(&[ExternalId::phone("+15106533394").unwrap()]),
+            None
+        );
+
+        // With both a rankless strong key and a public-anchor key, the
+        // stronger-ranked one wins (domain rank 2 < imdb's unknown 200).
+        let members = vec![
+            ExternalId::imdb("tt0133093").unwrap(),
+            ExternalId::domain("bluebottlecoffee.com").unwrap(),
+        ];
+        assert_eq!(
+            synthetic_anchor(&members).as_deref(),
+            Some("domain:bluebottlecoffee.com")
+        );
     }
 
     #[test]

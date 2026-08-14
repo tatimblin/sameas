@@ -122,6 +122,12 @@ impl PlaceTextSearchResolver {
 
     /// Parse a Find-Place response, returning the best candidate's `place_id`.
     pub fn parse(value: &Value) -> Result<Option<String>> {
+        Ok(Self::parse_all(value)?.into_iter().next())
+    }
+
+    /// Parse a Find-Place response, returning every candidate `place_id` in order.
+    /// Same status handling as `parse` (OK/ZERO_RESULTS ok; others error).
+    pub fn parse_all(value: &Value) -> Result<Vec<String>> {
         if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
             // ZERO_RESULTS is a normal "no match", not an error.
             if status != "OK" && status != "ZERO_RESULTS" {
@@ -131,10 +137,13 @@ impl PlaceTextSearchResolver {
         Ok(value
             .get("candidates")
             .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("place_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()))
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c.get("place_id").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -186,5 +195,16 @@ mod tests {
         );
         let zero = json!({ "status": "ZERO_RESULTS", "candidates": [] });
         assert_eq!(PlaceTextSearchResolver::parse(&zero).unwrap(), None);
+    }
+
+    #[test]
+    fn text_search_reads_all_candidates() {
+        let v = json!({ "status": "OK", "candidates": [{ "place_id": "ChIJ_a" }, { "place_id": "ChIJ_b" }] });
+        assert_eq!(
+            PlaceTextSearchResolver::parse_all(&v).unwrap(),
+            vec!["ChIJ_a".to_string(), "ChIJ_b".to_string()]
+        );
+        let zero = json!({ "status": "ZERO_RESULTS", "candidates": [] });
+        assert!(PlaceTextSearchResolver::parse_all(&zero).unwrap().is_empty());
     }
 }

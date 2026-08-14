@@ -9,17 +9,23 @@
 //! recorded as a corroborating edge but never single-handedly merges two
 //! otherwise-distinct entities.
 
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 
 use crate::anchor;
+use crate::confidence::{score, ConfidenceReason};
 use crate::graph::Graph;
+use crate::kind::Grain;
 use crate::model::{EntityRecord, ExternalId};
 
-/// Whether a resolution created a new entity or hit an existing one.
+/// Whether a resolution created a new entity, hit an existing one, or refused
+/// to resolve (no strong identifier / ambiguous).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     New,
     Hit,
+    Unresolved,
 }
 
 impl Status {
@@ -27,15 +33,26 @@ impl Status {
         match self {
             Status::New => "new",
             Status::Hit => "hit",
+            Status::Unresolved => "unresolved",
         }
     }
 }
 
+/// A distinct entity an ambiguous / refused resolution could have meant. Surfaced
+/// so the caller can ask for a stronger identifier instead of guessing.
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub canonical_id: String,
+    pub anchor: String,
+    pub name: Option<String>,
+}
+
 /// The result of resolving an input: a canonical id plus the completed
-/// identifier set from the local graph.
+/// identifier set from the local graph. `canonical_id` is `None` when the input
+/// could not be resolved (no strong key, or ambiguous among several entities).
 #[derive(Clone, Debug)]
 pub struct ResolveOutput {
-    pub canonical_id: String,
+    pub canonical_id: Option<String>,
     pub anchor: String,
     pub entity_type: Option<String>,
     pub name: Option<String>,
@@ -48,8 +65,13 @@ pub struct ResolveOutput {
     /// New edges written to the graph by this resolution.
     pub new_edges: usize,
     /// How well the input attaches to this entity, `0.0`–`1.0`. Reflects the
-    /// weakest link (the input→entity match), not cluster richness.
+    /// weakest link (the input→entity match), not cluster richness. Always
+    /// equals `score(&confidence_reason)`.
     pub confidence: f32,
+    /// Why the confidence came out the way it did (what to fix if it is low).
+    pub confidence_reason: ConfidenceReason,
+    /// When unresolved/ambiguous, the distinct entities the input could match.
+    pub candidates: Vec<Candidate>,
     /// Per-member edge provenance: `(key, source)`, e.g.
     /// `("wikidata:Q83495", Some("wikidata"))`.
     pub provenance: Vec<(String, Option<String>)>,
@@ -102,80 +124,160 @@ pub fn commit_record_with_source(
     let mut matched_via: Vec<String> = Vec::new();
     let mut new_edges = 0usize;
 
-    // 1. Which existing canonicals do the strong keys already point to?
-    let mut strong_hits: Vec<String> = Vec::new();
-    for id in &strong_ids {
+    // Partition strong keys by grain: identity keys name one thing (drive
+    // identity); affiliation keys (a shared domain) may span many things.
+    let identity_ids: Vec<&ExternalId> = strong_ids
+        .iter()
+        .copied()
+        .filter(|id| id.spec().grain == Grain::Identity)
+        .collect();
+    let affiliation_ids: Vec<&ExternalId> = strong_ids
+        .iter()
+        .copied()
+        .filter(|id| id.spec().grain == Grain::Affiliation)
+        .collect();
+
+    // 1. Which existing canonicals do the identity / affiliation keys hit?
+    let mut identity_hits: Vec<String> = Vec::new();
+    for id in &identity_ids {
         if let Some(canon) = graph.find(&id.key())? {
-            strong_hits.push(canon);
+            identity_hits.push(canon);
         }
     }
-    dedup(&mut strong_hits);
-
-    // 2. Which canonicals does the phone corroborate?
-    let mut phone_hits: Vec<String> = Vec::new();
-    for id in &phone_ids {
-        phone_hits.extend(graph.find_phone(&id.key())?);
+    dedup(&mut identity_hits);
+    let mut affil_hits: Vec<String> = Vec::new();
+    for id in &affiliation_ids {
+        if let Some(canon) = graph.find(&id.key())? {
+            affil_hits.push(canon);
+        }
     }
-    dedup(&mut phone_hits);
+    dedup(&mut affil_hits);
 
-    // 3. Choose the target canonical.
-    let (canonical_id, status) = if !strong_hits.is_empty() {
-        // Strong keys matched. If they span several entities, union them
-        // (strong-key-driven — legitimate). Winner = strongest anchor.
-        let winner = pick_winner(graph, &strong_hits)?;
-        for canon in &strong_hits {
+    // 2. Refuse if the record has NO strong key at all (only phone / name /
+    //    empty). We never mint or attach on the strength of a phone alone.
+    if strong_ids.is_empty() {
+        let mut phone_canons: Vec<String> = Vec::new();
+        for id in &phone_ids {
+            phone_canons.extend(graph.find_phone(&id.key())?);
+        }
+        dedup(&mut phone_canons);
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for c in &phone_canons {
+            if let Some(e) = graph.get_entity(c)? {
+                candidates.push(Candidate {
+                    canonical_id: e.canonical_id,
+                    anchor: e.anchor,
+                    name: e.name,
+                });
+            }
+        }
+        let reason = match candidates.len() {
+            0 => ConfidenceReason::NeedsStrongerIdentifier,
+            1 => ConfidenceReason::PhoneOnly,
+            n => ConfidenceReason::AmbiguousAmongN(n),
+        };
+        return Ok(ResolveOutput {
+            canonical_id: None,
+            anchor: String::new(),
+            entity_type: record.entity_type.clone(),
+            name: record.name.clone(),
+            same_as: Vec::new(),
+            matched_via: Vec::new(),
+            status: Status::Unresolved,
+            harvested,
+            new_edges: 0,
+            confidence: score(&reason),
+            confidence_reason: reason,
+            candidates,
+            provenance: Vec::new(),
+        });
+    }
+
+    // Incoming identity keys, for the affiliation-hit intersection test.
+    let incoming_identity_keys: HashSet<String> =
+        identity_ids.iter().map(|id| id.key()).collect();
+
+    // 3. Choose the target canonical (≥1 strong key present).
+    let (canonical_id, status) = if !identity_hits.is_empty() {
+        // Identity keys matched: legitimately the same thing. Union the identity
+        // hits, then absorb affiliation hits unless they carry a conflicting
+        // identity (a distinct thing sharing only the domain).
+        let winner = pick_winner(graph, &identity_hits)?;
+        for canon in &identity_hits {
             if canon != &winner {
                 graph.merge_into(&winner, canon)?;
             }
         }
-        (winner, Status::Hit)
-    } else if strong_ids.is_empty() {
-        // No strong keys at all: a phone-only (or empty) query.
-        match phone_hits.len() {
-            1 => (phone_hits[0].clone(), Status::Hit),
-            0 => {
-                // Lonely identifier: mint a synthetic entity so it still
-                // resolves to something stable.
-                let anchor = anchor::choose_anchor(&record.same_as);
-                let cid = anchor::canonical_id_for(&anchor);
-                graph.create_entity(
-                    &cid,
-                    &anchor,
-                    record.entity_type.as_deref(),
-                    record.name.as_deref(),
-                )?;
-                (cid, Status::New)
+        for canon in &affil_hits {
+            if canon != &winner
+                && !identity_conflict(&graph.members(&winner)?, &graph.members(canon)?)
+            {
+                graph.merge_into(&winner, canon)?;
             }
-            _ => {
-                // Phone corroborates several distinct entities — ambiguous.
-                // Never merge on phone alone; resolve to the lowest id and flag.
-                matched_via.push("phone (ambiguous: corroborates multiple entities)".into());
-                (phone_hits[0].clone(), Status::Hit)
+        }
+        (winner, Status::Hit)
+    } else if !affil_hits.is_empty() {
+        if identity_ids.is_empty() {
+            // Domain-only / single-instance org: adopt the affiliation cluster.
+            let winner = pick_winner(graph, &affil_hits)?;
+            for canon in &affil_hits {
+                if canon != &winner {
+                    graph.merge_into(&winner, canon)?;
+                }
+            }
+            (winner, Status::Hit)
+        } else {
+            // We carry identity keys; only adopt an affiliation cluster that
+            // already shares one of them, else this is a distinct thing.
+            let mut target: Option<String> = None;
+            for canon in &affil_hits {
+                let c_identity = identity_keys(&graph.members(canon)?);
+                if c_identity
+                    .iter()
+                    .any(|k| incoming_identity_keys.contains(k))
+                {
+                    target = Some(canon.clone());
+                    break;
+                }
+            }
+            match target {
+                Some(c) => (c, Status::Hit),
+                None => (mint_entity(graph, record)?, Status::New),
             }
         }
     } else {
-        // Has strong keys, but none matched an existing entity → a genuinely
-        // new entity. Even if its phone matches something, we do NOT adopt that
-        // entity: phone never merges distinct entities.
-        let anchor = anchor::choose_anchor(&record.same_as);
-        let cid = anchor::canonical_id_for(&anchor);
-        graph.create_entity(
-            &cid,
-            &anchor,
-            record.entity_type.as_deref(),
-            record.name.as_deref(),
-        )?;
-        (cid, Status::New)
+        // Strong keys, but none matched an existing entity → a new entity.
+        (mint_entity(graph, record)?, Status::New)
     };
 
-    // 4. Attach every strong key to the target.
+    // 4. Attach every strong key to the target, except an incoming affiliation
+    //    key currently owned by an entity that is a *distinct* thing (identity
+    //    conflict) — don't steal a shared domain.
     for id in &strong_ids {
-        match graph.find(&id.key())? {
+        let key = id.key();
+        match graph.find(&key)? {
             Some(c) if c == canonical_id => {
                 matched_via.push(id.kind_tag().to_string());
             }
-            _ => {
-                graph.attach_with_source(&id.key(), &canonical_id, Some(source))?;
+            Some(c) => {
+                // Don't steal a shared affiliation key (a chain domain) from a
+                // distinct entity. Compare the *incoming* identity keys (which the
+                // target holds/will hold) against the current owner's identity —
+                // the target's own nodes may not be attached yet on a fresh mint.
+                let owner_identity = identity_keys(&graph.members(&c)?);
+                if id.spec().grain == Grain::Affiliation
+                    && !incoming_identity_keys.is_empty()
+                    && !owner_identity.is_empty()
+                    && incoming_identity_keys.is_disjoint(&owner_identity)
+                {
+                    matched_via.push("domain (shared affiliation; distinct entity)".into());
+                    continue;
+                }
+                graph.attach_with_source(&key, &canonical_id, Some(source))?;
+                new_edges += 1;
+            }
+            None => {
+                graph.attach_with_source(&key, &canonical_id, Some(source))?;
                 new_edges += 1;
             }
         }
@@ -218,20 +320,19 @@ pub fn commit_record_with_source(
 
     dedup(&mut matched_via);
 
-    // Confidence reflects the input→entity attachment strength (weakest link).
-    let confidence = if !strong_ids.is_empty() {
-        crate::confidence::EXACT_STRONG
-    } else if !phone_ids.is_empty() {
-        crate::confidence::PHONE_ONLY
-    } else if entity.anchor.starts_with("local:") {
-        crate::confidence::SYNTHETIC_ONLY
-    } else {
-        crate::confidence::NEW_PUBLIC_ANCHOR
+    // 7. Confidence reason for the resolved path.
+    let reason = match status {
+        Status::Hit => ConfidenceReason::ExactStrongKey,
+        Status::New if anchor::public_anchor(&members).is_some() => {
+            ConfidenceReason::NewPublicAnchor
+        }
+        Status::New => ConfidenceReason::SyntheticStrongKey,
+        Status::Unresolved => unreachable!("unresolved handled above"),
     };
     let provenance = graph.member_sources(&canonical_id)?;
 
     Ok(ResolveOutput {
-        canonical_id,
+        canonical_id: Some(canonical_id),
         anchor: entity.anchor,
         entity_type: entity.entity_type,
         name: entity.name,
@@ -240,9 +341,42 @@ pub fn commit_record_with_source(
         status,
         harvested,
         new_edges,
-        confidence,
+        confidence: score(&reason),
+        confidence_reason: reason,
+        candidates: Vec::new(),
         provenance,
     })
+}
+
+/// Mint a fresh entity for `record`: public anchor if any, else a deterministic
+/// synthetic anchor from the strongest strong key, else a local synthetic id.
+fn mint_entity(graph: &Graph, record: &EntityRecord) -> Result<String> {
+    let anchor = anchor::choose_anchor(&record.same_as);
+    let cid = anchor::canonical_id_for(&anchor);
+    graph.create_entity(
+        &cid,
+        &anchor,
+        record.entity_type.as_deref(),
+        record.name.as_deref(),
+    )?;
+    Ok(cid)
+}
+
+/// The identity-grain keys among `members`.
+fn identity_keys(members: &[ExternalId]) -> HashSet<String> {
+    members
+        .iter()
+        .filter(|id| id.spec().grain == Grain::Identity)
+        .map(|id| id.key())
+        .collect()
+}
+
+/// True iff both member sets carry identity keys and those sets are disjoint —
+/// i.e. they name *distinct* things and must not be merged.
+fn identity_conflict(a: &[ExternalId], b: &[ExternalId]) -> bool {
+    let ka = identity_keys(a);
+    let kb = identity_keys(b);
+    !ka.is_empty() && !kb.is_empty() && ka.is_disjoint(&kb)
 }
 
 /// Resolve a single typed identifier (the CLI `--flag` path).
@@ -262,7 +396,7 @@ pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
     let members = graph.members(canonical_id)?;
     let provenance = graph.member_sources(canonical_id)?;
     Ok(ResolveOutput {
-        canonical_id: entity.canonical_id,
+        canonical_id: Some(entity.canonical_id),
         anchor: entity.anchor,
         entity_type: entity.entity_type,
         name: entity.name,
@@ -273,6 +407,8 @@ pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
         new_edges: 0,
         // A direct canonical-id lookup: we were handed the identity.
         confidence: crate::confidence::DIRECT_LOOKUP,
+        confidence_reason: ConfidenceReason::DirectLookup,
+        candidates: Vec::new(),
         provenance,
     })
 }
@@ -635,14 +771,8 @@ mod tests {
 
         // They must remain DISTINCT despite sharing a phone.
         assert_ne!(out1.canonical_id, out2.canonical_id);
-        assert_eq!(
-            g.find("domain:a-cafe.com").unwrap(),
-            Some(out1.canonical_id.clone())
-        );
-        assert_eq!(
-            g.find("domain:b-cafe.com").unwrap(),
-            Some(out2.canonical_id.clone())
-        );
+        assert_eq!(g.find("domain:a-cafe.com").unwrap(), out1.canonical_id.clone());
+        assert_eq!(g.find("domain:b-cafe.com").unwrap(), out2.canonical_id.clone());
         // The phone corroborates both.
         let phone_canons = g.find_phone("phone:+15106533394").unwrap();
         assert_eq!(phone_canons.len(), 2);
@@ -676,10 +806,10 @@ mod tests {
         )
         .unwrap();
         // Now domain, place_id, wikidata all resolve to the same canonical.
-        assert_eq!(g.find("domain:x.com").unwrap(), Some(out.canonical_id.clone()));
+        assert_eq!(g.find("domain:x.com").unwrap(), out.canonical_id.clone());
         assert_eq!(
             g.find("google_place_id:ChIJxyz").unwrap(),
-            Some(out.canonical_id.clone())
+            out.canonical_id.clone()
         );
         assert_eq!(out.same_as.len(), 3);
         assert_eq!(out.anchor, "wikidata:Q1");

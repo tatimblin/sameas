@@ -11,6 +11,7 @@ use sameas_core::{
     DirectRecordResolver, DomainResolver, EntityRecord, ExternalId, FixtureTransport, Graph,
     PlaceQuery, Resolver, ResolveOutput, Status,
 };
+use sameas_core::confidence::reason_tag;
 
 #[derive(Parser)]
 #[command(
@@ -319,6 +320,17 @@ fn to_json(out: &ResolveOutput, action: &str) -> String {
             )
         })
         .collect();
+    let candidates: Vec<serde_json::Value> = out
+        .candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "canonical_id": c.canonical_id,
+                "anchor": c.anchor,
+                "name": c.name,
+            })
+        })
+        .collect();
     let value = serde_json::json!({
         "action": action,
         "canonical_id": out.canonical_id,
@@ -327,9 +339,11 @@ fn to_json(out: &ResolveOutput, action: &str) -> String {
         "name": out.name,
         "status": out.status.as_str(),
         "confidence": out.confidence,
+        "confidence_reason": reason_tag(&out.confidence_reason),
         "matched_via": out.matched_via,
         "sameAs": same_as,
         "provenance": provenance,
+        "candidates": candidates,
         "completion_count": same_as.len(),
         "harvested": out.harvested,
         "new_edges": out.new_edges,
@@ -341,22 +355,31 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
     let status_word = match out.status {
         Status::New => "new entity",
         Status::Hit => "hit",
+        Status::Unresolved => "unresolved",
     };
     let matched = if out.matched_via.is_empty() {
         "-".to_string()
     } else {
         out.matched_via.join(", ")
     };
+    let id_display = out.canonical_id.as_deref().unwrap_or("(unresolved)");
 
-    println!("  {status_word:<12} {}", out.canonical_id);
-    println!("  {:<12} {}", "anchor:", out.anchor);
+    println!("  {status_word:<12} {id_display}");
+    if !out.anchor.is_empty() {
+        println!("  {:<12} {}", "anchor:", out.anchor);
+    }
     if let Some(t) = &out.entity_type {
         println!("  {:<12} {}", "type:", t);
     }
     if let Some(n) = &out.name {
         println!("  {:<12} {}", "name:", n);
     }
-    println!("  {:<12} {:.2}", "confidence:", out.confidence);
+    println!(
+        "  {:<12} {:.2} ({})",
+        "confidence:",
+        out.confidence,
+        reason_tag(&out.confidence_reason)
+    );
     println!("  {:<12} {}", "matched_via:", matched);
     println!(
         "  {:<12} {} identifiers",
@@ -368,6 +391,20 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
             "  {:<12} harvested {}, {} new edge(s)",
             "graph:", out.harvested, out.new_edges
         );
+    }
+    if !out.candidates.is_empty() {
+        println!("  candidates:  (supply a stronger identifier to disambiguate)");
+        for c in &out.candidates {
+            let who = if c.canonical_id.is_empty() {
+                c.anchor.clone()
+            } else {
+                c.canonical_id.clone()
+            };
+            match &c.name {
+                Some(n) => println!("      - {who}  ({n})"),
+                None => println!("      - {who}"),
+            }
+        }
     }
     println!("  sameAs:");
     for id in &out.same_as {

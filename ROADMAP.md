@@ -118,21 +118,41 @@ phone alone is refused.
 **Objective:** Handle entities in no public hub, keep the graph correct, and
 measure whether a fuzzy layer is ever warranted.
 
-**Deliverables**
-- Synthetic local canonical IDs when no public anchor exists.
-- Provisional entities for the ambiguous band (don't guess-merge).
-- Gated union rules incl. the **entity-grain rule** (domain anchors org;
-  geo/address distinguishes location — chains don't collapse).
-- `sameas link` / `merge` / `split` with edge re-pointing.
-- **Miss-rate instrumentation** — % of inputs answered by exact key vs. hub vs.
-  unresolved. This is the evidence gate for the optional fuzzy phase.
+**Deliverables** *(disambiguation core implemented; corrections + metrics deferred)*
+- **Entity-grain rule** *(implemented)* — each kind has a `grain`
+  (`Identity`/`Affiliation`/`Weak`, `kind.rs`); a shared **Affiliation** key (a
+  chain/studio domain) never merges two entities with disjoint **Identity** keys,
+  and anchor selection prefers Identity keys so two locations don't collide on the
+  same canonical id. Type-agnostic (works for places, movies, products, …).
+- **Resolve-or-refuse** *(implemented)* — resolution requires ≥1 strong key. With
+  no strong key (name-only / phone-only) the resolver **refuses**: `canonical_id =
+  None`, `status = unresolved`, a `confidence_reason`, and `candidates` for the
+  caller to confirm. Strong-key entities with no public anchor get a
+  **deterministic** anchor (no random UUID), so they reproduce across runs.
+- **Confidence as a control signal** *(implemented)* — a `0.0`–`1.0` score plus a
+  `confidence_reason` (`confidence.rs`); a low score says *why* (unique-but-thin,
+  `ambiguous_among_n`, `needs_stronger_identifier`) so the calling app can ask its
+  end user for a stronger identifier and re-resolve.
+- **Ambiguity signal** *(implemented)* — a name/text query matching several
+  places returns `candidates` and refuses rather than guess-merging.
+- `sameas link` / `merge` / `split` with edge re-pointing — **deferred**.
+- **Miss-rate instrumentation** (`sameas stats`) — **deferred**; the evidence gate
+  for the optional fuzzy phase.
 
-**Key components:** synthetic-ID minting, provisional state, correction ops,
-integrity constraints, metrics.
+**Key components:** grain-gated union, deterministic anchors, resolve-or-refuse,
+confidence reason + candidates. (Correction ops + metrics: next.)
 
-**Exit criteria:** a local restaurant with no public ID gets a stable synthetic
-canonical; a wrong link is splittable; two chain locations sharing a domain stay
-distinct; miss rate is reported.
+**Exit criteria:** two chain locations sharing a domain stay distinct *(met)*; a
+place with only a name/city returns "needs a stronger identifier" rather than a
+guessed merge *(met)*; a strong-key entity with no public anchor reproduces its
+canonical id *(met)*. Correction ops (`split`) and reported miss rate: deferred.
+
+> **Note on synthetic IDs.** The original wording ("a local restaurant with no
+> public ID gets a stable synthetic canonical") was refined by a product decision:
+> rather than mint a name-hash synthetic (which risks merging two same-name
+> places), hub-less physical places anchor on a **Placekey** derived from their
+> address (a strong key), and inputs with nothing resolvable are refused with a
+> "needs more info" signal. Fuzzy/name-based matching stays deferred.
 
 ---
 

@@ -117,4 +117,39 @@ else
 fi
 
 hr
-echo "Demo complete. Throwaway DBs: $DB , $DB2"
+echo "STEP 8  M3 — Disambiguation: same name/domain, different real-world things"
+DB3="${TMPDIR:-/tmp}/sameas-demo-m3.db"
+rm -f "$DB3"
+MISS="$ROOT/examples/fixtures/hubs_miss"
+sameas3() { "$BIN" --db "$DB3" "$@"; }
+
+echo
+echo "\$ sameas ingest examples/seed/kibatsu-sf.json ; ingest examples/seed/kibatsu-oakland.json"
+sameas3 ingest "$SEED/kibatsu-sf.json"      >/dev/null
+sameas3 ingest "$SEED/kibatsu-oakland.json" >/dev/null
+echo "  (two Kibatsu locations that SHARE the domain kibatsu.com)"
+
+SF="$(sameas3 --json resolve --place-id KIBATSU_SF  | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "?([^",]*)"?,?/\1/')"
+OAK="$(sameas3 --json resolve --place-id KIBATSU_OAK | grep '"canonical_id"' | head -n1 | sed -E 's/.*: "?([^",]*)"?,?/\1/')"
+echo "  place_id KIBATSU_SF  -> $SF"
+echo "  place_id KIBATSU_OAK -> $OAK"
+if [[ "$SF" != "$OAK" ]]; then
+  echo "  RESULT: DISTINCT ✓ (a shared domain does NOT collapse two locations)"
+else
+  echo "  RESULT: COLLAPSED ✗"; exit 1
+fi
+
+hr
+echo "STEP 8b The shared domain still resolves (to one location, single-valued)"
+echo "\$ sameas resolve --domain kibatsu.com"
+sameas3 resolve --domain kibatsu.com
+
+hr
+echo "STEP 8c Too little to be sure -> REFUSE (confidence is a control signal)"
+echo "\$ sameas resolve --name 'Ghost Kitchen' --city Nowhere --complete --hub-fixtures examples/fixtures/hubs_miss"
+sameas3 resolve --name "Ghost Kitchen" --city Nowhere --complete --hub-fixtures "$MISS"
+echo "  ^ no resolvable identifier -> status 'unresolved' + reason: the caller should"
+echo "    ask its end user for a stronger identifier, then re-resolve."
+
+hr
+echo "Demo complete. Throwaway DBs: $DB , $DB2 , $DB3"
