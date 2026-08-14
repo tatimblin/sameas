@@ -218,10 +218,19 @@ pub fn commit_record_with_source(
         (winner, Status::Hit)
     } else if !affil_hits.is_empty() {
         if identity_ids.is_empty() {
-            // Domain-only / single-instance org: adopt the affiliation cluster.
+            // Domain-only record. Adopt the affiliation cluster, but NEVER union
+            // two owners that carry disjoint identity keys: a record listing two
+            // studios' domains (or a page whose <link rel=canonical> points to a
+            // second registrable domain) must not merge two distinct things.
+            // Only fold in affiliation hits that are compatible with the winner
+            // (same entity, or one side identity-less) — mirroring the identity-
+            // hits branch. Conflicting owners stay separate and keep their own
+            // domain (step 4 refuses to steal it).
             let winner = pick_winner(graph, &affil_hits)?;
             for canon in &affil_hits {
-                if canon != &winner {
+                if canon != &winner
+                    && !identity_conflict(&graph.members(&winner)?, &graph.members(canon)?)
+                {
                     graph.merge_into(&winner, canon)?;
                 }
             }
@@ -259,17 +268,20 @@ pub fn commit_record_with_source(
             Some(c) if c == canonical_id => {
                 matched_via.push(id.kind_tag().to_string());
             }
-            Some(c) => {
-                // Don't steal a shared affiliation key (a chain domain) from a
-                // distinct entity. Compare the *incoming* identity keys (which the
-                // target holds/will hold) against the current owner's identity —
-                // the target's own nodes may not be attached yet on a fresh mint.
-                let owner_identity = identity_keys(&graph.members(&c)?);
-                if id.spec().grain == Grain::Affiliation
-                    && !incoming_identity_keys.is_empty()
-                    && !owner_identity.is_empty()
-                    && incoming_identity_keys.is_disjoint(&owner_identity)
-                {
+            Some(_) => {
+                // A different owner (the equal case is handled above). Don't
+                // steal a shared Affiliation key (a chain/brand domain) from it.
+                // If that owner were truly the same entity it would already have
+                // been unioned above — merge_into re-points its keys, so `find`
+                // would have returned `canonical_id` here. A *different* owner at
+                // this point means we could not prove the two are the same thing
+                // (their identity keys conflict, or the owner is an identity-less
+                // brand org). Re-pointing the domain would be a silent merge-
+                // without-cleanup that orphans that entity and leaves its anchor
+                // naming a key it no longer owns. Leave the key with its owner.
+                // This holds even when the incoming record carries no identity
+                // key of its own (a pure domain-only record).
+                if id.spec().grain == Grain::Affiliation {
                     matched_via.push("domain (shared affiliation; distinct entity)".into());
                     continue;
                 }
@@ -813,5 +825,157 @@ mod tests {
         );
         assert_eq!(out.same_as.len(), 3);
         assert_eq!(out.anchor, "wikidata:Q1");
+    }
+
+    // --- C1: an affiliation-only record must not merge distinct identities ---
+    #[test]
+    fn affiliation_only_record_does_not_merge_distinct_identities() {
+        let g = Graph::open_in_memory().unwrap();
+
+        // P and Q are distinct things (disjoint IMDb identity) that each carry
+        // their own studio domain.
+        let p = commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::imdb("tt1111111").unwrap(),
+                    ExternalId::domain("p-studio.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let q = commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::imdb("tt2222222").unwrap(),
+                    ExternalId::domain("q-studio.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(p.canonical_id, q.canonical_id);
+
+        // A record listing BOTH studio domains and no identity key at all
+        // (e.g. a page whose <link rel=canonical> points at a second domain).
+        // It must NOT union the two distinct clusters.
+        commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::domain("p-studio.com").unwrap(),
+                    ExternalId::domain("q-studio.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The two IMDb identities must STILL resolve to different canonicals.
+        let after_p = g.find("imdb:tt1111111").unwrap();
+        let after_q = g.find("imdb:tt2222222").unwrap();
+        assert!(after_p.is_some() && after_q.is_some());
+        assert_ne!(
+            after_p, after_q,
+            "an affiliation-only record must not merge distinct-identity entities"
+        );
+        // Each domain stays with its own identity's owner (not stolen).
+        assert_eq!(g.find("domain:p-studio.com").unwrap(), after_p);
+        assert_eq!(g.find("domain:q-studio.com").unwrap(), after_q);
+    }
+
+    // --- H1: stealing a domain from an identity-less brand must not orphan it ---
+    #[test]
+    fn store_does_not_orphan_identity_less_brand_owning_the_domain() {
+        let g = Graph::open_in_memory().unwrap();
+
+        // A domain-only brand org: no identity key, anchored on its domain.
+        let brand = commit_record(
+            &g,
+            &EntityRecord {
+                name: Some("Acme".into()),
+                same_as: vec![
+                    ExternalId::domain("acme.com").unwrap(),
+                    ExternalId::phone("+1-800-555-2000").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let brand_id = brand.canonical_id.clone().unwrap();
+        assert_eq!(brand.anchor, "domain:acme.com");
+
+        // A specific store: its own place_id identity + the same brand domain.
+        let store = commit_record(
+            &g,
+            &EntityRecord {
+                name: Some("Acme Store #1".into()),
+                same_as: vec![
+                    ExternalId::google_place_id("STORE1").unwrap(),
+                    ExternalId::domain("acme.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store_id = store.canonical_id.clone().unwrap();
+        assert_ne!(brand_id, store_id);
+
+        // The domain must NOT be stolen: it stays with the brand.
+        assert_eq!(g.find("domain:acme.com").unwrap().as_deref(), Some(brand_id.as_str()));
+        assert_eq!(
+            g.find("google_place_id:STORE1").unwrap().as_deref(),
+            Some(store_id.as_str())
+        );
+
+        // The brand entity survives AND its anchor still names a key it owns
+        // (no stale-anchor orphan).
+        let brand_row = g.get_entity(&brand_id).unwrap().expect("brand must survive");
+        assert_eq!(brand_row.anchor, "domain:acme.com");
+        assert_eq!(
+            g.find(&brand_row.anchor).unwrap().as_deref(),
+            Some(brand_id.as_str()),
+            "an entity's anchor must always name a key it actually owns"
+        );
+    }
+
+    // --- guard against over-correction: legitimate affiliation attach still works ---
+    #[test]
+    fn legitimate_domain_attaches_to_same_identity_entity() {
+        let g = Graph::open_in_memory().unwrap();
+
+        // Seed an entity by its identity key alone.
+        let seed = commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![ExternalId::wikidata("Q1").unwrap()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let seed_id = seed.canonical_id.clone().unwrap();
+
+        // A page carrying that SAME identity plus a new domain: the domain must
+        // attach to the existing entity (not be refused as a "shared" domain).
+        let out = commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::wikidata("Q1").unwrap(),
+                    ExternalId::domain("e.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.canonical_id.as_deref(), Some(seed_id.as_str()));
+        assert_eq!(out.status, Status::Hit);
+        assert_eq!(g.find("domain:e.com").unwrap().as_deref(), Some(seed_id.as_str()));
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"wikidata:Q1".to_string()));
+        assert!(keys.contains(&"domain:e.com".to_string()));
     }
 }
