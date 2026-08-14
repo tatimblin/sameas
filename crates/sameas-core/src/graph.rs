@@ -345,9 +345,15 @@ impl Graph {
     }
 
     /// Find canonical ids for a normalized name, optionally narrowed by qualifier
-    /// tokens. With no qualifiers, matches on name alone. With qualifiers, matches
-    /// entities that share the name **and at least one** qualifier token (the
-    /// "not rigid" rule — indexing by city still hits a later city+state query).
+    /// tokens. With no qualifiers, matches on name alone (bare-name semantics: a
+    /// single hit is confident, several are ambiguous). With qualifiers, a
+    /// candidate matches only when the qualifier set it was **indexed under** is a
+    /// SUBSET of the query's qualifiers — every facet the entity was indexed with
+    /// must also be present in the query. This is the "not rigid, but not
+    /// over-broad" rule: indexing by `{oakland}` still hits a later `{oakland,ca}`
+    /// query (subset holds), a bare-indexed entity (`{}`) hits any qualified query
+    /// (empty ⊆ anything), but an entity indexed under `{boston,us}` does NOT match
+    /// a `{seattle,us}` query (they share only the coarse `us`).
     /// Returns distinct canonical ids, sorted for determinism.
     pub fn find_by_name(&self, name_norm: &str, qualifiers: &[String]) -> Result<Vec<String>> {
         if name_norm.is_empty() {
@@ -358,35 +364,51 @@ impl Graph {
             .map(|q| q.as_str())
             .filter(|q| !q.is_empty())
             .collect();
-        let mut ids: Vec<String> = Vec::new();
-        if quals.is_empty() {
+
+        // Every entity indexed under this name carries a `""` row, so a plain
+        // name match enumerates all candidates.
+        let mut candidates: Vec<String> = {
             let mut stmt = self
                 .conn
                 .prepare("SELECT DISTINCT canonical_id FROM name_index WHERE name_norm = ?1")?;
             let rows = stmt
                 .query_map(params![name_norm], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            ids.extend(rows);
-        } else {
-            // name match AND qualifier IN (…). Build the IN-list placeholders.
-            let placeholders = vec!["?"; quals.len()].join(", ");
-            let sql = format!(
-                "SELECT DISTINCT canonical_id FROM name_index \
-                 WHERE name_norm = ?1 AND qualifier IN ({placeholders})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&name_norm];
-            for q in &quals {
-                binds.push(q);
+            rows
+        };
+
+        // Bare query: name-only semantics — return all same-name entities.
+        // Qualified query: keep only entities whose indexed (non-empty) qualifier
+        // set is a subset of the query's qualifiers.
+        if !quals.is_empty() {
+            let mut kept = Vec::new();
+            for cid in candidates {
+                let indexed = self.indexed_qualifiers(name_norm, &cid)?;
+                if indexed.iter().all(|q| quals.contains(&q.as_str())) {
+                    kept.push(cid);
+                }
             }
-            let rows = stmt
-                .query_map(binds.as_slice(), |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ids.extend(rows);
+            candidates = kept;
         }
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        candidates.sort();
+        candidates.dedup();
+        Ok(candidates)
+    }
+
+    /// The non-empty qualifier tokens an entity was indexed under for `name_norm`.
+    /// (The always-present `""` row is excluded — it is the bare-name marker, not
+    /// a facet.) Used by [`find_by_name`] for the qualifier-subset test.
+    fn indexed_qualifiers(&self, name_norm: &str, canonical_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT qualifier FROM name_index \
+             WHERE name_norm = ?1 AND canonical_id = ?2 AND qualifier != ''",
+        )?;
+        let rows = stmt
+            .query_map(params![name_norm, canonical_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // --- union ----------------------------------------------------------
@@ -516,7 +538,8 @@ mod tests {
             g.find_by_name("basecamp", &["san francisco".into()]).unwrap(),
             vec!["cx_sf".to_string()]
         );
-        // ≥1 overlap: extra qualifier the row doesn't have still matches on the shared one.
+        // Subset holds: indexed {san francisco} ⊆ query {san francisco, ca}, so a
+        // query with an EXTRA (finer) qualifier still hits the indexed entity.
         assert_eq!(
             g.find_by_name("basecamp", &["san francisco".into(), "ca".into()])
                 .unwrap(),
@@ -530,6 +553,39 @@ mod tests {
         // Unknown name / qualifier → no hit.
         assert!(g.find_by_name("nowhere", &[]).unwrap().is_empty());
         assert!(g.find_by_name("basecamp", &["boston".into()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_by_name_qualifier_subset_rule() {
+        let g = Graph::open_in_memory().unwrap();
+        // H5: two same-name entities that share ONLY a coarse country qualifier.
+        g.create_entity("cx_bos", "google_place_id:BOS", None, Some("Acme"))
+            .unwrap();
+        g.create_entity("cx_sea", "google_place_id:SEA", None, Some("Acme"))
+            .unwrap();
+        g.index_name("acme", &["boston".into(), "us".into()], "cx_bos", Some("t"))
+            .unwrap();
+
+        // Querying a DIFFERENT city (sharing only "us") must MISS the Boston
+        // entity — indexed {boston, us} ⊄ query {seattle, us}.
+        assert!(g
+            .find_by_name("acme", &["seattle".into(), "us".into()])
+            .unwrap()
+            .is_empty());
+        // The exact city (superset query) hits.
+        assert_eq!(
+            g.find_by_name("acme", &["boston".into(), "us".into(), "ma".into()])
+                .unwrap(),
+            vec!["cx_bos".to_string()]
+        );
+
+        // M7: a bare-indexed entity (empty qualifier set) is hit by any qualified
+        // query — {} ⊆ anything.
+        g.index_name("cafe x", &[], "cx_sea", Some("t")).unwrap();
+        assert_eq!(
+            g.find_by_name("cafe x", &["oakland".into()]).unwrap(),
+            vec!["cx_sea".to_string()]
+        );
     }
 
     #[test]

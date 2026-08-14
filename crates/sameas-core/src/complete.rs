@@ -66,14 +66,27 @@ fn hubs_for(kind: &str) -> &'static [&'static str] {
     }
 }
 
-/// The "edge is missing" gate: skip a hub when the cluster already carries its
-/// target edge(s), keeping completion local-first and idempotent.
+/// The "edge is missing" gate: skip a hub when the cluster already carries the
+/// edge(s) that hub would ADD, keeping completion local-first and idempotent.
+///
+/// The gate keys on each hub's OUTPUT kinds, never the input tag. Keying on the
+/// input tag self-skips a hub when the input *is* that kind (e.g. a `wikidata:`
+/// input echoes a `wikidata` edge, which would make a `has("wikidata")` gate
+/// true at hop 0), so the hub never runs and the crosswalk it exists to perform
+/// never happens. Keying on the crosswalk target instead lets a `wikidata:` id
+/// harvest website+tmdb+imdb and a `tmdb:` id crosswalk to imdb/wikidata.
 fn skip_if_present(hub: &str, members: &[ExternalId]) -> bool {
     let has = |tag: &str| members.iter().any(|m| m.kind_tag() == tag);
     match hub {
-        "wikidata" => has("wikidata"),
-        "tmdb" => has("tmdb"),
-        "place_details" => has("domain") && has("phone"),
+        // Wikidata crosswalks a movie out to its TMDb id (+ website/imdb); once a
+        // tmdb edge exists the crosswalk has been done.
+        "wikidata" => has("tmdb"),
+        // TMDb crosswalks out to the Wikidata QID (+ imdb).
+        "tmdb" => has("wikidata"),
+        // Place Details yields a website and/or phone. Gate on either: a
+        // phone-less (website-only) place still counts as completed, so it is not
+        // re-fetched every run.
+        "place_details" => has("domain") || has("phone"),
         _ => true,
     }
 }
@@ -335,9 +348,15 @@ pub fn resolve_name(
 
     // Unambiguous (exactly one place_id, or none + a Placekey). Build one record
     // and commit + forward-complete via the place_id.
+    //
+    // Leave `name` empty here: the entity is minted name-less so the resolved
+    // place's displayName (harvested by Place Details during completion) fills
+    // it via `enrich_entity`'s NULL→name path. Seeding the user's query string
+    // as the name would block that (enrich never clobbers). If no hub name
+    // arrives, we fall back to the query name below so the entity isn't nameless.
     let mut record = EntityRecord {
         entity_type: query.entity_type.clone(),
-        name: query.name.clone(),
+        name: None,
         same_as: Vec::new(),
     };
 
@@ -375,23 +394,40 @@ pub fn resolve_name(
         return Ok(out);
     }
 
-    // Confidence by evidence: a full street address yields a precise Placekey;
-    // otherwise a UNIQUE text-search match is a confident (delegated) match —
-    // the candidate count is the signal (several would have refused above).
-    let reason = if query.has_street() {
+    // Confidence by EVIDENCE, not intent: report PlacekeyAddress only when a
+    // Placekey edge actually landed in the cluster. A street was supplied but the
+    // Placekey hub returned nothing → identity rests on the place_id, so a unique
+    // text-search match is a PlaceUniqueMatch (the candidate count is the signal;
+    // several would have refused above).
+    let has_placekey = out.same_as.iter().any(|id| id.kind_tag() == "placekey");
+    let reason = if has_placekey {
         ConfidenceReason::PlacekeyAddress
     } else if unique_place {
         ConfidenceReason::PlaceUniqueMatch
     } else {
+        // Unreachable in practice: reaching here means a strong key was committed
+        // (else the early `canonical_id.is_none()` return fired) that is neither a
+        // Placekey nor a unique place_id — impossible on this path. Retained
+        // defensively so the match stays exhaustive over the evidence tiers.
         ConfidenceReason::PlacekeyCityOnly
     };
     out.confidence = score(&reason);
     out.confidence_reason = reason;
 
-    // Write-through the local name index so the next identical name+qualifier
-    // query is served locally (zero external calls). Index both the query name
-    // and the resolved display name (alias) under the same qualifiers.
+    // Persist a display name and write-through the local name index so the next
+    // identical name+qualifier query is served locally (zero external calls).
     if let Some(cid) = out.canonical_id.clone() {
+        // If completion produced no displayName, keep the entity from being
+        // nameless by filling the query name (enrich only fills a NULL name).
+        if out.name.is_none() {
+            if let Some(qname) = query.name.clone() {
+                graph.enrich_entity(&cid, None, Some(&qname))?;
+                out.name = Some(qname);
+            }
+        }
+        // Index the query name (what the user typed) and the resolved display
+        // name (the hub's canonical name, an alias) under the same qualifiers, so
+        // a later query by EITHER string resolves locally.
         if !name.is_empty() {
             graph.index_name(&name, &quals, &cid, Some("name_query"))?;
         }
@@ -762,5 +798,200 @@ mod tests {
         };
         let hit = resolve_name_local(&g, &q).unwrap().expect("hit");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_park"));
+    }
+
+    #[test]
+    fn wikidata_input_completes_via_output_keyed_gate() {
+        // M2: a direct wikidata id must still harvest website+tmdb+imdb. The hub
+        // gate keys on OUTPUT kinds, so a wikidata input no longer self-skips.
+        let g = Graph::open_in_memory().unwrap();
+        let wd = WikidataResolver::new(
+            ExternalId::wikidata("Q83495").unwrap(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url()
+        .unwrap();
+        let transport = FixtureTransport::from_pairs(vec![(
+            "GET",
+            &wd,
+            json!({"results": {"bindings": [{
+                "item": {"value": "http://www.wikidata.org/entity/Q83495"},
+                "imdb": {"value": "tt0133093"},
+                "website": {"value": "https://www.warnerbros.com/movies/matrix"},
+                "tmdb": {"value": "603"}
+            }]}}),
+        )]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let input = EntityRecord {
+            same_as: vec![ExternalId::wikidata("Q83495").unwrap()],
+            ..Default::default()
+        };
+        let out = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"domain:warnerbros.com".to_string()), "{keys:?}");
+        assert!(keys.contains(&"tmdb:603".to_string()), "{keys:?}");
+        assert!(keys.contains(&"imdb:tt0133093".to_string()), "{keys:?}");
+
+        // Idempotent: a second run adds no edges (all output edges present).
+        let second = resolve_and_complete(&g, &input, &ctx).unwrap();
+        assert_eq!(second.new_edges, 0, "second run should add no edges");
+    }
+
+    #[test]
+    fn tmdb_input_crosswalks_to_imdb_and_wikidata() {
+        // M2: a direct tmdb id crosswalks out to imdb + wikidata.
+        let g = Graph::open_in_memory().unwrap();
+        let ext = "https://api.themoviedb.org/3/movie/603/external_ids?api_key=";
+        let transport = FixtureTransport::from_pairs(vec![(
+            "GET",
+            ext,
+            json!({"imdb_id": "tt0133093", "wikidata_id": "Q83495"}),
+        )]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let input = EntityRecord {
+            same_as: vec![ExternalId::new("tmdb", "603").unwrap()],
+            ..Default::default()
+        };
+        let out = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"imdb:tt0133093".to_string()), "{keys:?}");
+        assert!(keys.contains(&"wikidata:Q83495".to_string()), "{keys:?}");
+
+        let second = resolve_and_complete(&g, &input, &ctx).unwrap();
+        assert_eq!(second.new_edges, 0, "second run should add no edges");
+    }
+
+    #[test]
+    fn street_without_placekey_reports_place_unique_not_placekey() {
+        // M3: a street was supplied but the Placekey hub returned nothing, so the
+        // reason must reflect the ACTUAL evidence (a unique place_id), not the
+        // intent (PlacekeyAddress).
+        let g = Graph::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Blue Bottle Coffee".into()),
+            street: Some("300 Webster St".into()),
+            city: Some("Oakland".into()),
+            region: Some("CA".into()),
+            country: Some("US".into()),
+            ..Default::default()
+        };
+        let text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(query.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let details_url = PlaceDetailsResolver::new(
+            ExternalId::google_place_id("PID_X").unwrap(),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        // Placekey returns an empty object → no placekey edge.
+        let transport = FixtureTransport::from_pairs(vec![
+            ("POST", "https://api.placekey.io/v1/placekey", json!({})),
+            ("POST", &text_url, json!({"places": [{"id": "PID_X"}]})),
+            (
+                "GET",
+                &details_url,
+                json!({"displayName": {"text": "Blue Bottle Coffee"}, "websiteUri": "https://bluebottlecoffee.com/"}),
+            ),
+        ]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let out = resolve_name(&g, &query, &ctx).unwrap();
+        assert!(
+            !out.same_as.iter().any(|i| i.kind_tag() == "placekey"),
+            "no placekey expected: {:?}",
+            out.same_as
+        );
+        assert_eq!(out.confidence_reason, ConfidenceReason::PlaceUniqueMatch);
+        assert!((out.confidence - crate::confidence::PLACE_UNIQUE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_name_persists_display_name_and_indexes_alias() {
+        // M4 + M6: the hub displayName becomes the stored name, and BOTH the query
+        // name and the resolved displayName are indexed under the qualifiers, so a
+        // later LOCAL query by either string hits the same entity.
+        let g = Graph::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Nickname".into()),
+            city: Some("Portland".into()),
+            ..Default::default()
+        };
+        let text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(query.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let details_url = PlaceDetailsResolver::new(
+            ExternalId::google_place_id("PID_OFFICIAL").unwrap(),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("POST", &text_url, json!({"places": [{"id": "PID_OFFICIAL"}]})),
+            (
+                "GET",
+                &details_url,
+                json!({"displayName": {"text": "Official Name"}, "websiteUri": "https://official.example/"}),
+            ),
+        ]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let cid = first.canonical_id.clone().expect("resolve should succeed");
+        // Stored name is the hub displayName, not the query nickname.
+        assert_eq!(first.name.as_deref(), Some("Official Name"));
+
+        // A LOCAL query for the OFFICIAL name + same qualifier hits the entity.
+        let official = NameQuery {
+            name: Some("Official Name".into()),
+            city: Some("Portland".into()),
+            ..Default::default()
+        };
+        let hit = resolve_name_local(&g, &official)
+            .unwrap()
+            .expect("alias local hit");
+        assert_eq!(hit.canonical_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(hit.confidence_reason, ConfidenceReason::LocalNameMatch);
+
+        // The original nickname still resolves locally too.
+        let nick = resolve_name_local(&g, &query)
+            .unwrap()
+            .expect("query-name local hit");
+        assert_eq!(nick.canonical_id.as_deref(), Some(cid.as_str()));
+    }
+
+    #[test]
+    fn local_name_does_not_serve_wrong_entity_on_coarse_overlap() {
+        // H5: an entity cached under {boston, us} must NOT be returned for a
+        // {seattle, us} query sharing only the coarse country — it misses locally
+        // (so the caller reaches out) rather than confidently serving Boston.
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_bos", "google_place_id:BOS", None, Some("Acme"))
+            .unwrap();
+        g.index_name("acme", &["boston".into(), "us".into()], "cx_bos", Some("t"))
+            .unwrap();
+
+        let seattle = NameQuery {
+            name: Some("Acme".into()),
+            city: Some("Seattle".into()),
+            country: Some("US".into()),
+            ..Default::default()
+        };
+        assert!(resolve_name_local(&g, &seattle).unwrap().is_none());
+
+        let boston = NameQuery {
+            name: Some("Acme".into()),
+            city: Some("Boston".into()),
+            country: Some("US".into()),
+            ..Default::default()
+        };
+        let hit = resolve_name_local(&g, &boston)
+            .unwrap()
+            .expect("boston hits");
+        assert_eq!(hit.canonical_id.as_deref(), Some("cx_bos"));
     }
 }
