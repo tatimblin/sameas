@@ -7,9 +7,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use sameas_core::{
-    commit_record, complete_place_query, load_entity, resolve_and_complete, CompletionCtx,
-    DirectRecordResolver, DomainResolver, EntityRecord, ExternalId, FixtureTransport, Graph,
-    PlaceQuery, Resolver, ResolveOutput, Status,
+    commit_record, load_entity, name_not_found, resolve_and_complete, resolve_name,
+    resolve_name_local, CompletionCtx, DirectRecordResolver, DomainResolver, EntityRecord,
+    ExternalId, FixtureTransport, Graph, NameQuery, Resolver, ResolveOutput, Status,
 };
 use sameas_core::confidence::reason_tag;
 
@@ -96,6 +96,11 @@ struct ResolveArgs {
     /// ISO country code for --name (e.g. `US`).
     #[arg(long)]
     country: Option<String>,
+    /// Generic disambiguating qualifier for --name; repeatable. Type-agnostic —
+    /// a city, state, borough, year, etc. (e.g. `--qualifier Brooklyn`,
+    /// `--qualifier 1999`). Used to match/cache by name locally.
+    #[arg(long = "qualifier")]
+    qualifiers: Vec<String>,
 
     /// Optional: harvest extra sameAs from a domain's page HTML fixture (offline
     /// enrichment). Without it, --domain is a plain graph key lookup.
@@ -152,19 +157,23 @@ fn run() -> Result<()> {
 fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
     // Name/address is a reverse-resolution path: it needs the hubs.
     if let Some(name) = &args.name {
-        if !args.complete {
-            bail!("--name requires --complete (name/address is resolved via hub reverse-resolvers)");
-        }
-        let query = PlaceQuery {
+        let query = NameQuery {
             name: Some(name.clone()),
+            qualifiers: args.qualifiers.clone(),
+            entity_type: None,
             street: args.address.clone(),
             city: args.city.clone(),
             region: args.region.clone(),
             country: args.country.clone(),
-            entity_type: None,
         };
-        let ctx = build_completion_ctx(args)?;
-        return complete_place_query(graph, &query, &ctx);
+        // With --complete, resolve graph-first then reach out to hubs on a miss.
+        // Without it, do a local-only lookup (zero network): a hit is served from
+        // the graph; a miss says "re-run with --complete".
+        if args.complete {
+            let ctx = build_completion_ctx(args)?;
+            return resolve_name(graph, &query, &ctx);
+        }
+        return Ok(resolve_name_local(graph, &query)?.unwrap_or_else(|| name_not_found(&query)));
     }
 
     // Build an EntityRecord from whichever typed source was given.

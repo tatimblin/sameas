@@ -8,7 +8,7 @@
 //!
 //! Only forward completions run speculatively (imdb/wikidata/tmdb crosswalk;
 //! place_id → details). Reverse-resolvers (phone/name/address → place_id /
-//! Placekey) are **entry-point only** — see [`complete_place_query`] — because
+//! Placekey) are **entry-point only** — see [`resolve_name`] — because
 //! auto-running them on every domain/phone in a cluster would risk false place
 //! edges (a movie's website is not a place).
 //!
@@ -179,18 +179,95 @@ pub fn resolve_and_complete(
     Ok(out)
 }
 
-/// Resolve a name/address query: reverse-resolve to a Placekey anchor **and** a
-/// Google place_id (via text search), merge both into one record so they land in
-/// a single cluster, commit, then forward-complete (place_id → website + phone).
-///
-/// Confidence is bounded by the coarseness of the query (`city_only`), even
-/// though completion may be rich — the identity match is only as good as the
-/// text/address lookup.
-pub fn complete_place_query(
+/// Local-only name resolution: answer a name + qualifiers query **from the graph
+/// alone, with zero external calls**. Returns `Some(hit)` for a unique match,
+/// `Some(unresolved+candidates)` when several distinct entities match (ambiguous
+/// — reaching out wouldn't disambiguate what we already know is plural), or
+/// `None` on a miss (the caller may then reach out via [`resolve_name`]).
+pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<ResolveOutput>> {
+    let name = query.match_name();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let quals = query.qualifier_tokens();
+    let hits = graph.find_by_name(&name, &quals)?;
+    if hits.len() == 1 {
+        let mut out = load_entity(graph, &hits[0])?;
+        out.confidence_reason = ConfidenceReason::LocalNameMatch;
+        out.confidence = score(&out.confidence_reason);
+        return Ok(Some(out));
+    }
+    if hits.len() > 1 {
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for cid in &hits {
+            if let Some(e) = graph.get_entity(cid)? {
+                candidates.push(Candidate {
+                    canonical_id: e.canonical_id,
+                    anchor: e.anchor,
+                    name: e.name,
+                });
+            }
+        }
+        let reason = ConfidenceReason::AmbiguousAmongN(candidates.len());
+        return Ok(Some(ResolveOutput {
+            canonical_id: None,
+            anchor: String::new(),
+            entity_type: query.entity_type.clone(),
+            name: query.name.clone(),
+            same_as: Vec::new(),
+            matched_via: Vec::new(),
+            status: Status::Unresolved,
+            harvested: 0,
+            new_edges: 0,
+            confidence: score(&reason),
+            confidence_reason: reason,
+            candidates,
+            provenance: Vec::new(),
+        }));
+    }
+    Ok(None)
+}
+
+/// A structured "not found in the local graph" result — used when a name query
+/// is run local-only (no `--complete`) and misses. Signals the caller to reach
+/// out (or supply a stronger identifier).
+pub fn name_not_found(query: &NameQuery) -> ResolveOutput {
+    let reason = ConfidenceReason::NeedsStrongerIdentifier;
+    ResolveOutput {
+        canonical_id: None,
+        anchor: String::new(),
+        entity_type: query.entity_type.clone(),
+        name: query.name.clone(),
+        same_as: Vec::new(),
+        matched_via: vec![
+            "not in local graph — re-run with --complete to reach external hubs".into(),
+        ],
+        status: Status::Unresolved,
+        harvested: 0,
+        new_edges: 0,
+        confidence: score(&reason),
+        confidence_reason: reason,
+        candidates: Vec::new(),
+        provenance: Vec::new(),
+    }
+}
+
+/// Resolve a name/address query: **graph-first** (see [`resolve_name_local`]),
+/// then, on a miss, reverse-resolve via the hubs (Placekey when a street is
+/// present + Google Text Search → place_id → website/phone) and **write the
+/// name+qualifiers into the local index** so the next identical query is local.
+pub fn resolve_name(
     graph: &Graph,
-    query: &PlaceQuery,
+    query: &NameQuery,
     ctx: &CompletionCtx,
 ) -> Result<ResolveOutput> {
+    // 0. Graph-first: zero external calls when we've seen this name before.
+    if let Some(out) = resolve_name_local(graph, query)? {
+        return Ok(out);
+    }
+    let name = query.match_name();
+    let quals = query.qualifier_tokens();
+
     // Google place_id candidates via text search (best-effort). We look at
     // *all* candidates: more than one means the query is ambiguous.
     let ts = PlaceTextSearchResolver::new(
@@ -198,13 +275,19 @@ pub fn complete_place_query(
         ctx.google_key.clone(),
         ctx.transport.clone(),
     );
-    let place_ids: Vec<String> = match ctx.transport.get_json(&ts.url()) {
-        Ok(v) => PlaceTextSearchResolver::parse_all(&v).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    let place_ids: Vec<String> = ts.candidates().unwrap_or_default();
 
     // Ambiguous on the place itself: refuse to commit a place_id (and keep the
     // Placekey out, to avoid a half-built entity). Ask for a stronger query.
+    //
+    // DEFERRED (candidate enrichment): for candidates not already in the graph we
+    // emit only the bare place_id key with `name: None` — enough for a machine to
+    // detect ambiguity, but NOT enough for a caller (e.g. an AI agent) to turn the
+    // list into a human-answerable "which one?" question with meaningful options.
+    // Making candidates choosable means fetching Place Details (name + formatted
+    // address) per un-graphed candidate here. That costs one external call per
+    // candidate on an ambiguous query — a deliberate exception to "reach out as
+    // little as possible" — so it's deferred until a consumer actually needs it.
     if place_ids.len() > 1 {
         let mut candidates: Vec<Candidate> = Vec::new();
         for pid in &place_ids {
@@ -258,18 +341,26 @@ pub fn complete_place_query(
         same_as: Vec::new(),
     };
 
-    // Placekey anchor (best-effort).
-    if let Some(pk) = crate::hubs::placekey::PlacekeyResolver::new(
-        query.clone(),
-        ctx.placekey_key.clone(),
-        ctx.transport.clone(),
-    )
-    .harvest()
-    .ok()
-    .and_then(|r| r.same_as.into_iter().next())
-    {
-        record.same_as.push(pk);
+    // Placekey anchor (best-effort) — only when we have a street address, since
+    // Placekey's minimum inputs require a street (or lat/long): a name+city query
+    // can't produce a Placekey, so skip the guaranteed-failing round-trip and let
+    // the Google place_id carry the identity.
+    if query.has_street() {
+        if let Some(pk) = crate::hubs::placekey::PlacekeyResolver::new(
+            query.clone(),
+            ctx.placekey_key.clone(),
+            ctx.transport.clone(),
+        )
+        .harvest()
+        .ok()
+        .and_then(|r| r.same_as.into_iter().next())
+        {
+            record.same_as.push(pk);
+        }
     }
+    // At this point the text search returned 0 or 1 candidate (>1 already refused
+    // above). Exactly one is a confident, unique hub match.
+    let unique_place = place_ids.len() == 1;
     if let Some(pid) = place_ids.into_iter().next() {
         let id = ExternalId::google_place_id(&pid)?;
         if !record.same_as.iter().any(|e| e == &id) {
@@ -284,33 +375,60 @@ pub fn complete_place_query(
         return Ok(out);
     }
 
-    // Confidence is bounded by the coarseness of the query, not cluster richness.
-    let reason = if query.is_city_only() {
-        ConfidenceReason::PlacekeyCityOnly
-    } else {
+    // Confidence by evidence: a full street address yields a precise Placekey;
+    // otherwise a UNIQUE text-search match is a confident (delegated) match —
+    // the candidate count is the signal (several would have refused above).
+    let reason = if query.has_street() {
         ConfidenceReason::PlacekeyAddress
+    } else if unique_place {
+        ConfidenceReason::PlaceUniqueMatch
+    } else {
+        ConfidenceReason::PlacekeyCityOnly
     };
     out.confidence = score(&reason);
     out.confidence_reason = reason;
+
+    // Write-through the local name index so the next identical name+qualifier
+    // query is served locally (zero external calls). Index both the query name
+    // and the resolved display name (alias) under the same qualifiers.
+    if let Some(cid) = out.canonical_id.clone() {
+        if !name.is_empty() {
+            graph.index_name(&name, &quals, &cid, Some("name_query"))?;
+        }
+        if let Some(display) = out.name.clone() {
+            let alias = crate::normalize::name_key(&display);
+            if !alias.is_empty() && alias != name {
+                graph.index_name(&alias, &quals, &cid, Some("name_query"))?;
+            }
+        }
+    }
     Ok(out)
 }
 
-/// A transient place query for the reverse-resolvers. Never persisted — only the
-/// resulting IDs (Placekey, place_id, …) are stored.
+/// A transient, **type-agnostic** query: a name plus free-form qualifier tokens
+/// (city / state / borough / year / …). Never persisted as content — only the
+/// resulting IDs (place_id, Placekey, …) and a minimal name/qualifier match key
+/// are stored. The `street`/`city`/`region`/`country` fields are place-hub
+/// specifics used only by the Placekey adapter; a movie/park/etc. uses `name` +
+/// `qualifiers` and leaves them `None`.
 #[derive(Clone, Debug, Default)]
-pub struct PlaceQuery {
+pub struct NameQuery {
     pub name: Option<String>,
+    /// Free-form disambiguating facets — the engine treats these as opaque
+    /// tokens, never as typed city/state/year.
+    pub qualifiers: Vec<String>,
+    pub entity_type: Option<String>,
     pub street: Option<String>,
     pub city: Option<String>,
     pub region: Option<String>,
     pub country: Option<String>,
-    pub entity_type: Option<String>,
 }
 
-impl PlaceQuery {
-    /// A free-text query for Find-Place: `"name, street, city region country"`.
+impl NameQuery {
+    /// A free-text query for the hub Text Search: name, address parts, and any
+    /// extra qualifier tokens joined with commas.
     pub fn text_query(&self) -> String {
-        [
+        let mut parts: Vec<&str> = [
             self.name.as_deref(),
             self.street.as_deref(),
             self.city.as_deref(),
@@ -319,13 +437,41 @@ impl PlaceQuery {
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+        parts.extend(self.qualifiers.iter().map(|q| q.as_str()));
+        parts.join(", ")
     }
 
-    /// Coarse query: a name and a city (or less) but no street address.
-    pub fn is_city_only(&self) -> bool {
-        self.street.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+    /// Normalized name for the local name index (empty if no usable name).
+    pub fn match_name(&self) -> String {
+        self.name
+            .as_deref()
+            .map(crate::normalize::name_key)
+            .unwrap_or_default()
+    }
+
+    /// Normalized qualifier tokens for the local name index: the free-form
+    /// `qualifiers` plus `city`/`region`/`country` when present. `street` is
+    /// excluded (too specific; it only feeds Placekey). Deduped, non-empty.
+    pub fn qualifier_tokens(&self) -> Vec<String> {
+        let mut toks: Vec<String> = self
+            .qualifiers
+            .iter()
+            .map(|q| q.as_str())
+            .chain([self.city.as_deref(), self.region.as_deref(), self.country.as_deref()]
+                .into_iter()
+                .flatten())
+            .map(crate::normalize::name_key)
+            .filter(|t| !t.is_empty())
+            .collect();
+        toks.sort();
+        toks.dedup();
+        toks
+    }
+
+    /// A non-empty street address is present — the minimum Placekey needs.
+    pub fn has_street(&self) -> bool {
+        self.street.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
     }
 }
 
@@ -386,15 +532,15 @@ mod tests {
     fn place_id_completes_to_website_and_phone() {
         // Exit criterion 2: a place_id completes to website + phone.
         let g = Graph::open_in_memory().unwrap();
-        let details = "https://maps.googleapis.com/maps/api/place/details/json?place_id=ChIJN1&fields=website,international_phone_number,name&key=";
+        let details = "https://places.googleapis.com/v1/places/ChIJN1";
         let transport = FixtureTransport::from_pairs(vec![(
             "GET",
             details,
-            json!({"status": "OK", "result": {
-                "name": "Blue Bottle Coffee",
-                "website": "https://bluebottlecoffee.com/",
-                "international_phone_number": "+1 510-653-3394"
-            }}),
+            json!({
+                "displayName": { "text": "Blue Bottle Coffee" },
+                "websiteUri": "https://bluebottlecoffee.com/",
+                "internationalPhoneNumber": "+1 510-653-3394"
+            }),
         )]);
         let ctx = CompletionCtx::new(Arc::new(transport));
 
@@ -412,14 +558,14 @@ mod tests {
     fn completion_is_idempotent() {
         // Re-running completion on an already-complete cluster adds no edges.
         let g = Graph::open_in_memory().unwrap();
-        let details = "https://maps.googleapis.com/maps/api/place/details/json?place_id=ChIJN1&fields=website,international_phone_number,name&key=";
+        let details = "https://places.googleapis.com/v1/places/ChIJN1";
         let transport = FixtureTransport::from_pairs(vec![(
             "GET",
             details,
-            json!({"status": "OK", "result": {
-                "website": "https://bluebottlecoffee.com/",
-                "international_phone_number": "+1 510-653-3394"
-            }}),
+            json!({
+                "websiteUri": "https://bluebottlecoffee.com/",
+                "internationalPhoneNumber": "+1 510-653-3394"
+            }),
         )]);
         let ctx = CompletionCtx::new(Arc::new(transport));
         let input = EntityRecord {
@@ -432,12 +578,14 @@ mod tests {
     }
 
     #[test]
-    fn name_city_resolves_via_placekey_and_completes_via_place_id() {
+    fn full_address_resolves_via_placekey_and_completes_via_place_id() {
         use crate::hubs::{PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
 
         let g = Graph::open_in_memory().unwrap();
-        let query = PlaceQuery {
+        // A full street address → Placekey runs (its minimum inputs are met).
+        let query = NameQuery {
             name: Some("Blue Bottle Coffee".into()),
+            street: Some("300 Webster St".into()),
             city: Some("Oakland".into()),
             region: Some("CA".into()),
             country: Some("US".into()),
@@ -460,27 +608,27 @@ mod tests {
 
         let transport = FixtureTransport::from_pairs(vec![
             ("POST", "https://api.placekey.io/v1/placekey", json!({"placekey": "227-223@5vg-7gq-tvz"})),
-            ("GET", &text_url, json!({"status": "OK", "candidates": [{"place_id": "EXAMPLE_blue_bottle_oakland"}]})),
+            ("POST", &text_url, json!({"places": [{"id": "EXAMPLE_blue_bottle_oakland"}]})),
             (
                 "GET",
                 &details_url,
-                json!({"status": "OK", "result": {
-                    "website": "https://bluebottlecoffee.com/",
-                    "international_phone_number": "+1 510-653-3394"
-                }}),
+                json!({
+                    "websiteUri": "https://bluebottlecoffee.com/",
+                    "internationalPhoneNumber": "+1 510-653-3394"
+                }),
             ),
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
 
-        let out = complete_place_query(&g, &query, &ctx).unwrap();
+        let out = resolve_name(&g, &query, &ctx).unwrap();
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"placekey:227-223@5vg-7gq-tvz".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"google_place_id:EXAMPLE_blue_bottle_oakland".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"domain:bluebottlecoffee.com".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"phone:+15106533394".to_string()), "keys={keys:?}");
-        // Placekey (rank 1) is the anchor; the coarse city-only query is low-confidence.
+        // Placekey (rank 1) is the anchor; a full-address match is higher confidence.
         assert_eq!(out.anchor, "placekey:227-223@5vg-7gq-tvz");
-        assert!((out.confidence - crate::confidence::PLACEKEY_CITY).abs() < 1e-6);
+        assert!((out.confidence - crate::confidence::PLACEKEY_ADDRESS).abs() < 1e-6);
     }
 
     #[test]
@@ -532,5 +680,87 @@ mod tests {
         .unwrap();
         assert_eq!(phone_only.status, Status::Unresolved);
         assert!(phone_only.canonical_id.is_none());
+    }
+
+    #[test]
+    fn name_query_caches_second_lookup_is_local() {
+        use crate::hubs::{PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
+
+        let g = Graph::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Blue Bottle Coffee".into()),
+            city: Some("Oakland".into()),
+            region: Some("CA".into()),
+            country: Some("US".into()),
+            ..Default::default()
+        };
+        let text_url = PlaceTextSearchResolver::new(
+            TextSearchInput::Text(query.text_query()),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let details_url = PlaceDetailsResolver::new(
+            ExternalId::google_place_id("PID1").unwrap(),
+            String::new(),
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("POST", &text_url, json!({"places": [{"id": "PID1"}]})),
+            ("GET", &details_url, json!({"websiteUri": "https://bluebottlecoffee.com/"})),
+        ]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+
+        // First resolution reaches the (fixture) hub and records the name index.
+        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let cid = first.canonical_id.clone().expect("first resolve should succeed");
+
+        // Local-only lookup takes NO transport at all → proves zero external calls.
+        let second = resolve_name_local(&g, &query).unwrap().expect("cached local hit");
+        assert_eq!(second.canonical_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(second.confidence_reason, ConfidenceReason::LocalNameMatch);
+    }
+
+    #[test]
+    fn name_index_ambiguous_returns_candidates() {
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_sf", "google_place_id:SF", None, Some("Basecamp")).unwrap();
+        g.create_entity("cx_ny", "google_place_id:NY", None, Some("Basecamp")).unwrap();
+        g.index_name("basecamp", &["san francisco".into()], "cx_sf", Some("t")).unwrap();
+        g.index_name("basecamp", &["new york".into()], "cx_ny", Some("t")).unwrap();
+
+        // Bare name matches both → ambiguous (definitive; no external call).
+        let bare = NameQuery { name: Some("Basecamp".into()), ..Default::default() };
+        let out = resolve_name_local(&g, &bare).unwrap().expect("ambiguous is definitive");
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.candidates.len(), 2);
+
+        // A qualifier narrows to the one entity.
+        let sf = NameQuery {
+            name: Some("Basecamp".into()),
+            qualifiers: vec!["San Francisco".into()],
+            ..Default::default()
+        };
+        let hit = resolve_name_local(&g, &sf).unwrap().expect("unique");
+        assert_eq!(hit.canonical_id.as_deref(), Some("cx_sf"));
+    }
+
+    #[test]
+    fn name_index_is_type_agnostic_about_the_facet() {
+        // The qualifier is a state here (a national park), not a city — same
+        // machinery, no place-specific assumptions.
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_park", "wikidata:Q180402", Some("Park"), Some("Yosemite"))
+            .unwrap();
+        g.index_name("yosemite", &["california".into()], "cx_park", Some("t")).unwrap();
+
+        let q = NameQuery {
+            name: Some("Yosemite".into()),
+            qualifiers: vec!["California".into()],
+            ..Default::default()
+        };
+        let hit = resolve_name_local(&g, &q).unwrap().expect("hit");
+        assert_eq!(hit.canonical_id.as_deref(), Some("cx_park"));
     }
 }

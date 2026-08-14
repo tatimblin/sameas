@@ -29,7 +29,10 @@ pub mod normalize;
 pub mod resolve;
 pub mod transport;
 
-pub use complete::{complete_place_query, resolve_and_complete, CompletionCtx, PlaceQuery};
+pub use complete::{
+    name_not_found, resolve_and_complete, resolve_name, resolve_name_local, CompletionCtx,
+    NameQuery,
+};
 pub use confidence::ConfidenceReason;
 pub use graph::Graph;
 pub use kind::{spec_for_tag, Grain, KindSpec, KINDS};

@@ -14,11 +14,19 @@
 pub const EXACT_STRONG: f32 = 0.95;
 /// Completed through a strong-key hub crosswalk (e.g. imdb → wikidata → tmdb).
 pub const HUB_CROSSWALK: f32 = 0.90;
-/// Placekey derived from a full street address.
-pub const PLACEKEY_ADDRESS: f32 = 0.70;
+/// Placekey derived from a full street address — precise, high confidence.
+pub const PLACEKEY_ADDRESS: f32 = 0.85;
+/// A text/name query the hub resolved to a SINGLE place — a confident (if
+/// delegated) match. Not as certain as a user-supplied exact id.
+pub const PLACE_UNIQUE: f32 = 0.80;
 /// New entity minted with a public anchor, no corroboration.
 pub const NEW_PUBLIC_ANCHOR: f32 = 0.60;
-/// Placekey / text-search derived from name + city only (coarse).
+/// A repeat name+qualifier query served from the local name index (cached prior
+/// resolution). Conservative/medium — still a name match; the broader name-match
+/// confidence tier is an open decision.
+pub const LOCAL_NAME: f32 = 0.60;
+/// Text/name query resolved but only coarsely (kept for a future match-score
+/// signal; the count-based path uses `PLACE_UNIQUE`/`AMBIGUOUS`).
 pub const PLACEKEY_CITY: f32 = 0.40;
 /// Phone-only corroboration — a hypothesis, never a merge.
 pub const PHONE_ONLY: f32 = 0.30;
@@ -42,6 +50,8 @@ pub enum ConfidenceReason {
     ExactStrongKey,
     HubCrosswalk,
     PlacekeyAddress,
+    PlaceUniqueMatch,
+    LocalNameMatch,
     NewPublicAnchor,
     PlacekeyCityOnly,
     PhoneOnly,
@@ -58,6 +68,8 @@ pub fn score(reason: &ConfidenceReason) -> f32 {
         ConfidenceReason::ExactStrongKey => EXACT_STRONG,
         ConfidenceReason::HubCrosswalk => HUB_CROSSWALK,
         ConfidenceReason::PlacekeyAddress => PLACEKEY_ADDRESS,
+        ConfidenceReason::PlaceUniqueMatch => PLACE_UNIQUE,
+        ConfidenceReason::LocalNameMatch => LOCAL_NAME,
         ConfidenceReason::NewPublicAnchor => NEW_PUBLIC_ANCHOR,
         ConfidenceReason::PlacekeyCityOnly => PLACEKEY_CITY,
         ConfidenceReason::PhoneOnly => PHONE_ONLY,
@@ -74,6 +86,8 @@ pub fn reason_tag(reason: &ConfidenceReason) -> &'static str {
         ConfidenceReason::ExactStrongKey => "exact_strong_key",
         ConfidenceReason::HubCrosswalk => "hub_crosswalk",
         ConfidenceReason::PlacekeyAddress => "placekey_address",
+        ConfidenceReason::PlaceUniqueMatch => "place_unique_match",
+        ConfidenceReason::LocalNameMatch => "local_name_match",
         ConfidenceReason::NewPublicAnchor => "new_public_anchor",
         ConfidenceReason::PlacekeyCityOnly => "placekey_city_only",
         ConfidenceReason::PhoneOnly => "phone_only",

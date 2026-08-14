@@ -52,6 +52,15 @@ CREATE TABLE IF NOT EXISTS phone_edges (
     FOREIGN KEY(canonical_id) REFERENCES entities(canonical_id)
 );
 CREATE INDEX IF NOT EXISTS idx_phone_canonical ON phone_edges(canonical_id);
+CREATE TABLE IF NOT EXISTS name_index (
+    name_norm    TEXT NOT NULL,
+    qualifier    TEXT NOT NULL,
+    canonical_id TEXT NOT NULL,
+    source       TEXT,
+    PRIMARY KEY (name_norm, qualifier, canonical_id),
+    FOREIGN KEY(canonical_id) REFERENCES entities(canonical_id)
+);
+CREATE INDEX IF NOT EXISTS idx_name_index_name ON name_index(name_norm);
 "#;
 
 impl Graph {
@@ -305,6 +314,81 @@ impl Graph {
         Ok(ids)
     }
 
+    // --- local name index (resolve name + qualifiers offline) -----------
+
+    /// Index an entity under a normalized name and a set of normalized qualifier
+    /// tokens (city / state / borough / year / …). Writes one row per qualifier,
+    /// plus a `qualifier = ""` row so a bare-name query can still match. Both
+    /// name and qualifiers are expected already normalized (via
+    /// `normalize::name_key`).
+    pub fn index_name(
+        &self,
+        name_norm: &str,
+        qualifiers: &[String],
+        canonical_id: &str,
+        source: Option<&str>,
+    ) -> Result<()> {
+        if name_norm.is_empty() {
+            return Ok(());
+        }
+        // Empty-string row lets a name-only query match; qualifier rows add facets.
+        let mut quals: Vec<&str> = vec![""];
+        quals.extend(qualifiers.iter().map(|q| q.as_str()).filter(|q| !q.is_empty()));
+        for q in quals {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO name_index(name_norm, qualifier, canonical_id, source)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![name_norm, q, canonical_id, source],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Find canonical ids for a normalized name, optionally narrowed by qualifier
+    /// tokens. With no qualifiers, matches on name alone. With qualifiers, matches
+    /// entities that share the name **and at least one** qualifier token (the
+    /// "not rigid" rule — indexing by city still hits a later city+state query).
+    /// Returns distinct canonical ids, sorted for determinism.
+    pub fn find_by_name(&self, name_norm: &str, qualifiers: &[String]) -> Result<Vec<String>> {
+        if name_norm.is_empty() {
+            return Ok(Vec::new());
+        }
+        let quals: Vec<&str> = qualifiers
+            .iter()
+            .map(|q| q.as_str())
+            .filter(|q| !q.is_empty())
+            .collect();
+        let mut ids: Vec<String> = Vec::new();
+        if quals.is_empty() {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT canonical_id FROM name_index WHERE name_norm = ?1")?;
+            let rows = stmt
+                .query_map(params![name_norm], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.extend(rows);
+        } else {
+            // name match AND qualifier IN (…). Build the IN-list placeholders.
+            let placeholders = vec!["?"; quals.len()].join(", ");
+            let sql = format!(
+                "SELECT DISTINCT canonical_id FROM name_index \
+                 WHERE name_norm = ?1 AND qualifier IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&name_norm];
+            for q in &quals {
+                binds.push(q);
+            }
+            let rows = stmt
+                .query_map(binds.as_slice(), |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.extend(rows);
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     // --- union ----------------------------------------------------------
 
     /// Merge `loser` into `winner`: re-point all strong nodes and phone edges,
@@ -326,6 +410,15 @@ impl Graph {
         )?;
         self.conn.execute(
             "DELETE FROM phone_edges WHERE canonical_id = ?1",
+            params![loser],
+        )?;
+        // Re-point local name-index rows too (ignore rows that would collide).
+        self.conn.execute(
+            "UPDATE OR IGNORE name_index SET canonical_id = ?1 WHERE canonical_id = ?2",
+            params![winner, loser],
+        )?;
+        self.conn.execute(
+            "DELETE FROM name_index WHERE canonical_id = ?1",
             params![loser],
         )?;
         self.conn.execute(
@@ -404,6 +497,39 @@ mod tests {
         assert!(sources
             .iter()
             .any(|(k, s)| k == "domain:a.com" && s.is_none()));
+    }
+
+    #[test]
+    fn name_index_matches_name_plus_qualifier() {
+        let g = Graph::open_in_memory().unwrap();
+        g.create_entity("cx_sf", "google_place_id:SF", None, Some("Basecamp"))
+            .unwrap();
+        g.create_entity("cx_ny", "google_place_id:NY", None, Some("Basecamp"))
+            .unwrap();
+        g.index_name("basecamp", &["san francisco".into()], "cx_sf", Some("t"))
+            .unwrap();
+        g.index_name("basecamp", &["new york".into()], "cx_ny", Some("t"))
+            .unwrap();
+
+        // name + qualifier → the one matching entity.
+        assert_eq!(
+            g.find_by_name("basecamp", &["san francisco".into()]).unwrap(),
+            vec!["cx_sf".to_string()]
+        );
+        // ≥1 overlap: extra qualifier the row doesn't have still matches on the shared one.
+        assert_eq!(
+            g.find_by_name("basecamp", &["san francisco".into(), "ca".into()])
+                .unwrap(),
+            vec!["cx_sf".to_string()]
+        );
+        // Bare name matches BOTH → caller treats as ambiguous.
+        assert_eq!(
+            g.find_by_name("basecamp", &[]).unwrap(),
+            vec!["cx_ny".to_string(), "cx_sf".to_string()]
+        );
+        // Unknown name / qualifier → no hit.
+        assert!(g.find_by_name("nowhere", &[]).unwrap().is_empty());
+        assert!(g.find_by_name("basecamp", &["boston".into()]).unwrap().is_empty());
     }
 
     #[test]

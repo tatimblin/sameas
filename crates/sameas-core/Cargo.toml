@@ -16,7 +16,7 @@ psl = "2"
 phonenumber = "0.3"
 scraper = "0.20"
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+reqwest = { version = "0.12", features = ["blocking", "json", "gzip"], optional = true }
 
 [features]
 # Live HTTP fetch for DomainResolver. Off by default so CI + demo stay offline

@@ -167,6 +167,21 @@ pub fn placekey(raw: &str) -> Result<String> {
     Ok(lower)
 }
 
+/// Normalize a display name / title / qualifier into a match key for the local
+/// name index: lowercased, trimmed, internal whitespace collapsed, and
+/// surrounding (not internal) punctuation stripped per word. Deterministic and
+/// dependency-free — this is **exact** normalization, NOT fuzzy matching (no
+/// stemming, no stop-word removal, no alias folding). `"  Blue  Bottle Café! "`
+/// → `"blue bottle café"`; `"San Francisco"` → `"san francisco"`.
+pub fn name_key(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Find a `prefix…`-shaped token in a raw string or URL (case-sensitive on the
 /// prefix). Splits on common URL/path separators.
 fn extract_token(raw: &str, prefix: &str) -> Option<String> {
@@ -251,6 +266,17 @@ mod tests {
         assert!(yelp("").is_err());
         // A Yelp URL that is not a /biz/ page has no derivable slug.
         assert!(yelp("https://www.yelp.com/search?find_desc=coffee").is_err());
+    }
+
+    #[test]
+    fn name_key_normalization() {
+        assert_eq!(name_key("  Blue  Bottle  Coffee "), "blue bottle coffee");
+        assert_eq!(name_key("Basecamp restaurant"), "basecamp restaurant");
+        assert_eq!(name_key("San Francisco"), "san francisco");
+        // Surrounding punctuation stripped, internal kept.
+        assert_eq!(name_key("Joe's Pizza!"), "joe's pizza");
+        assert_eq!(name_key("(1999)"), "1999");
+        assert_eq!(name_key("   "), "");
     }
 
     #[test]

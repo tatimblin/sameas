@@ -1,12 +1,10 @@
 {
   "method": "GET",
-  "url": "https://maps.googleapis.com/maps/api/place/details/json",
+  "url": "https://places.googleapis.com/v1/places/EXAMPLE_blue_bottle_oakland",
   "response": {
-    "status": "OK",
-    "result": {
-      "name": "Blue Bottle Coffee",
-      "website": "https://bluebottlecoffee.com/",
-      "international_phone_number": "+1 510-653-3394"
-    }
+    "id": "EXAMPLE_blue_bottle_oakland",
+    "displayName": { "text": "Blue Bottle Coffee", "languageCode": "en" },
+    "websiteUri": "https://bluebottlecoffee.com/",
+    "internationalPhoneNumber": "+1 510-653-3394"
   }
 }

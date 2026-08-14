@@ -101,10 +101,17 @@ echo "\$ sameas resolve --place-id EXAMPLE_blue_bottle_oakland --complete --hub-
 sameas2 resolve --place-id EXAMPLE_blue_bottle_oakland --complete --hub-fixtures "$HUBS"
 
 hr
-echo "STEP 7c name + city -> Placekey anchor + place_id (reverse) then website + phone"
-echo "        (coarse input -> low confidence; identity is only as good as the match)"
-echo "\$ sameas resolve --name 'Blue Bottle Coffee' --city Oakland --region CA --country US --complete --hub-fixtures examples/fixtures/hubs"
-sameas2 resolve --name "Blue Bottle Coffee" --city Oakland --region CA --country US --complete --hub-fixtures "$HUBS"
+echo "STEP 7c name + full address -> Placekey anchor + place_id (reverse) then website + phone"
+echo "        (Placekey needs a street; name+city alone resolves via place_id at low confidence)"
+echo "\$ sameas resolve --name 'Blue Bottle Coffee' --address '300 Webster St' --city Oakland --region CA --country US --complete --hub-fixtures examples/fixtures/hubs"
+sameas2 resolve --name "Blue Bottle Coffee" --address "300 Webster St" --city Oakland --region CA --country US --complete --hub-fixtures "$HUBS"
+
+hr
+echo "STEP 7d Same name query again — served from the LOCAL name index (no --complete,"
+echo "        no hub fixtures) => zero external calls. Type-agnostic: qualifier is any facet."
+echo "\$ sameas resolve --name 'Blue Bottle Coffee' --address '300 Webster St' --city Oakland --region CA --country US"
+sameas2 resolve --name "Blue Bottle Coffee" --address "300 Webster St" --city Oakland --region CA --country US
+echo "  ^ confidence_reason 'local_name_match' — resolved from the graph, nothing reached out."
 
 hr
 echo "Exit-criteria check: IMDb completes to a QID + TMDb from an empty graph:"

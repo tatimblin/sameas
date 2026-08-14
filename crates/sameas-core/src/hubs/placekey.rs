@@ -3,7 +3,7 @@
 //! Placekey is a free, open identity anchor for physical places, keyed on
 //! name/address. It is an *anchor*, not a data hub: it returns a Placekey, not a
 //! website or phone. The completion orchestrator pairs it with a Google place_id
-//! lookup (see `complete::complete_place_query`) so a name+address query still
+//! lookup (see `complete::resolve_name`) so a name+address query still
 //! completes to website + phone.
 //!
 //! Endpoint: `POST https://api.placekey.io/v1/placekey` with an `apikey` header
@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::push_id;
-use crate::complete::PlaceQuery;
+use crate::complete::NameQuery;
 use crate::model::EntityRecord;
 use crate::resolve::Resolver;
 use crate::transport::HttpTransport;
@@ -23,13 +23,13 @@ use crate::transport::HttpTransport;
 const ENDPOINT: &str = "https://api.placekey.io/v1/placekey";
 
 pub struct PlacekeyResolver {
-    query: PlaceQuery,
+    query: NameQuery,
     api_key: String,
     transport: Arc<dyn HttpTransport>,
 }
 
 impl PlacekeyResolver {
-    pub fn new(query: PlaceQuery, api_key: String, transport: Arc<dyn HttpTransport>) -> Self {
+    pub fn new(query: NameQuery, api_key: String, transport: Arc<dyn HttpTransport>) -> Self {
         PlacekeyResolver {
             query,
             api_key,
@@ -101,7 +101,7 @@ mod tests {
             ENDPOINT,
             json!({ "placekey": "227-223@5vg-7gq-tvz" }),
         )]);
-        let query = PlaceQuery {
+        let query = NameQuery {
             name: Some("Blue Bottle Coffee".into()),
             city: Some("Oakland".into()),
             region: Some("CA".into()),

@@ -240,7 +240,10 @@ fn place_id_completes_website_and_phone_from_hubs() {
 }
 
 #[test]
-fn name_city_resolves_to_placekey_anchor_at_low_confidence() {
+fn name_city_unique_match_resolves_via_place_id() {
+    // Name + city (no street) can't produce a Placekey (min inputs), so it
+    // resolves via the Google place_id. The fixture returns a SINGLE candidate →
+    // a confident unique match (not the coarse floor).
     let h = Harness::new();
     let fx = hub_fixtures();
     let out = h.run(&[
@@ -248,25 +251,68 @@ fn name_city_resolves_to_placekey_anchor_at_low_confidence() {
         "CA", "--country", "US", "--complete", "--hub-fixtures", &fx,
     ]);
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-    // Placekey (rank 1) is the anchor; a name+city query is coarse → low confidence.
-    assert_eq!(value["anchor"].as_str().unwrap(), "placekey:227-223@5vg-7gq-tvz");
-    assert!((value["confidence"].as_f64().unwrap() - 0.40).abs() < 1e-3);
+    assert_eq!(value["anchor"].as_str().unwrap(), "google_place_id:EXAMPLE_blue_bottle_oakland");
+    assert_eq!(value["confidence_reason"].as_str().unwrap(), "place_unique_match");
+    assert!(value["confidence"].as_f64().unwrap() >= 0.75);
     let same_as = same_as_of(&value);
     assert!(same_as.contains(&"google_place_id:EXAMPLE_blue_bottle_oakland".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"phone:+15106533394".to_string()), "{same_as:?}");
+    // No street → no Placekey.
+    assert!(!same_as.iter().any(|k| k.starts_with("placekey:")), "{same_as:?}");
+}
+
+#[test]
+fn full_address_resolves_to_placekey_anchor() {
+    // A full street address lets Placekey run → Placekey (rank 1) is the anchor,
+    // and place_id still completes to website + phone.
+    let h = Harness::new();
+    let fx = hub_fixtures();
+    let out = h.run(&[
+        "--json", "resolve", "--name", "Blue Bottle Coffee", "--address", "300 Webster St",
+        "--city", "Oakland", "--region", "CA", "--country", "US", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["anchor"].as_str().unwrap(), "placekey:227-223@5vg-7gq-tvz");
+    assert_eq!(value["confidence_reason"].as_str().unwrap(), "placekey_address");
+    let same_as = same_as_of(&value);
+    assert!(same_as.contains(&"placekey:227-223@5vg-7gq-tvz".to_string()), "{same_as:?}");
     assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()), "{same_as:?}");
     assert!(same_as.contains(&"phone:+15106533394".to_string()), "{same_as:?}");
 }
 
 #[test]
-fn name_without_complete_is_rejected() {
+fn name_local_only_miss_is_unresolved() {
+    // `--name` without `--complete` is a local-only lookup (no network). On an
+    // empty graph it misses → unresolved, with a hint to re-run with --complete.
     let h = Harness::new();
-    let output = std::process::Command::new(bin())
-        .arg("--db")
-        .arg(&h.db)
-        .args(["resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland"])
-        .output()
-        .expect("failed to run sameas");
-    assert!(!output.status.success(), "--name without --complete should fail");
+    let v = h.value(&["resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland"]);
+    assert_eq!(v["status"].as_str().unwrap(), "unresolved");
+    assert!(v["canonical_id"].is_null());
+    assert_eq!(v["confidence_reason"].as_str().unwrap(), "needs_stronger_identifier");
+}
+
+#[test]
+fn name_query_is_cached_second_lookup_is_local() {
+    // First resolve reaches the hub (fixtures) and records the name+qualifiers.
+    // The second lookup runs local-only (NO --complete, no network) and still
+    // resolves to the same entity — proving the name index cached it.
+    let h = Harness::new();
+    let fx = hub_fixtures();
+    let first = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "--country", "US", "--complete", "--hub-fixtures", &fx,
+    ]);
+    let id = first["canonical_id"].as_str().expect("first resolve should succeed");
+
+    // No --complete, no --hub-fixtures → zero network. Must hit the local index.
+    let second = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "--country", "US",
+    ]);
+    assert_eq!(second["canonical_id"].as_str(), Some(id));
+    assert_eq!(second["confidence_reason"].as_str().unwrap(), "local_name_match");
 }
 
 // --- M3: entity-grain, refuse, ambiguity ----------------------------------
@@ -331,9 +377,9 @@ fn name_city_with_no_hub_match_refuses() {
         &[
             (
                 "findplace_zero.json",
-                r#"{ "method": "GET",
-                     "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                     "response": { "status": "ZERO_RESULTS", "candidates": [] } }"#,
+                r#"{ "method": "POST",
+                     "url": "https://places.googleapis.com/v1/places:searchText",
+                     "response": {} }"#,
             ),
             (
                 "placekey_miss.json",
@@ -355,6 +401,32 @@ fn name_city_with_no_hub_match_refuses() {
     );
 }
 
+/// Live smoke test against the REAL Google Places (New) v1 API. Ignored by
+/// default (non-deterministic + costs money). Run intentionally with:
+///   `GOOGLE_PLACES_API_KEY=… cargo test -p sameas-cli --features live-fetch -- --ignored`
+/// Skips (no failure) when the key env var is absent.
+#[test]
+#[ignore = "hits the live Google Places API; needs GOOGLE_PLACES_API_KEY + --features live-fetch"]
+fn live_place_details_smoke() {
+    if std::env::var("GOOGLE_PLACES_API_KEY").is_err() {
+        eprintln!("skipping live_place_details_smoke: GOOGLE_PLACES_API_KEY not set");
+        return;
+    }
+    let h = Harness::new();
+    // ChIJN1t_tDeuEmsRUsoyG83frY4 is a real, stable Google place id (Google Sydney).
+    // Live completion = --complete with NO --hub-fixtures.
+    let value = h.value(&[
+        "resolve", "--place-id", "ChIJN1t_tDeuEmsRUsoyG83frY4", "--complete",
+    ]);
+    assert!(value["canonical_id"].as_str().is_some(), "expected a resolved id: {value}");
+    let same_as = same_as_of(&value);
+    // A real Place Details response should yield at least a website domain.
+    assert!(
+        same_as.iter().any(|k| k.starts_with("domain:")),
+        "expected a website from live Place Details: {same_as:?}"
+    );
+}
+
 #[test]
 fn name_city_ambiguous_returns_candidates() {
     // Text search returns >1 candidate → refuse, surface all candidates.
@@ -364,10 +436,9 @@ fn name_city_ambiguous_returns_candidates() {
         &[
             (
                 "findplace_two.json",
-                r#"{ "method": "GET",
-                     "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                     "response": { "status": "OK",
-                       "candidates": [ {"place_id": "CAND_A"}, {"place_id": "CAND_B"} ] } }"#,
+                r#"{ "method": "POST",
+                     "url": "https://places.googleapis.com/v1/places:searchText",
+                     "response": { "places": [ {"id": "CAND_A"}, {"id": "CAND_B"} ] } }"#,
             ),
             (
                 "placekey_miss.json",

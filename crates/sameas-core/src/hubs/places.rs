@@ -1,19 +1,30 @@
-//! Google Places adapters (legacy web-service API — query-param key, single GET).
+//! Google Places API (New) v1 adapters (header auth + field mask).
 //!
 //! * [`PlaceDetailsResolver`]: `place_id → website, phone` (M2 exit criterion 2).
 //! * [`PlaceTextSearchResolver`] (reverse): `name/address` or `phone → place_id`.
+//!
+//! The New API drops the legacy in-body `status` string: success is HTTP 2xx and
+//! the fields are camelCase; failures are HTTP 4xx/5xx (mapped to a clear error by
+//! the transport). Auth is the `X-Goog-Api-Key` header and every request carries a
+//! required `X-Goog-FieldMask`.
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::Value;
+use anyhow::Result;
+use serde_json::{json, Value};
 
 use super::push_id;
 use crate::model::{EntityRecord, ExternalId};
 use crate::resolve::Resolver;
 use crate::transport::HttpTransport;
 
-const BASE: &str = "https://maps.googleapis.com";
+const BASE: &str = "https://places.googleapis.com";
+
+/// Fields for Place Details. `websiteUri`/phone are the Enterprise SKU — required
+/// for our use. Never use the `*` wildcard mask in production.
+const DETAILS_MASK: &str = "id,displayName,websiteUri,internationalPhoneNumber,nationalPhoneNumber";
+/// Text Search fields use the `places.` prefix (results nest under `places[]`).
+const TEXT_SEARCH_MASK: &str = "places.id,places.displayName";
 
 // ---------------------------------------------------------------------------
 // Place Details: place_id → website, phone
@@ -35,36 +46,28 @@ impl PlaceDetailsResolver {
     }
 
     pub(crate) fn url(&self) -> String {
-        format!(
-            "{BASE}/maps/api/place/details/json?place_id={}&fields=website,international_phone_number,name&key={}",
-            self.place_id.value(),
-            self.api_key
-        )
+        format!("{BASE}/v1/places/{}", self.place_id.value())
     }
 
-    /// Parse a Place Details response into a record. Reads `result.website`,
-    /// `result.international_phone_number`, and `result.name`. Errors if the
-    /// response `status` is present and not `OK`.
+    /// Parse a Place Details (New) response — a bare place object (no `result`
+    /// wrapper, no `status`). Reads `websiteUri`, `internationalPhoneNumber`
+    /// (falling back to `nationalPhoneNumber`), and `displayName.text`.
     pub fn parse(value: &Value) -> Result<EntityRecord> {
-        if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
-            if status != "OK" {
-                bail!("google place details status {status:?}");
-            }
-        }
-        let result = value
-            .get("result")
-            .ok_or_else(|| anyhow!("google place details: missing result"))?;
-
         let mut record = EntityRecord::default();
-        if let Some(name) = result.get("name").and_then(|v| v.as_str()) {
+        if let Some(name) = value
+            .get("displayName")
+            .and_then(|d| d.get("text"))
+            .and_then(|t| t.as_str())
+        {
             record.name = Some(name.to_string());
         }
-        if let Some(site) = result.get("website").and_then(|v| v.as_str()) {
+        if let Some(site) = value.get("websiteUri").and_then(|v| v.as_str()) {
             push_id(&mut record, "domain", site);
         }
-        if let Some(phone) = result
-            .get("international_phone_number")
+        if let Some(phone) = value
+            .get("internationalPhoneNumber")
             .and_then(|v| v.as_str())
+            .or_else(|| value.get("nationalPhoneNumber").and_then(|v| v.as_str()))
         {
             push_id(&mut record, "phone", phone);
         }
@@ -74,7 +77,11 @@ impl PlaceDetailsResolver {
 
 impl Resolver for PlaceDetailsResolver {
     fn harvest(&self) -> Result<EntityRecord> {
-        let value = self.transport.get_json(&self.url())?;
+        let headers = [
+            ("X-Goog-Api-Key", self.api_key.as_str()),
+            ("X-Goog-FieldMask", DETAILS_MASK),
+        ];
+        let value = self.transport.get_json_with_headers(&self.url(), &headers)?;
         let mut record = Self::parse(&value)?;
         push_id(&mut record, "google_place_id", self.place_id.value());
         Ok(record)
@@ -85,7 +92,8 @@ impl Resolver for PlaceDetailsResolver {
 // Text Search (reverse): name/address or phone → place_id
 // ---------------------------------------------------------------------------
 
-/// What kind of text query is being sent to Find-Place-From-Text.
+/// What kind of text query is being sent to Text Search. Both become `textQuery`
+/// in the New API; the distinction is documentary (phone is low priority).
 pub enum TextSearchInput {
     /// Free-text query, e.g. `"Blue Bottle Coffee, Oakland CA"`.
     Text(String),
@@ -109,37 +117,46 @@ impl PlaceTextSearchResolver {
     }
 
     pub(crate) fn url(&self) -> String {
-        let (inputtype, raw) = match &self.input {
-            TextSearchInput::Text(t) => ("textquery", t.as_str()),
-            TextSearchInput::Phone(p) => ("phonenumber", p.as_str()),
-        };
-        let encoded: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
-        format!(
-            "{BASE}/maps/api/place/findplacefromtext/json?input={encoded}&inputtype={inputtype}&fields=place_id&key={}",
-            self.api_key
-        )
+        format!("{BASE}/v1/places:searchText")
     }
 
-    /// Parse a Find-Place response, returning the best candidate's `place_id`.
+    fn body(&self) -> Value {
+        let query = match &self.input {
+            TextSearchInput::Text(t) => t,
+            TextSearchInput::Phone(p) => p,
+        };
+        json!({ "textQuery": query })
+    }
+
+    /// Run the search and return every candidate `place_id` (best-effort; used by
+    /// the completion layer to detect ambiguity). POSTs with the api-key +
+    /// field-mask headers.
+    pub(crate) fn candidates(&self) -> Result<Vec<String>> {
+        let headers = [
+            ("X-Goog-Api-Key", self.api_key.as_str()),
+            ("X-Goog-FieldMask", TEXT_SEARCH_MASK),
+        ];
+        let value = self
+            .transport
+            .post_json(&self.url(), &headers, &self.body())?;
+        Self::parse_all(&value)
+    }
+
+    /// Parse a Text Search (New) response, returning the best candidate's id.
     pub fn parse(value: &Value) -> Result<Option<String>> {
         Ok(Self::parse_all(value)?.into_iter().next())
     }
 
-    /// Parse a Find-Place response, returning every candidate `place_id` in order.
-    /// Same status handling as `parse` (OK/ZERO_RESULTS ok; others error).
+    /// Parse a Text Search (New) response, returning every `places[].id` in order.
+    /// An absent/empty `places` array means no match (the New API has no
+    /// `ZERO_RESULTS` status — it returns 200 with no `places`).
     pub fn parse_all(value: &Value) -> Result<Vec<String>> {
-        if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
-            // ZERO_RESULTS is a normal "no match", not an error.
-            if status != "OK" && status != "ZERO_RESULTS" {
-                bail!("google find-place status {status:?}");
-            }
-        }
         Ok(value
-            .get("candidates")
-            .and_then(|c| c.as_array())
+            .get("places")
+            .and_then(|p| p.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|c| c.get("place_id").and_then(|v| v.as_str()))
+                    .filter_map(|p| p.get("id").and_then(|v| v.as_str()))
                     .map(|s| s.to_string())
                     .collect()
             })
@@ -149,7 +166,13 @@ impl PlaceTextSearchResolver {
 
 impl Resolver for PlaceTextSearchResolver {
     fn harvest(&self) -> Result<EntityRecord> {
-        let value = self.transport.get_json(&self.url())?;
+        let headers = [
+            ("X-Goog-Api-Key", self.api_key.as_str()),
+            ("X-Goog-FieldMask", TEXT_SEARCH_MASK),
+        ];
+        let value = self
+            .transport
+            .post_json(&self.url(), &headers, &self.body())?;
         let mut record = EntityRecord::default();
         if let Some(place_id) = Self::parse(&value)? {
             push_id(&mut record, "google_place_id", &place_id);
@@ -161,17 +184,14 @@ impl Resolver for PlaceTextSearchResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn place_details_parses_website_and_phone() {
+    fn place_details_parses_v1_website_and_phone() {
         let v = json!({
-            "status": "OK",
-            "result": {
-                "name": "Blue Bottle Coffee",
-                "website": "https://bluebottlecoffee.com/",
-                "international_phone_number": "+1 510-653-3394"
-            }
+            "id": "ChIJabc",
+            "displayName": { "text": "Blue Bottle Coffee", "languageCode": "en" },
+            "websiteUri": "https://bluebottlecoffee.com/",
+            "internationalPhoneNumber": "+1 510-653-3394"
         });
         let rec = PlaceDetailsResolver::parse(&v).unwrap();
         assert_eq!(rec.name.as_deref(), Some("Blue Bottle Coffee"));
@@ -181,30 +201,35 @@ mod tests {
     }
 
     #[test]
-    fn place_details_rejects_bad_status() {
-        let v = json!({ "status": "NOT_FOUND", "result": {} });
-        assert!(PlaceDetailsResolver::parse(&v).is_err());
+    fn place_details_falls_back_to_national_phone() {
+        let v = json!({
+            "displayName": { "text": "X" },
+            "nationalPhoneNumber": "(510) 653-3394"
+        });
+        let rec = PlaceDetailsResolver::parse(&v).unwrap();
+        let keys: Vec<String> = rec.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"phone:+15106533394".to_string()));
     }
 
     #[test]
-    fn text_search_reads_best_candidate() {
-        let v = json!({ "status": "OK", "candidates": [{ "place_id": "ChIJabc" }, { "place_id": "ChIJxyz" }] });
-        assert_eq!(
-            PlaceTextSearchResolver::parse(&v).unwrap().as_deref(),
-            Some("ChIJabc")
-        );
-        let zero = json!({ "status": "ZERO_RESULTS", "candidates": [] });
-        assert_eq!(PlaceTextSearchResolver::parse(&zero).unwrap(), None);
+    fn place_details_tolerates_missing_fields() {
+        // A place with no website/phone yields an empty record (not an error).
+        let rec = PlaceDetailsResolver::parse(&json!({ "id": "ChIJabc" })).unwrap();
+        assert!(rec.same_as.is_empty());
     }
 
     #[test]
-    fn text_search_reads_all_candidates() {
-        let v = json!({ "status": "OK", "candidates": [{ "place_id": "ChIJ_a" }, { "place_id": "ChIJ_b" }] });
+    fn text_search_reads_place_ids() {
+        let v = json!({ "places": [
+            { "id": "ChIJ_a", "displayName": { "text": "A" } },
+            { "id": "ChIJ_b", "displayName": { "text": "B" } }
+        ]});
+        assert_eq!(PlaceTextSearchResolver::parse(&v).unwrap().as_deref(), Some("ChIJ_a"));
         assert_eq!(
             PlaceTextSearchResolver::parse_all(&v).unwrap(),
             vec!["ChIJ_a".to_string(), "ChIJ_b".to_string()]
         );
-        let zero = json!({ "status": "ZERO_RESULTS", "candidates": [] });
-        assert!(PlaceTextSearchResolver::parse_all(&zero).unwrap().is_empty());
+        // No `places` → no match.
+        assert!(PlaceTextSearchResolver::parse_all(&json!({})).unwrap().is_empty());
     }
 }

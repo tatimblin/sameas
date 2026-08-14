@@ -1,10 +1,9 @@
 {
-  "method": "GET",
-  "url": "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+  "method": "POST",
+  "url": "https://places.googleapis.com/v1/places:searchText",
   "response": {
-    "status": "OK",
-    "candidates": [
-      { "place_id": "EXAMPLE_blue_bottle_oakland" }
+    "places": [
+      { "id": "EXAMPLE_blue_bottle_oakland", "displayName": { "text": "Blue Bottle Coffee" } }
     ]
   }
 }

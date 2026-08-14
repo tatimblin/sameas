@@ -27,6 +27,13 @@ pub trait HttpTransport {
     /// HTTP GET returning parsed JSON.
     fn get_json(&self, url: &str) -> Result<Value>;
 
+    /// HTTP GET with request headers (e.g. `X-Goog-Api-Key` + `X-Goog-FieldMask`
+    /// for Google Places API New). Defaults to a plain GET — offline fixtures
+    /// match on the URL and ignore headers, so they need no override.
+    fn get_json_with_headers(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Value> {
+        self.get_json(url)
+    }
+
     /// HTTP POST with headers and a JSON body, returning parsed JSON.
     fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value>;
 }
@@ -160,44 +167,135 @@ impl HttpTransport for FixtureTransport {
     }
 }
 
-/// Real HTTP transport (opt-in). A single blocking client carries a default
-/// `User-Agent` — mandatory for the Wikidata SPARQL endpoint (403 without).
+/// Real HTTP transport (opt-in). A single reused blocking client carries a
+/// descriptive `User-Agent` (mandatory for Wikidata SPARQL — 403 without),
+/// sensible timeouts, gzip, and a JSON `Accept`. Calls retry transient failures
+/// (timeouts, 429, 5xx) and map non-2xx to a clear, class-named error.
 #[cfg(feature = "live-fetch")]
 pub struct ReqwestTransport {
     client: reqwest::blocking::Client,
+    max_attempts: u32,
 }
 
 #[cfg(feature = "live-fetch")]
 impl ReqwestTransport {
     pub fn new() -> Result<Self> {
+        use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
+        use std::time::Duration;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+
         let client = reqwest::blocking::Client::builder()
-            .user_agent(concat!("sameas/", env!("CARGO_PKG_VERSION")))
+            // Descriptive UA per Wikimedia's User-Agent policy.
+            .user_agent(concat!(
+                "sameas/",
+                env!("CARGO_PKG_VERSION"),
+                " (https://example.com/sameas) reqwest"
+            ))
+            .default_headers(headers)
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .gzip(true)
             .build()
             .map_err(|e| anyhow!("building http client: {e}"))?;
-        Ok(ReqwestTransport { client })
+        Ok(ReqwestTransport {
+            client,
+            max_attempts: 3,
+        })
+    }
+
+    /// Send with bounded retry on transient failures (transport timeout/connect,
+    /// HTTP 429, 5xx), honoring `Retry-After` when present, else exponential
+    /// backoff. Never retries other 4xx.
+    fn send_with_retry(
+        &self,
+        build: impl Fn() -> reqwest::blocking::RequestBuilder,
+    ) -> reqwest::Result<reqwest::blocking::Response> {
+        use std::time::Duration;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match build().send() {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let transient =
+                        status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                    if transient && attempt < self.max_attempts {
+                        let wait = resp
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| Duration::from_millis(200 * 2u64.pow(attempt)));
+                        std::thread::sleep(wait);
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if attempt < self.max_attempts && (e.is_timeout() || e.is_connect()) => {
+                    std::thread::sleep(Duration::from_millis(200 * 2u64.pow(attempt)));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read a response as JSON, mapping a non-2xx to an `anyhow` error that names
+    /// the class (auth / not-found / rate-limited / other) with a body snippet —
+    /// so callers can tell "bad key" from "no data".
+    fn read_json(resp: reqwest::blocking::Response, what: &str) -> Result<Value> {
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .json::<Value>()
+                .map_err(|e| anyhow!("{what}: decoding response body: {e}"));
+        }
+        let body = resp.text().unwrap_or_default();
+        let snippet: String = body.chars().take(300).collect();
+        match status.as_u16() {
+            401 | 403 => Err(anyhow!(
+                "{what}: authentication/authorization denied (HTTP {status}): {snippet}"
+            )),
+            404 => Err(anyhow!("{what}: not found (HTTP 404): {snippet}")),
+            429 => Err(anyhow!("{what}: rate limited (HTTP 429): {snippet}")),
+            _ => Err(anyhow!("{what}: unexpected HTTP {status}: {snippet}")),
+        }
     }
 }
 
 #[cfg(feature = "live-fetch")]
 impl HttpTransport for ReqwestTransport {
     fn get_json(&self, url: &str) -> Result<Value> {
-        self.client
-            .get(url)
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<Value>())
-            .map_err(|e| anyhow!("GET {url}: {e}"))
+        self.get_json_with_headers(url, &[])
+    }
+
+    fn get_json_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
+        let resp = self
+            .send_with_retry(|| {
+                let mut req = self.client.get(url);
+                for (k, v) in headers {
+                    req = req.header(*k, *v);
+                }
+                req
+            })
+            .map_err(|e| anyhow!("GET {url}: {e}"))?;
+        Self::read_json(resp, &format!("GET {url}"))
     }
 
     fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
-        let mut req = self.client.post(url).json(body);
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        req.send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<Value>())
-            .map_err(|e| anyhow!("POST {url}: {e}"))
+        let resp = self
+            .send_with_retry(|| {
+                let mut req = self.client.post(url).json(body);
+                for (k, v) in headers {
+                    req = req.header(*k, *v);
+                }
+                req
+            })
+            .map_err(|e| anyhow!("POST {url}: {e}"))?;
+        Self::read_json(resp, &format!("POST {url}"))
     }
 }
 

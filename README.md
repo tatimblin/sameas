@@ -145,6 +145,71 @@ an **M3 disambiguation** section showing two chain locations that share a domain
 staying distinct and a too-thin query being refused with a "needs more info"
 signal.
 
+## Live hub calls (opt-in)
+
+By default everything runs offline against fixtures. To call the real hubs, build
+with `--features live-fetch` and supply API keys via env vars; then use
+`--complete` **without** `--hub-fixtures`:
+
+```sh
+cargo build --features live-fetch
+export GOOGLE_PLACES_API_KEY=…   # Google Maps Platform key with Places API (New) enabled
+export PLACEKEY_API_KEY=…        # optional, for address → Placekey
+export TMDB_API_KEY=…            # optional, for movie crosswalk
+
+BIN=./target/debug/sameas
+"$BIN" --db /tmp/live.db resolve --place-id "ChIJN1t_tDeuEmsRUsoyG83frY4" --complete
+"$BIN" --db /tmp/live.db resolve --name "Blue Bottle Coffee" \
+  --address "300 Webster St" --city Oakland --region CA --country US --complete
+```
+
+The live transport uses **Google Places API (New) v1** (`places.googleapis.com`,
+`X-Goog-Api-Key` + field-mask headers), the Placekey API (`apikey` header), and
+Wikidata SPARQL (descriptive `User-Agent`); it reuses one connection-pooled client
+with timeouts, gzip, and bounded retry/backoff on 429/5xx (honoring `Retry-After`).
+A bad key surfaces a clear `authentication/authorization denied (HTTP 401/403)`
+error rather than a silent empty result.
+
+Gated live smoke test (skips if the key env var is absent):
+```sh
+GOOGLE_PLACES_API_KEY=… cargo test -p sameas-cli --features live-fetch -- --ignored
+```
+
+> **Notes.** Place Details `websiteUri`/phone fall in Google's **Enterprise** SKU,
+> so each live Place Details call is billed at that tier. Placekey needs a **street
+> address** (or lat/long) — a name+city query resolves via the Google `place_id`
+> instead. Live calls cost money and are non-deterministic, so they're never part
+> of `cargo test`/CI (kept offline via fixtures).
+
+## Resolving by name (local name index)
+
+Names aren't identifiers, so resolving a **name + qualifier(s)** reaches an
+external hub the *first* time — then the result is recorded in a **local name
+index** so the next identical query is served from the graph with **zero external
+calls**:
+
+```sh
+# First time: reaches the hub, then caches the name → entity mapping
+sameas resolve --name "Blue Bottle Coffee" --city Oakland --region CA --complete
+# Again (no --complete, no network): served locally, confidence_reason local_name_match
+sameas resolve --name "Blue Bottle Coffee" --city Oakland --region CA
+```
+
+The qualifier is **type-agnostic** — a free-form facet, not a fixed
+city/state/year schema. Use the generic, repeatable `--qualifier` for whatever
+disambiguates the entity:
+
+```sh
+sameas resolve --name "Yosemite"   --qualifier California --complete   # park: name + state
+sameas resolve --name "Joe's Pizza" --qualifier Brooklyn  --complete   # NYC:  name + borough
+```
+
+Matching is **exact-normalized** (lowercase/trim) on the name plus **≥1 shared
+qualifier token** — deterministic, no fuzzy matching. A name matching several
+distinct entities returns them as `candidates` (ambiguous) rather than guessing.
+Alias/typo tolerance (e.g. `SF` ↔ `San Francisco`) is a deferred, evidence-gated
+layer pointed *inward* at this index.
+
 ## CLI usage
 
 ```sh
