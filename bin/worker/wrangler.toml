@@ -1,0 +1,25 @@
+name = "sameas"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-04-08"
+# Enabled so the worker has a reachable public URL (<name>.<subdomain>.workers.dev)
+# without provisioning a custom domain first. Swap to a `routes` custom domain when
+# there is one.
+workers_dev = true
+
+[build]
+command = "./custom_build.sh"
+watch_dir = ["src", "../../crates"]
+
+# The crosswalk graph. Its own database, NOT shared with any consumer's schema —
+# `sameas` is protocol-agnostic by design (PROJECT_GOALS non-goal #3: no AT-URIs,
+# DIDs, or lexicons), and a separate DB enforces that structurally rather than by
+# discipline.
+[[d1_databases]]
+binding = "DB"
+database_name = "sameas-crosswalk"
+database_id = "67788b06-a209-49d8-9bdb-a45e7ea099d8"
+migrations_dir = "../../migrations"
+
+[observability.logs]
+enabled = true
+invocation_logs = false

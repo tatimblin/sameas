@@ -1,0 +1,109 @@
+name: CI
+
+# The three bugs that reached production did so because every test in this repo was
+# manual and opt-in. This workflow is the thing that makes them stay fixed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: cargo test (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Keys off Cargo.lock and handles the registry, git db and target/ together.
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` is the Rust analogue of `npm ci`; it requires Cargo.lock to be
+      # committed, which is also what keeps the wasm-bindgen pin honest across
+      # machines and across Cloudflare's build pipeline.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The whole suite: the crate's unit tests, the CLI's 29 subprocess tests, the
+      # host-target Worker tests (parse_identifier, auth_outcome), the
+      # GraphStore conformance suite against SqliteStore, and the
+      # bind_opt/NULLIF source lint.
+      - name: test
+        run: cargo test --workspace --locked
+
+      # BUG 1, outermost layer. `bin/worker` pins `=0.2.100` and `sameas-core`
+      # carries a `<0.2.101` ceiling, but a human can still loosen either; this is
+      # what notices. Cargo hard-errors on an unsatisfiable pin, so the failure mode
+      # this catches is a *relaxed* constraint resolving to something newer.
+      - name: wasm-bindgen resolves to exactly 0.2.100
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo tree --workspace --target wasm32-unknown-unknown -i wasm-bindgen --locked \
+            | tee /dev/stderr \
+            | grep -qE '^wasm-bindgen v0\.2\.100( |$)' \
+            || {
+              echo "::error file=bin/worker/Cargo.toml::wasm-bindgen must resolve to exactly 0.2.100 — 0.2.101+ breaks worker-build 0.1.1's shim codegen, producing a Worker that builds and deploys cleanly then fails on every request"
+              exit 1
+            }
+
+  worker:
+    name: wasm build + miniflare suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: bin/worker/package-lock.json
+
+      # Swatinem/rust-cache deliberately skips ~/.cargo/bin, so a bare
+      # `cargo install worker-build` costs ~2 minutes on every run. The version is
+      # part of the BUG 1 contract (it is the tool whose codegen assumptions the
+      # wasm-bindgen pin exists to satisfy), so it is pinned, not floating.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/worker-build
+          key: worker-build-0.1.1-${{ runner.os }}
+      - run: command -v worker-build || cargo install worker-build@0.1.1 --locked
+
+      # Type-check the D1 backend on its real target. This CANNOT catch BUG 1 — no
+      # shim is produced — which is why the vitest run below does the full
+      # worker-build.
+      - name: cargo check (wasm32)
+        run: |
+          cargo check -p sameas-core --target wasm32-unknown-unknown \
+            --no-default-features --features d1 --locked
+          cargo check -p sameas-worker --target wasm32-unknown-unknown --locked
+
+      - run: npm ci
+        working-directory: bin/worker
+      - run: npx tsc --noEmit
+        working-directory: bin/worker
+
+      # vitest.config.mts runs custom_build.sh itself, so this cannot test a stale
+      # binary; it also asserts the shim binds its wasm exports (BUG 1) and that the
+      # test and deploy migration paths agree. Then: smoke, nullif (BUG 2),
+      # stats (BUG 3), auth, and the GraphStore conformance suite against D1Store.
+      - name: miniflare suite
+        run: npm test
+        working-directory: bin/worker
+
+      # Proves the DEPLOY guard has teeth, which `npm test` cannot: it builds both
+      # with and without `--features test-endpoints` and asserts the guard's verdict
+      # flips. Added because the guard was VACUOUS and nothing noticed — it grepped
+      # index.wasm for "__conformance", a string that never appears there, so it
+      # passed a test-flavored build whose mutating POST /__conformance answered 200.
+      # A guard that cannot fail is worse than none, because it reads as proof.
+      # Runs last: two full worker-build passes, and it leaves a clean build behind.
+      - name: deploy guard has teeth
+        run: npm run verify:guard
+        working-directory: bin/worker

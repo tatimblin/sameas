@@ -1,0 +1,52 @@
+[package]
+name = "sameas-worker"
+description = "sameas as a Cloudflare Worker: HTTP resolve/entity over a D1 crosswalk graph."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+release = false
+
+# https://github.com/rustwasm/wasm-pack/issues/1247
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The Worker is the D1 backend only: no rusqlite (cannot target wasm32) and no
+# HTML harvesting (a domain is just a graph key here).
+sameas-core = { path = "../../crates/sameas-core", default-features = false, features = [
+    "d1",
+] }
+
+worker = { version = "0.5", features = ["d1"] }
+worker-macros = { version = "0.5" }
+console_error_panic_hook = "0.1"
+
+# PINNED, and it must stay pinned. `worker-build` 0.1.1 post-processes
+# `wasm-bindgen`'s JS output into the Worker shim, and 0.2.101+ changed that
+# codegen to an init-function form (`function pt(e){_=e}`) that worker-build does
+# not call — producing a shim whose wasm exports are never bound, which fails at
+# runtime with `Cannot read properties of undefined (reading 'fetch')` on EVERY
+# request, including ones that touch nothing. It builds and deploys cleanly, so
+# there is no signal until the first live request.
+wasm-bindgen = "=0.2.100"
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Adds `POST /__conformance`, which runs
+# `sameas_core::store::conformance::run_all` against the live D1 binding — the
+# only way to exercise the backend-agnostic contract suite against `D1Store`.
+#
+# NEVER enabled for a deploy. `custom_build.sh` passes `$WORKER_BUILD_FEATURES`,
+# which only `vitest.config.mts` sets, and `npm run deploy` greps the built shim
+# for `__conformance` and fails if it is present — so this is enforced
+# structurally, not by remembering. The route mutates (it merges and splits
+# fixtures), which is exactly why it must not ship.
+test-endpoints = []

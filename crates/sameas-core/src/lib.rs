@@ -11,7 +11,8 @@
 //!   every identifier kind. Adding a kind = one entry + a normalizer.
 //! * [`model`] — spec-backed [`ExternalId`] + [`EntityRecord`].
 //! * [`normalize`] — URL→domain, phone→E.164, IMDb/QID/TMDb, Yelp slug.
-//! * [`graph`] — union-find over SQLite (ID-to-ID edges only).
+//! * [`store`] — the [`GraphStore`] storage boundary (ID-to-ID edges only):
+//!   [`SqliteStore`] for the CLI/tests, `store::d1::D1Store` for the Worker.
 //! * [`anchor`] — deterministic canonical-anchor selection.
 //! * [`resolve`] — [`Resolver`] trait, adapters, and orchestration.
 //! * [`transport`] — HTTP/JSON transport for hub adapters (offline fixture +
@@ -21,12 +22,14 @@
 pub mod anchor;
 pub mod complete;
 pub mod confidence;
-pub mod graph;
+pub mod correct;
 pub mod hubs;
+pub mod json;
 pub mod kind;
 pub mod model;
 pub mod normalize;
 pub mod resolve;
+pub mod store;
 pub mod transport;
 
 pub use complete::{
@@ -34,11 +37,21 @@ pub use complete::{
     NameQuery,
 };
 pub use confidence::ConfidenceReason;
-pub use graph::Graph;
+pub use correct::{link, merge, split, LinkOutcome};
 pub use kind::{spec_for_tag, Grain, KindSpec, KINDS};
 pub use model::{EntityRecord, ExternalId};
 pub use resolve::{
     commit_record, commit_record_with_source, load_entity, resolve_id, DirectRecordResolver,
-    DomainResolver, Resolver, ResolveOutput, Status,
+    Resolver, ResolveOutput, Status,
 };
+pub use store::{EntityRow, GraphStore, NameCardinality, StatsReport};
 pub use transport::{FixtureTransport, HttpTransport};
+
+// Backend-specific types stay behind their feature, mirroring how
+// `ReqwestTransport` is reachable only via its module path. `D1Store` is likewise
+// `sameas_core::store::d1::D1Store`.
+#[cfg(feature = "sqlite")]
+pub use store::SqliteStore;
+
+#[cfg(feature = "harvest")]
+pub use resolve::DomainResolver;
