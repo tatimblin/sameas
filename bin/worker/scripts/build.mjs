@@ -40,29 +40,55 @@ export function checkShim(dir) {
 }
 
 /**
+ * A byte sequence that is present in a `--features test-endpoints` build of
+ * `index.wasm` and absent from a plain one.
+ *
+ * **It is NOT the route path.** `"__conformance"` — the obvious choice, and what
+ * this guard used until it was tested — never appears in the wasm at all, so the
+ * guard passed a test-flavored build that answered `POST /__conformance` with 200.
+ * Route-matching literals are compared as byte slices with known lengths, and none
+ * of `/__conformance`, `/stats`, or `/ingest` survives as a searchable string. (A
+ * grep for `/resolve` DOES hit — on the source path `.../src/resolve.rs`, not the
+ * route. That near-miss is how the original check looked like it worked.)
+ *
+ * `conformance_failed` is the `error_json` code in the `#[cfg]`-gated
+ * `handlers::conformance`, and it survives because error codes are formatted into
+ * a JSON body rather than length-compared. Verified in both directions: absent
+ * from a clean build, present in a test build.
+ *
+ * If this ever needs changing, re-verify by BUILDING BOTH WAYS and grepping —
+ * `assert_no_test_endpoints_rejects_a_test_build` in `test/guard.test.ts` pins it.
+ */
+const TEST_ENDPOINT_MARKER = "conformance_failed";
+
+/**
  * Fail if a test-only route leaked into a deployable artifact. The
  * `/__conformance` route is `#[cfg(feature = "test-endpoints")]` and that feature
- * is passed only by this file — but a stale `build/` from a test run could
- * otherwise be deployed as-is.
+ * is passed only by the vitest config — but a stale `build/` from a test run could
+ * otherwise be deployed as-is, and that route MUTATES (it merges and splits
+ * fixtures).
  *
- * Checks `index.wasm`, NOT `shim.mjs`: the route string is compiled into the wasm
- * (the shim only forwards `fetch`), so grepping the JS silently passes a
- * test-flavored artifact. Also runs `checkShim` so one call covers both invariants.
+ * Checks `index.wasm`, NOT `shim.mjs`: the marker is compiled into the wasm (the
+ * shim only forwards `fetch`), so grepping the JS silently passes a test-flavored
+ * artifact. Also runs `checkShim` so one call covers both invariants.
  */
 export function assertNoTestEndpoints(dir) {
   checkShim(dir);
   const wasmPath = path.join(dir, "build/worker/index.wasm");
-  // The route literal lives in the wasm data section; read as latin1 so byte
-  // sequences survive without utf-8 replacement.
+  // Read as latin1 so byte sequences survive without utf-8 replacement.
   const wasm = readFileSync(wasmPath, "latin1");
-  if (wasm.includes("__conformance")) {
+  if (wasm.includes(TEST_ENDPOINT_MARKER)) {
     throw new Error(
-      `${wasmPath} contains the test-only /__conformance route.\n` +
+      `${wasmPath} contains the test-only /__conformance route ` +
+        `(marker ${JSON.stringify(TEST_ENDPOINT_MARKER)}).\n` +
         `It was built with --features test-endpoints (i.e. by the test harness). ` +
         `Rebuild without WORKER_BUILD_FEATURES — \`npm run build\` — before deploying.`,
     );
   }
 }
+
+/** Exported for the guard's own test. */
+export { TEST_ENDPOINT_MARKER };
 
 /**
  * `readD1Migrations` takes an explicit path and never reads wrangler's

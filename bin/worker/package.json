@@ -6,10 +6,12 @@
         "check:shim": "node scripts/check-shim.mjs",
         "db:migrations:apply": "npx wrangler d1 migrations apply DB --remote",
         "db:migrations:apply:local": "npx wrangler d1 migrations apply DB --local",
-        "deploy": "npm run db:migrations:apply && npx wrangler deploy && npm run check:shim",
+        "deploy": "npm run db:migrations:apply && npm run build:clean && npm run check:shim && env -u WORKER_BUILD_FEATURES npx wrangler deploy && npm run check:shim",
+        "build:clean": "env -u WORKER_BUILD_FEATURES ./custom_build.sh",
         "dev": "npx wrangler dev",
         "test": "vitest run",
-        "test:watch": "vitest"
+        "test:watch": "vitest",
+        "verify:guard": "node scripts/verify-guard.mjs"
     },
     "devDependencies": {
         "@cloudflare/vitest-pool-workers": "0.16.3",

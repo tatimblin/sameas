@@ -96,3 +96,14 @@ jobs:
       - name: miniflare suite
         run: npm test
         working-directory: bin/worker
+
+      # Proves the DEPLOY guard has teeth, which `npm test` cannot: it builds both
+      # with and without `--features test-endpoints` and asserts the guard's verdict
+      # flips. Added because the guard was VACUOUS and nothing noticed — it grepped
+      # index.wasm for "__conformance", a string that never appears there, so it
+      # passed a test-flavored build whose mutating POST /__conformance answered 200.
+      # A guard that cannot fail is worse than none, because it reads as proof.
+      # Runs last: two full worker-build passes, and it leaves a clean build behind.
+      - name: deploy guard has teeth
+        run: npm run verify:guard
+        working-directory: bin/worker
