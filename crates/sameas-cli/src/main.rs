@@ -7,9 +7,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use sameas_core::{
-    commit_record, load_entity, name_not_found, resolve_and_complete, resolve_name,
-    resolve_name_local, CompletionCtx, DirectRecordResolver, DomainResolver, EntityRecord,
-    ExternalId, FixtureTransport, Graph, NameQuery, Resolver, ResolveOutput, Status,
+    commit_record, link, load_entity, merge, name_not_found, resolve_and_complete, resolve_name,
+    resolve_name_local, split, CompletionCtx, DirectRecordResolver, DomainResolver, EntityRecord,
+    ExternalId, FixtureTransport, GraphStore, LinkOutcome, NameQuery, Resolver, ResolveOutput,
+    SqliteStore, StatsReport, Status,
 };
 use sameas_core::confidence::reason_tag;
 
@@ -53,6 +54,35 @@ enum Command {
         /// A record file or a directory of record files.
         path: PathBuf,
     },
+    /// Assert two identifiers are the same entity (create/attach/merge as needed).
+    Link {
+        /// First key as KIND:VALUE (e.g. google_place_id:ChIJ...).
+        a: String,
+        /// Second key as KIND:VALUE.
+        b: String,
+        /// Override the same-kind identity-conflict guard.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Combine two or more entities into one, keeping the strongest anchor.
+    Merge {
+        /// Canonical ids to merge (2+).
+        #[arg(required = true, num_args = 2..)]
+        ids: Vec<String>,
+        /// Override the same-kind identity-conflict guard.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Detach one or more strong keys onto a fresh entity (undo a bad merge).
+    Split {
+        /// The key to detach as KIND:VALUE.
+        key: String,
+        /// Additional keys to detach with it (repeatable).
+        #[arg(long = "with")]
+        with: Vec<String>,
+    },
+    /// Report the resolution miss rate (exact / hub / miss breakdown).
+    Stats,
 }
 
 #[derive(Args)]
@@ -125,34 +155,97 @@ struct ResolveArgs {
     hub_fixtures: Option<PathBuf>,
 }
 
-fn main() {
-    if let Err(err) = run() {
+/// Current-thread runtime: the storage trait is `#[async_trait(?Send)]` (see
+/// `sameas_core::store`), and the CLI is a single sequential resolve — there is no
+/// concurrency to exploit, so a work-stealing pool would only add a `Send` bound we
+/// deliberately don't want.
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(err) = run().await {
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let graph = Graph::open(&cli.db).with_context(|| format!("opening db {}", cli.db))?;
+    let graph = SqliteStore::open(&cli.db).with_context(|| format!("opening db {}", cli.db))?;
 
     match &cli.command {
         Command::Resolve(args) => {
-            let out = do_resolve(&graph, args)?;
+            let out = do_resolve(&graph, args).await?;
+            // Log the outcome for `sameas stats` (best-effort — a logging failure
+            // must never fail the resolution). `entity` and `ingest` are excluded:
+            // a direct id lookup and a seed load are not user-facing *queries*, so
+            // counting them would skew the miss rate.
+            record_outcome(&graph, &out, &describe_resolve(args)).await;
             print_output(&out, cli.json, "resolve");
         }
         Command::Entity { id } => {
-            let out = load_entity(&graph, id)?;
+            let out = load_entity(&graph, id).await?;
             print_output(&out, cli.json, "entity");
         }
         Command::Ingest { path } => {
-            do_ingest(&graph, path, cli.json)?;
+            do_ingest(&graph, path, cli.json).await?;
+        }
+        Command::Link { a, b, force } => {
+            let outcome = link(&graph, a, b, *force).await?;
+            print_link(&outcome, cli.json);
+        }
+        Command::Merge { ids, force } => {
+            let winner = merge(&graph, ids, *force).await?;
+            print_correction("merge", &winner, cli.json);
+        }
+        Command::Split { key, with } => {
+            let mut keys = vec![key.clone()];
+            keys.extend(with.iter().cloned());
+            let new_cid = split(&graph, &keys).await?;
+            print_correction("split", &new_cid, cli.json);
+        }
+        Command::Stats => {
+            let report = graph.stats().await?;
+            print_stats(&report, cli.json);
         }
     }
     Ok(())
 }
 
-fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
+/// Log a resolution outcome to the stats table, best-effort. Silently ignores
+/// errors: instrumentation must never break the user's resolution.
+async fn record_outcome(graph: &dyn GraphStore, out: &ResolveOutput, input_desc: &str) {
+    let _ = graph.record_resolution(
+        out.status.as_str(),
+        reason_tag(&out.confidence_reason),
+        out.matched_via.first().map(|s| s.as_str()),
+        out.confidence,
+        Some(input_desc),
+    ).await;
+}
+
+/// A short descriptor of what was resolved, stored with the outcome so the
+/// future fuzzy-phase gate can slice actual missed inputs. IDs only — no
+/// provider content.
+fn describe_resolve(args: &ResolveArgs) -> String {
+    if let Some(d) = &args.domain {
+        format!("domain:{d}")
+    } else if args.phone.is_some() {
+        "phone".to_string()
+    } else if let Some(p) = &args.place_id {
+        format!("google_place_id:{p}")
+    } else if let Some(i) = &args.imdb {
+        format!("imdb:{i}")
+    } else if let Some(id) = &args.id {
+        id.clone()
+    } else if args.name.is_some() {
+        "name".to_string()
+    } else if args.input.is_some() {
+        "record".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<ResolveOutput> {
     // Geo/qualifier facets apply ONLY to the --name reverse-resolution path.
     // Combined with a typed source they would be silently ignored, so reject.
     if args.name.is_none() {
@@ -201,9 +294,9 @@ fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
         // the graph; a miss says "re-run with --complete".
         if args.complete {
             let ctx = build_completion_ctx(args)?;
-            return resolve_name(graph, &query, &ctx);
+            return resolve_name(graph, &query, &ctx).await;
         }
-        return Ok(resolve_name_local(graph, &query)?.unwrap_or_else(|| name_not_found(&query)));
+        return Ok(resolve_name_local(graph, &query).await?.unwrap_or_else(|| name_not_found(&query)));
     }
 
     // Build an EntityRecord from whichever typed source was given.
@@ -211,15 +304,15 @@ fn do_resolve(graph: &Graph, args: &ResolveArgs) -> Result<ResolveOutput> {
 
     if args.complete {
         let ctx = build_completion_ctx(args)?;
-        return resolve_and_complete(graph, &record, &ctx);
+        return resolve_and_complete(graph, &record, &ctx).await;
     }
-    commit_record(graph, &record)
+    commit_record(graph, &record).await
 }
 
 /// Build the input record for a non-name source. `--domain` without page
 /// harvesting is just a single domain key; everything else is a one-id record
 /// (or a harvested/loaded record).
-fn build_input_record(_graph: &Graph, args: &ResolveArgs) -> Result<EntityRecord> {
+fn build_input_record(_graph: &dyn GraphStore, args: &ResolveArgs) -> Result<EntityRecord> {
     if let Some(domain) = &args.domain {
         if args.fixture.is_some() || args.fetch {
             let resolver = build_domain_resolver(domain, args.fixture.as_deref(), args.fetch)?;
@@ -310,12 +403,12 @@ fn build_domain_resolver(
 }
 
 /// Ingest one record file into the graph and return the resolution output.
-fn ingest_one(graph: &Graph, file: &Path) -> Result<ResolveOutput> {
+async fn ingest_one(graph: &dyn GraphStore, file: &Path) -> Result<ResolveOutput> {
     let record = EntityRecord::from_path(file)
         .with_context(|| format!("ingesting {}", file.display()))?;
     let resolver = DirectRecordResolver::new(record);
     let record = resolver.harvest()?;
-    commit_record(graph, &record)
+    commit_record(graph, &record).await
 }
 
 /// Ingest a single file or a directory of `*.json` records.
@@ -327,10 +420,10 @@ fn ingest_one(graph: &Graph, file: &Path) -> Result<ResolveOutput> {
 /// continues rather than aborting mid-way. A summary is always printed; if any
 /// file failed, the failures are listed and the process exits non-zero (but the
 /// good records are already committed — never a silent half-done batch).
-fn do_ingest(graph: &Graph, path: &Path, json: bool) -> Result<()> {
+async fn do_ingest(graph: &dyn GraphStore, path: &Path, json: bool) -> Result<()> {
     if !path.is_dir() {
         // Single file: error loudly on any failure (unchanged behavior).
-        let out = ingest_one(graph, path)?;
+        let out = ingest_one(graph, path).await?;
         print_output(&out, json, "ingest");
         return Ok(());
     }
@@ -355,7 +448,7 @@ fn do_ingest(graph: &Graph, path: &Path, json: bool) -> Result<()> {
     let mut ingested = 0usize;
     let mut failures: Vec<(PathBuf, String)> = Vec::new();
     for file in &files {
-        match ingest_one(graph, file) {
+        match ingest_one(graph, file).await {
             Ok(out) => {
                 print_output(&out, json, "ingest");
                 ingested += 1;
@@ -396,53 +489,10 @@ fn print_output(out: &ResolveOutput, json: bool, action: &str) {
 }
 
 /// Round a confidence to 2 decimals for display (f32 → clean f64).
-fn round2(v: f32) -> f64 {
-    ((v as f64) * 100.0).round() / 100.0
-}
-
+/// Serialize a resolution for `--json`. The document shape lives in
+/// `sameas_core::json` so the CLI and the HTTP Worker cannot drift apart.
 fn to_json(out: &ResolveOutput, action: &str) -> String {
-    let same_as: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
-    let provenance: serde_json::Map<String, serde_json::Value> = out
-        .provenance
-        .iter()
-        .map(|(key, source)| {
-            (
-                key.clone(),
-                serde_json::Value::String(source.clone().unwrap_or_else(|| "unknown".into())),
-            )
-        })
-        .collect();
-    let candidates: Vec<serde_json::Value> = out
-        .candidates
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "canonical_id": c.canonical_id,
-                "anchor": c.anchor,
-                "name": c.name,
-            })
-        })
-        .collect();
-    let value = serde_json::json!({
-        "action": action,
-        "canonical_id": out.canonical_id,
-        "anchor": out.anchor,
-        "type": out.entity_type,
-        "name": out.name,
-        "status": out.status.as_str(),
-        // Round the raw f32 to 2 decimals for stable, human-friendly JSON
-        // (the core struct keeps full precision).
-        "confidence": round2(out.confidence),
-        "confidence_reason": reason_tag(&out.confidence_reason),
-        "matched_via": out.matched_via,
-        "hint": out.hint,
-        "sameAs": same_as,
-        "provenance": provenance,
-        "candidates": candidates,
-        "completion_count": same_as.len(),
-        "harvested": out.harvested,
-        "new_edges": out.new_edges,
-    });
+    let value = sameas_core::json::resolve_output_json(out, action);
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -518,4 +568,149 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
         }
     }
     println!();
+}
+
+// -------------------------------------------------------------------------
+// Correction + stats rendering
+// -------------------------------------------------------------------------
+
+fn print_link(outcome: &LinkOutcome, json: bool) {
+    let (verb, cid) = match outcome {
+        LinkOutcome::Created(c) => ("created", c),
+        LinkOutcome::Attached(c) => ("attached", c),
+        LinkOutcome::AlreadyLinked(c) => ("already_linked", c),
+        LinkOutcome::Merged(c) => ("merged", c),
+    };
+    if json {
+        let value = serde_json::json!({
+            "action": "link",
+            "outcome": verb,
+            "canonical_id": cid,
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+    } else {
+        println!("  {:<12} {} ({})", "link:", cid, verb);
+    }
+}
+
+fn print_correction(action: &str, cid: &str, json: bool) {
+    if json {
+        let value = serde_json::json!({
+            "action": action,
+            "canonical_id": cid,
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+    } else {
+        println!("  {:<12} {}", format!("{action}:"), cid);
+    }
+}
+
+/// The miss rate as shown to the user: rounded ONCE (half-away-from-zero, via
+/// `round2`) so JSON and the pretty "miss rate:" line always show the same value.
+/// Previously JSON used `round2` while pretty used `{:.2}`'s banker's rounding,
+/// so identical data could render as 0.12 vs 0.13.
+fn display_miss_rate(report: &StatsReport) -> f64 {
+    sameas_core::json::round2(report.miss_rate() as f32)
+}
+
+fn print_stats(report: &StatsReport, json: bool) {
+    // Reuse the single rounded miss rate everywhere; the "miss:" bucket
+    // percentage derives from it too, so the bucket line and the "miss rate:"
+    // line can never disagree.
+    let miss_rate = display_miss_rate(report);
+    if json {
+        let by_reason: serde_json::Map<String, serde_json::Value> = report
+            .by_reason
+            .iter()
+            .map(|(tag, n)| (tag.clone(), serde_json::json!(n)))
+            .collect();
+        let value = serde_json::json!({
+            "action": "stats",
+            "total": report.total,
+            "exact": report.exact,
+            "hub": report.hub,
+            "miss": report.miss,
+            "miss_rate": miss_rate,
+            "by_reason": by_reason,
+            "entities": report.entities,
+            "edges": report.edges,
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return;
+    }
+
+    let pct = |n: usize| -> f64 {
+        if report.total == 0 {
+            0.0
+        } else {
+            (n as f64 / report.total as f64 * 100.0).round()
+        }
+    };
+    println!("  resolutions logged: {}", report.total);
+    println!(
+        "  {:<10} {:>6}  {:>4}%   answered from an exact key",
+        "exact:",
+        report.exact,
+        pct(report.exact)
+    );
+    println!(
+        "  {:<10} {:>6}  {:>4}%   required a hub lookup",
+        "hub:",
+        report.hub,
+        pct(report.hub)
+    );
+    // The miss percentage derives from the single rounded miss rate (not an
+    // independent `pct(miss)`), so the bucket line and the "miss rate:" line
+    // below always agree.
+    println!(
+        "  {:<10} {:>6}  {:>4}%   unresolved (the miss set)",
+        "miss:",
+        report.miss,
+        (miss_rate * 100.0).round()
+    );
+    println!(
+        "  {:<10} {:>6.2}",
+        "miss rate:",
+        miss_rate
+    );
+    if !report.by_reason.is_empty() {
+        println!("  by reason:");
+        for (tag, n) in &report.by_reason {
+            println!("      {tag:<28} {n:>6}");
+        }
+    }
+    println!(
+        "  graph: {} entities, {} edges",
+        report.entities, report.edges
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn miss_rate_display_is_consistent_across_json_and_pretty() {
+        // 1/8 = 0.125: a value where round2 (half-away-from-zero → 0.13) and
+        // `{:.2}`'s banker's rounding (→ 0.12) used to disagree. Now both the
+        // JSON `miss_rate` and the pretty "miss rate:" line use the SAME rounded
+        // value, and the "miss:" bucket percentage derives from it.
+        let report = StatsReport {
+            total: 8,
+            exact: 5,
+            hub: 2,
+            miss: 1,
+            by_reason: vec![("needs_stronger_identifier".into(), 1)],
+            entities: 3,
+            edges: 4,
+        };
+        let shown = display_miss_rate(&report);
+        // Single rounded value, half-away-from-zero.
+        assert_eq!(shown, 0.13);
+        // The pretty "miss:" bucket percentage derives from the same value.
+        assert_eq!((shown * 100.0).round(), 13.0);
+        // JSON serializes the identical rounded value (not a re-rounding).
+        let json = serde_json::json!({ "miss_rate": shown });
+        assert_eq!(json["miss_rate"], serde_json::json!(0.13));
+    }
 }

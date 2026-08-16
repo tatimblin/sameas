@@ -10,11 +10,17 @@ name = "sameas"
 path = "src/main.rs"
 
 [dependencies]
-sameas-core = { path = "../sameas-core" }
+# The CLI is inherently the SQLite backend + HTML harvesting: it takes a `--db`
+# path and a `--fixture` page.
+sameas-core = { path = "../sameas-core", features = ["sqlite", "harvest"] }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+# Current-thread runtime only: the storage trait is `#[async_trait(?Send)]`
+# (D1Database is !Send and Workers are single-threaded), and the CLI has no
+# concurrency to exploit anyway.
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
 live-fetch = ["sameas-core/live-fetch"]

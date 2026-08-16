@@ -796,3 +796,85 @@ fn empty_name_is_rejected() {
     assert!(!ok, "empty --name must be rejected");
     assert!(stderr.contains("empty"), "stderr={stderr}");
 }
+
+// -------------------------------------------------------------------------
+// M3 correction ops + stats (link / merge / split / stats)
+// -------------------------------------------------------------------------
+
+#[test]
+fn merge_combines_two_entities() {
+    let h = Harness::new();
+    // Two independent entities via distinct-kind keys (no identity conflict).
+    let a = h.canonical_id(&["resolve", "--id", "google_place_id:MERGEA"]);
+    let b = h.canonical_id(&["resolve", "--id", "wikidata:Q555"]);
+    assert_ne!(a, b);
+
+    let v = h.value(&["merge", &a, &b]);
+    let winner = v["canonical_id"].as_str().unwrap();
+    // The strongest anchor (wikidata) survives.
+    assert_eq!(winner, b);
+
+    // Both keys now read back one entity carrying both.
+    let ent = h.value(&["entity", winner]);
+    let same_as = ent["sameAs"].as_array().unwrap();
+    assert_eq!(same_as.len(), 2);
+}
+
+#[test]
+fn merge_refuses_conflicting_identities() {
+    let h = Harness::new();
+    // Two distinct place_ids = two distinct locations (same-kind identity keys).
+    let a = h.canonical_id(&["resolve", "--id", "google_place_id:LOCA"]);
+    let b = h.canonical_id(&["resolve", "--id", "google_place_id:LOCB"]);
+    let (ok, _out, err) = h.run_raw(&["merge", &a, &b]);
+    assert!(!ok, "merging two distinct locations must be refused");
+    assert!(err.contains("refusing to merge"), "stderr={err}");
+    // --force overrides.
+    let (ok, _out, _err) = h.run_raw(&["merge", &a, &b, "--force"]);
+    assert!(ok, "merge --force should succeed");
+}
+
+#[test]
+fn split_undoes_a_bad_merge() {
+    let h = Harness::new();
+    // Force two locations into one entity (a false merge), then split one out.
+    let a = h.canonical_id(&["resolve", "--id", "google_place_id:MHTN"]);
+    let b = h.canonical_id(&["resolve", "--id", "google_place_id:BKN"]);
+    h.run(&["merge", &a, &b, "--force"]);
+
+    let v = h.value(&["split", "google_place_id:BKN"]);
+    let new_cid = v["canonical_id"].as_str().unwrap();
+
+    // Two distinct entities again, each anchored on its own place_id.
+    let mhtn = h.canonical_id(&["resolve", "--id", "google_place_id:MHTN"]);
+    let bkn = h.canonical_id(&["resolve", "--id", "google_place_id:BKN"]);
+    assert_ne!(mhtn, bkn);
+    assert_eq!(bkn, new_cid);
+}
+
+#[test]
+fn link_asserts_sameness() {
+    let h = Harness::new();
+    let v = h.value(&["link", "google_place_id:LINKA", "yelp:linka"]);
+    assert_eq!(v["outcome"].as_str().unwrap(), "created");
+    let cid = v["canonical_id"].as_str().unwrap();
+    // Both keys resolve to the linked entity.
+    assert_eq!(h.canonical_id(&["resolve", "--id", "google_place_id:LINKA"]), cid);
+    assert_eq!(h.canonical_id(&["resolve", "--id", "yelp:linka"]), cid);
+}
+
+#[test]
+fn stats_reports_miss_rate() {
+    let h = Harness::new();
+    // Two exact hits + one miss (name with no hub, local miss → unresolved).
+    h.run(&["resolve", "--id", "wikidata:Q1"]);
+    h.run(&["resolve", "--id", "google_place_id:SP"]);
+    h.run(&["resolve", "--name", "Ghost Diner", "--city", "Nowhere"]);
+
+    let v = h.value(&["stats"]);
+    assert_eq!(v["total"].as_u64().unwrap(), 3);
+    assert_eq!(v["exact"].as_u64().unwrap(), 2);
+    assert_eq!(v["miss"].as_u64().unwrap(), 1);
+    let miss_rate = v["miss_rate"].as_f64().unwrap();
+    assert!((miss_rate - 0.33).abs() < 0.02, "miss_rate={miss_rate}");
+}

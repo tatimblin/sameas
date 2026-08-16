@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sameas-core", "crates/sameas-cli"]
+members = ["crates/sameas-core", "crates/sameas-cli", "bin/worker"]
 resolver = "2"
 
 [workspace.package]
