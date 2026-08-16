@@ -120,7 +120,12 @@ pub async fn link(graph: &dyn GraphStore, a_key: &str, b_key: &str, force: bool)
             // Neither known: mint one entity anchored on the stronger key. Guard
             // first — two distinct same-kind identity keys (e.g. two place_ids)
             // must not silently fuse into one entity just because both are new.
-            if !force && same_kind_identity_conflict(&[a.clone()], &[b.clone()]) {
+            if !force
+                && same_kind_identity_conflict(
+                    std::slice::from_ref(&a),
+                    std::slice::from_ref(&b),
+                )
+            {
                 bail!(
                     "refusing to link {a_key} and {b_key}: they are distinct identity keys \
                      of the same kind (pass --force to override)"
