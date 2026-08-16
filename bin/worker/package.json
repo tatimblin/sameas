@@ -1,0 +1,22 @@
+{
+    "name": "sameas-worker",
+    "private": true,
+    "scripts": {
+        "build": "./custom_build.sh",
+        "check:shim": "node scripts/check-shim.mjs",
+        "db:migrations:apply": "npx wrangler d1 migrations apply DB --remote",
+        "db:migrations:apply:local": "npx wrangler d1 migrations apply DB --local",
+        "deploy": "npm run db:migrations:apply && npx wrangler deploy && npm run check:shim",
+        "dev": "npx wrangler dev",
+        "test": "vitest run",
+        "test:watch": "vitest"
+    },
+    "devDependencies": {
+        "@cloudflare/vitest-pool-workers": "0.16.3",
+        "@cloudflare/workers-types": "4.20260508.1",
+        "@types/node": "^22.20.1",
+        "typescript": "^6.0.3",
+        "vitest": "4.1.5",
+        "wrangler": "4.90.0"
+    }
+}

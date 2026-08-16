@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    // miniflare's shipped .d.ts files reference `node:*` modules and internal
+    // relative paths that do not resolve standalone, so checking them reports ~100
+    // errors unrelated to this suite. We check OUR code strictly and take the
+    // dependencies' types on faith. (agent-web omits this, which is why its
+    // `tsc --noEmit` has never been clean.)
+    "skipLibCheck": true,
+    // Only `node` here — the `cloudflare:*` module declarations are pulled in by
+    // `/// <reference types>` in test/env.d.ts, because the pool ships them under a
+    // subpath export (`@cloudflare/vitest-pool-workers/types`) that this field
+    // cannot name.
+    "types": ["node"],
+    // scripts/*.mjs is plain Node with JSDoc; type-check the TS, not the JS.
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["test/**/*.ts", "vitest.config.mts", "scripts/**/*.mjs"]
+}
