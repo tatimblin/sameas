@@ -21,7 +21,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::confidence::{score, ConfidenceReason};
-use crate::graph::{Graph, NameCardinality};
 use crate::hubs::{
     PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput, TmdbResolver, WikidataResolver,
 };
@@ -29,6 +28,7 @@ use crate::model::{EntityRecord, ExternalId};
 use crate::resolve::{
     commit_record_with_source, load_entity, Candidate, Resolver, ResolveOutput, Status,
 };
+use crate::store::{GraphStore, NameCardinality};
 use crate::transport::HttpTransport;
 
 /// Configuration for a completion run: the transport plus per-hub API keys and
@@ -121,13 +121,13 @@ fn run_hub(hub: &str, id: &ExternalId, ctx: &CompletionCtx) -> Option<EntityReco
 }
 
 /// Resolve an input record and bootstrap-complete it from external hubs.
-pub fn resolve_and_complete(
-    graph: &Graph,
+pub async fn resolve_and_complete(
+    graph: &dyn GraphStore,
     input: &EntityRecord,
     ctx: &CompletionCtx,
 ) -> Result<ResolveOutput> {
     // 1. Local-first commit — establishes the canonical id + input confidence.
-    let seed = commit_record_with_source(graph, input, "input")?;
+    let seed = commit_record_with_source(graph, input, "input").await?;
     // Refused (no strong key) → nothing resolvable to complete.
     let canonical_id = match &seed.canonical_id {
         Some(c) => c.clone(),
@@ -138,7 +138,7 @@ pub fn resolve_and_complete(
     // 2. Bounded BFS over the cluster.
     let mut visited: HashSet<(&'static str, String)> = HashSet::new();
     for _hop in 0..ctx.max_hops {
-        let members = graph.members(&canonical_id)?;
+        let members = graph.members(&canonical_id).await?;
         let mut did_work = false;
 
         for id in &members {
@@ -152,7 +152,7 @@ pub fn resolve_and_complete(
                     continue;
                 }
                 if let Some(record) = run_hub(hub, id, ctx) {
-                    let out = commit_record_with_source(graph, &record, source_for(hub))?;
+                    let out = commit_record_with_source(graph, &record, source_for(hub)).await?;
                     total_new_edges += out.new_edges;
                     if out.new_edges > 0 {
                         did_work = true;
@@ -166,7 +166,7 @@ pub fn resolve_and_complete(
     }
 
     // 3. Reload the final cluster, carrying the input-attachment metadata.
-    let mut out = load_entity(graph, &canonical_id)?;
+    let mut out = load_entity(graph, &canonical_id).await?;
     out.status = seed.status;
     out.matched_via = seed.matched_via;
     out.harvested = seed.harvested;
@@ -205,7 +205,7 @@ pub fn resolve_and_complete(
 /// query whose token set Q ⊇ S. A query that under-specifies (S ⊄ Q) is never
 /// answered by confidently returning that entity — conservative misses are
 /// acceptable (worst case a hub re-call); a wrong confident hit is not.
-pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<ResolveOutput>> {
+pub async fn resolve_name_local(graph: &dyn GraphStore, query: &NameQuery) -> Result<Option<ResolveOutput>> {
     let name = query.match_name();
     if name.is_empty() {
         return Ok(None);
@@ -223,7 +223,7 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
     //        So we consult the establishing-set scan first and only fall back to
     //        the unique fact when that scan misses.
     let mut unique_fallback: Option<String> = None;
-    match graph.name_cardinality(&name, &quals)? {
+    match graph.name_cardinality(&name, &quals).await? {
         Some(NameCardinality::Ambiguous(stored)) => {
             let candidates: Vec<Candidate> = stored
                 .into_iter()
@@ -243,7 +243,7 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
 
     // 2. Gather same-name entities with their establishing sets S_i. (An empty
     //    set here is a graph miss — the unique fallback below still applies.)
-    let entities = graph.name_entities(&name)?;
+    let entities = graph.name_entities(&name).await?;
     let qset: std::collections::HashSet<&str> = quals.iter().map(|s| s.as_str()).collect();
 
     // Bare query (no qualifiers): name-only semantics — every same-name entity is
@@ -280,7 +280,7 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
     };
 
     if matched.len() == 1 {
-        let mut out = load_entity(graph, &matched[0])?;
+        let mut out = load_entity(graph, &matched[0]).await?;
         out.confidence_reason = ConfidenceReason::LocalNameMatch;
         out.confidence = score(&out.confidence_reason);
         return Ok(Some(out));
@@ -288,7 +288,7 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
     if matched.len() > 1 {
         let mut candidates: Vec<Candidate> = Vec::new();
         for cid in &matched {
-            if let Some(e) = graph.get_entity(cid)? {
+            if let Some(e) = graph.get_entity(cid).await? {
                 candidates.push(Candidate {
                     canonical_id: e.canonical_id,
                     anchor: e.anchor,
@@ -303,7 +303,7 @@ pub fn resolve_name_local(graph: &Graph, query: &NameQuery) -> Result<Option<Res
     //    repeat of a genuinely single-location entity resolves locally (zero
     //    external) instead of re-calling the hub every time.
     if let Some(cid) = unique_fallback {
-        let mut out = load_entity(graph, &cid)?;
+        let mut out = load_entity(graph, &cid).await?;
         out.confidence_reason = ConfidenceReason::LocalNameMatch;
         out.confidence = score(&out.confidence_reason);
         return Ok(Some(out));
@@ -361,13 +361,13 @@ pub fn name_not_found(query: &NameQuery) -> ResolveOutput {
 /// then, on a miss, reverse-resolve via the hubs (Placekey when a street is
 /// present + Google Text Search → place_id → website/phone) and **write the
 /// name+qualifiers into the local index** so the next identical query is local.
-pub fn resolve_name(
-    graph: &Graph,
+pub async fn resolve_name(
+    graph: &dyn GraphStore,
     query: &NameQuery,
     ctx: &CompletionCtx,
 ) -> Result<ResolveOutput> {
     // 0. Graph-first: zero external calls when we've seen this name before.
-    if let Some(out) = resolve_name_local(graph, query)? {
+    if let Some(out) = resolve_name_local(graph, query).await? {
         return Ok(out);
     }
     let name = query.match_name();
@@ -397,9 +397,9 @@ pub fn resolve_name(
         let mut candidates: Vec<Candidate> = Vec::new();
         for pid in &place_ids {
             let key = ExternalId::google_place_id(pid)?.key();
-            match graph.find(&key)? {
+            match graph.find(&key).await? {
                 Some(cid) => {
-                    if let Some(e) = graph.get_entity(&cid)? {
+                    if let Some(e) = graph.get_entity(&cid).await? {
                         candidates.push(Candidate {
                             canonical_id: e.canonical_id,
                             anchor: e.anchor,
@@ -428,7 +428,7 @@ pub fn resolve_name(
                 .iter()
                 .map(|c| (c.canonical_id.clone(), c.anchor.clone(), c.name.clone()))
                 .collect();
-            graph.record_name_cardinality(&name, &quals, &triples)?;
+            graph.record_name_cardinality(&name, &quals, &triples).await?;
         }
         return Ok(ambiguous_output(query, candidates));
     }
@@ -476,7 +476,7 @@ pub fn resolve_name(
 
     // If neither a Placekey nor a place_id was found, the record has no strong
     // key: the commit refuses (Unresolved / NeedsStrongerIdentifier). Return it.
-    let mut out = resolve_and_complete(graph, &record, ctx)?;
+    let mut out = resolve_and_complete(graph, &record, ctx).await?;
     if out.canonical_id.is_none() {
         return Ok(out);
     }
@@ -508,7 +508,7 @@ pub fn resolve_name(
         // nameless by filling the query name (enrich only fills a NULL name).
         if out.name.is_none() {
             if let Some(qname) = query.name.clone() {
-                graph.enrich_entity(&cid, None, Some(&qname))?;
+                graph.enrich_entity(&cid, None, Some(&qname)).await?;
                 out.name = Some(qname);
             }
         }
@@ -516,12 +516,12 @@ pub fn resolve_name(
         // name (the hub's canonical name, an alias) under the same qualifiers, so
         // a later query by EITHER string resolves locally.
         if !name.is_empty() {
-            graph.index_name(&name, &quals, &cid, Some("name_query"))?;
+            graph.index_name(&name, &quals, &cid, Some("name_query")).await?;
         }
         if let Some(display) = out.name.clone() {
             let alias = crate::normalize::name_key(&display);
             if !alias.is_empty() && alias != name {
-                graph.index_name(&alias, &quals, &cid, Some("name_query"))?;
+                graph.index_name(&alias, &quals, &cid, Some("name_query")).await?;
             }
         }
         // Record the UNIQUE side of the cardinality memory: the hub text-search
@@ -534,7 +534,7 @@ pub fn resolve_name(
         // `name`, same `quals`) so lookups line up. Type-agnostic — Q is any
         // qualifier set.
         if unique_place && !name.is_empty() {
-            graph.record_name_unique(&name, &quals, &cid)?;
+            graph.record_name_unique(&name, &quals, &cid).await?;
         }
     }
     Ok(out)
@@ -629,6 +629,7 @@ impl NameQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SqliteStore;
     use crate::transport::FixtureTransport;
     use serde_json::json;
 
@@ -642,11 +643,11 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn imdb_completes_from_empty_graph() {
+    #[tokio::test]
+    async fn imdb_completes_from_empty_graph() {
         // Exit criterion 1: an IMDb id resolves to a QID and completes to
         // website + TMDb with no prior graph state.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
 
         let wd = wikidata_url("tt0133093");
         let find = "https://api.themoviedb.org/3/find/tt0133093?external_source=imdb_id&api_key=";
@@ -670,7 +671,7 @@ mod tests {
             same_as: vec![ExternalId::imdb("tt0133093").unwrap()],
             ..Default::default()
         };
-        let out = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let out = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"wikidata:Q83495".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"tmdb:603".to_string()), "keys={keys:?}");
@@ -679,10 +680,10 @@ mod tests {
         assert!(out.confidence >= 0.9, "confidence={}", out.confidence);
     }
 
-    #[test]
-    fn place_id_completes_to_website_and_phone() {
+    #[tokio::test]
+    async fn place_id_completes_to_website_and_phone() {
         // Exit criterion 2: a place_id completes to website + phone.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let details = "https://places.googleapis.com/v1/places/ChIJN1";
         let transport = FixtureTransport::from_pairs(vec![(
             "GET",
@@ -699,16 +700,16 @@ mod tests {
             same_as: vec![ExternalId::google_place_id("ChIJN1").unwrap()],
             ..Default::default()
         };
-        let out = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let out = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"domain:bluebottlecoffee.com".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"phone:+15106533394".to_string()), "keys={keys:?}");
     }
 
-    #[test]
-    fn completion_is_idempotent() {
+    #[tokio::test]
+    async fn completion_is_idempotent() {
         // Re-running completion on an already-complete cluster adds no edges.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let details = "https://places.googleapis.com/v1/places/ChIJN1";
         let transport = FixtureTransport::from_pairs(vec![(
             "GET",
@@ -723,16 +724,16 @@ mod tests {
             same_as: vec![ExternalId::google_place_id("ChIJN1").unwrap()],
             ..Default::default()
         };
-        resolve_and_complete(&g, &input, &ctx).unwrap();
-        let second = resolve_and_complete(&g, &input, &ctx).unwrap();
+        resolve_and_complete(&g, &input, &ctx).await.unwrap();
+        let second = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         assert_eq!(second.new_edges, 0, "second run should add no edges");
     }
 
-    #[test]
-    fn full_address_resolves_via_placekey_and_completes_via_place_id() {
+    #[tokio::test]
+    async fn full_address_resolves_via_placekey_and_completes_via_place_id() {
         use crate::hubs::{PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
 
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         // A full street address → Placekey runs (its minimum inputs are met).
         let query = NameQuery {
             name: Some("Blue Bottle Coffee".into()),
@@ -771,7 +772,7 @@ mod tests {
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
 
-        let out = resolve_name(&g, &query, &ctx).unwrap();
+        let out = resolve_name(&g, &query, &ctx).await.unwrap();
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"placekey:227-223@5vg-7gq-tvz".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"google_place_id:EXAMPLE_blue_bottle_oakland".to_string()), "keys={keys:?}");
@@ -782,12 +783,12 @@ mod tests {
         assert!((out.confidence - crate::confidence::PLACEKEY_ADDRESS).abs() < 1e-6);
     }
 
-    #[test]
-    fn reverse_place_id_does_not_merge_into_phone_only_entity() {
+    #[tokio::test]
+    async fn reverse_place_id_does_not_merge_into_phone_only_entity() {
         // Two place-bearing entities sharing the SAME phone but distinct
         // place_ids stay distinct (phone never merges), and a phone-only commit
         // refuses to mint anything at all (no strong key).
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
 
         let place_a = commit_record_with_source(
             &g,
@@ -799,7 +800,7 @@ mod tests {
                 ..Default::default()
             },
             "reverse_search",
-        )
+        ).await
         .unwrap();
 
         let place_b = commit_record_with_source(
@@ -812,12 +813,12 @@ mod tests {
                 ..Default::default()
             },
             "reverse_search",
-        )
+        ).await
         .unwrap();
 
         assert_ne!(place_a.canonical_id, place_b.canonical_id);
         // The shared phone corroborates both, without merging them.
-        assert_eq!(g.find_phone("phone:+15106533394").unwrap().len(), 2);
+        assert_eq!(g.find_phone("phone:+15106533394").await.unwrap().len(), 2);
 
         // A phone-only commit has no strong key → refuse (no entity minted).
         let phone_only = commit_record_with_source(
@@ -827,17 +828,17 @@ mod tests {
                 ..Default::default()
             },
             "input",
-        )
+        ).await
         .unwrap();
         assert_eq!(phone_only.status, Status::Unresolved);
         assert!(phone_only.canonical_id.is_none());
     }
 
-    #[test]
-    fn name_query_caches_second_lookup_is_local() {
+    #[tokio::test]
+    async fn name_query_caches_second_lookup_is_local() {
         use crate::hubs::{PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
 
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let query = NameQuery {
             name: Some("Blue Bottle Coffee".into()),
             city: Some("Oakland".into()),
@@ -864,26 +865,26 @@ mod tests {
         let ctx = CompletionCtx::new(Arc::new(transport));
 
         // First resolution reaches the (fixture) hub and records the name index.
-        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let first = resolve_name(&g, &query, &ctx).await.unwrap();
         let cid = first.canonical_id.clone().expect("first resolve should succeed");
 
         // Local-only lookup takes NO transport at all → proves zero external calls.
-        let second = resolve_name_local(&g, &query).unwrap().expect("cached local hit");
+        let second = resolve_name_local(&g, &query).await.unwrap().expect("cached local hit");
         assert_eq!(second.canonical_id.as_deref(), Some(cid.as_str()));
         assert_eq!(second.confidence_reason, ConfidenceReason::LocalNameMatch);
     }
 
-    #[test]
-    fn name_index_ambiguous_returns_candidates() {
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_sf", "google_place_id:SF", None, Some("Basecamp")).unwrap();
-        g.create_entity("cx_ny", "google_place_id:NY", None, Some("Basecamp")).unwrap();
-        g.index_name("basecamp", &["san francisco".into()], "cx_sf", Some("t")).unwrap();
-        g.index_name("basecamp", &["new york".into()], "cx_ny", Some("t")).unwrap();
+    #[tokio::test]
+    async fn name_index_ambiguous_returns_candidates() {
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_sf", "google_place_id:SF", None, Some("Basecamp")).await.unwrap();
+        g.create_entity("cx_ny", "google_place_id:NY", None, Some("Basecamp")).await.unwrap();
+        g.index_name("basecamp", &["san francisco".into()], "cx_sf", Some("t")).await.unwrap();
+        g.index_name("basecamp", &["new york".into()], "cx_ny", Some("t")).await.unwrap();
 
         // Bare name matches both → ambiguous (definitive; no external call).
         let bare = NameQuery { name: Some("Basecamp".into()), ..Default::default() };
-        let out = resolve_name_local(&g, &bare).unwrap().expect("ambiguous is definitive");
+        let out = resolve_name_local(&g, &bare).await.unwrap().expect("ambiguous is definitive");
         assert_eq!(out.status, Status::Unresolved);
         assert_eq!(out.candidates.len(), 2);
 
@@ -893,33 +894,33 @@ mod tests {
             qualifiers: vec!["San Francisco".into()],
             ..Default::default()
         };
-        let hit = resolve_name_local(&g, &sf).unwrap().expect("unique");
+        let hit = resolve_name_local(&g, &sf).await.unwrap().expect("unique");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_sf"));
     }
 
-    #[test]
-    fn name_index_is_type_agnostic_about_the_facet() {
+    #[tokio::test]
+    async fn name_index_is_type_agnostic_about_the_facet() {
         // The qualifier is a state here (a national park), not a city — same
         // machinery, no place-specific assumptions.
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_park", "wikidata:Q180402", Some("Park"), Some("Yosemite"))
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_park", "wikidata:Q180402", Some("Park"), Some("Yosemite")).await
             .unwrap();
-        g.index_name("yosemite", &["california".into()], "cx_park", Some("t")).unwrap();
+        g.index_name("yosemite", &["california".into()], "cx_park", Some("t")).await.unwrap();
 
         let q = NameQuery {
             name: Some("Yosemite".into()),
             qualifiers: vec!["California".into()],
             ..Default::default()
         };
-        let hit = resolve_name_local(&g, &q).unwrap().expect("hit");
+        let hit = resolve_name_local(&g, &q).await.unwrap().expect("hit");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_park"));
     }
 
-    #[test]
-    fn wikidata_input_completes_via_output_keyed_gate() {
+    #[tokio::test]
+    async fn wikidata_input_completes_via_output_keyed_gate() {
         // M2: a direct wikidata id must still harvest website+tmdb+imdb. The hub
         // gate keys on OUTPUT kinds, so a wikidata input no longer self-skips.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let wd = WikidataResolver::new(
             ExternalId::wikidata("Q83495").unwrap(),
             Arc::new(FixtureTransport::from_pairs(vec![])),
@@ -941,21 +942,21 @@ mod tests {
             same_as: vec![ExternalId::wikidata("Q83495").unwrap()],
             ..Default::default()
         };
-        let out = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let out = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"domain:warnerbros.com".to_string()), "{keys:?}");
         assert!(keys.contains(&"tmdb:603".to_string()), "{keys:?}");
         assert!(keys.contains(&"imdb:tt0133093".to_string()), "{keys:?}");
 
         // Idempotent: a second run adds no edges (all output edges present).
-        let second = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let second = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         assert_eq!(second.new_edges, 0, "second run should add no edges");
     }
 
-    #[test]
-    fn tmdb_input_crosswalks_to_imdb_and_wikidata() {
+    #[tokio::test]
+    async fn tmdb_input_crosswalks_to_imdb_and_wikidata() {
         // M2: a direct tmdb id crosswalks out to imdb + wikidata.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let ext = "https://api.themoviedb.org/3/movie/603/external_ids?api_key=";
         let transport = FixtureTransport::from_pairs(vec![(
             "GET",
@@ -967,21 +968,21 @@ mod tests {
             same_as: vec![ExternalId::new("tmdb", "603").unwrap()],
             ..Default::default()
         };
-        let out = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let out = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"imdb:tt0133093".to_string()), "{keys:?}");
         assert!(keys.contains(&"wikidata:Q83495".to_string()), "{keys:?}");
 
-        let second = resolve_and_complete(&g, &input, &ctx).unwrap();
+        let second = resolve_and_complete(&g, &input, &ctx).await.unwrap();
         assert_eq!(second.new_edges, 0, "second run should add no edges");
     }
 
-    #[test]
-    fn street_without_placekey_reports_place_unique_not_placekey() {
+    #[tokio::test]
+    async fn street_without_placekey_reports_place_unique_not_placekey() {
         // M3: a street was supplied but the Placekey hub returned nothing, so the
         // reason must reflect the ACTUAL evidence (a unique place_id), not the
         // intent (PlacekeyAddress).
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let query = NameQuery {
             name: Some("Blue Bottle Coffee".into()),
             street: Some("300 Webster St".into()),
@@ -1013,7 +1014,7 @@ mod tests {
             ),
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
-        let out = resolve_name(&g, &query, &ctx).unwrap();
+        let out = resolve_name(&g, &query, &ctx).await.unwrap();
         assert!(
             !out.same_as.iter().any(|i| i.kind_tag() == "placekey"),
             "no placekey expected: {:?}",
@@ -1023,12 +1024,12 @@ mod tests {
         assert!((out.confidence - crate::confidence::PLACE_UNIQUE).abs() < 1e-6);
     }
 
-    #[test]
-    fn resolve_name_persists_display_name_and_indexes_alias() {
+    #[tokio::test]
+    async fn resolve_name_persists_display_name_and_indexes_alias() {
         // M4 + M6: the hub displayName becomes the stored name, and BOTH the query
         // name and the resolved displayName are indexed under the qualifiers, so a
         // later LOCAL query by either string hits the same entity.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let query = NameQuery {
             name: Some("Nickname".into()),
             city: Some("Portland".into()),
@@ -1055,7 +1056,7 @@ mod tests {
             ),
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
-        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let first = resolve_name(&g, &query, &ctx).await.unwrap();
         let cid = first.canonical_id.clone().expect("resolve should succeed");
         // Stored name is the hub displayName, not the query nickname.
         assert_eq!(first.name.as_deref(), Some("Official Name"));
@@ -1066,28 +1067,28 @@ mod tests {
             city: Some("Portland".into()),
             ..Default::default()
         };
-        let hit = resolve_name_local(&g, &official)
+        let hit = resolve_name_local(&g, &official).await
             .unwrap()
             .expect("alias local hit");
         assert_eq!(hit.canonical_id.as_deref(), Some(cid.as_str()));
         assert_eq!(hit.confidence_reason, ConfidenceReason::LocalNameMatch);
 
         // The original nickname still resolves locally too.
-        let nick = resolve_name_local(&g, &query)
+        let nick = resolve_name_local(&g, &query).await
             .unwrap()
             .expect("query-name local hit");
         assert_eq!(nick.canonical_id.as_deref(), Some(cid.as_str()));
     }
 
-    #[test]
-    fn local_name_does_not_serve_wrong_entity_on_coarse_overlap() {
+    #[tokio::test]
+    async fn local_name_does_not_serve_wrong_entity_on_coarse_overlap() {
         // H5: an entity cached under {boston, us} must NOT be returned for a
         // {seattle, us} query sharing only the coarse country — it misses locally
         // (so the caller reaches out) rather than confidently serving Boston.
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_bos", "google_place_id:BOS", None, Some("Acme"))
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_bos", "google_place_id:BOS", None, Some("Acme")).await
             .unwrap();
-        g.index_name("acme", &["boston".into(), "us".into()], "cx_bos", Some("t"))
+        g.index_name("acme", &["boston".into(), "us".into()], "cx_bos", Some("t")).await
             .unwrap();
 
         let seattle = NameQuery {
@@ -1096,7 +1097,7 @@ mod tests {
             country: Some("US".into()),
             ..Default::default()
         };
-        assert!(resolve_name_local(&g, &seattle).unwrap().is_none());
+        assert!(resolve_name_local(&g, &seattle).await.unwrap().is_none());
 
         let boston = NameQuery {
             name: Some("Acme".into()),
@@ -1104,18 +1105,18 @@ mod tests {
             country: Some("US".into()),
             ..Default::default()
         };
-        let hit = resolve_name_local(&g, &boston)
+        let hit = resolve_name_local(&g, &boston).await
             .unwrap()
             .expect("boston hits");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_bos"));
     }
 
-    #[test]
-    fn t1_identical_repeat_with_street_hits_locally_zero_external() {
+    #[tokio::test]
+    async fn t1_identical_repeat_with_street_hits_locally_zero_external() {
         // T1 (regression): name+street+city establishes E; the IDENTICAL repeat
         // (same street) still hits locally with zero external calls — the cache
         // value prop is preserved for a same-or-more-specific query.
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let query = NameQuery {
             name: Some("Blue Bottle Coffee".into()),
             street: Some("1 Ferry Building".into()),
@@ -1140,23 +1141,23 @@ mod tests {
             ("GET", &details_url, json!({"websiteUri": "https://bluebottlecoffee.com/"})),
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
-        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let first = resolve_name(&g, &query, &ctx).await.unwrap();
         let cid = first.canonical_id.clone().expect("establish E");
 
         // Local-only (no transport at all) → proves zero external calls.
-        let second = resolve_name_local(&g, &query).unwrap().expect("cached local hit");
+        let second = resolve_name_local(&g, &query).await.unwrap().expect("cached local hit");
         assert_eq!(second.canonical_id.as_deref(), Some(cid.as_str()));
         assert_eq!(second.confidence_reason, ConfidenceReason::LocalNameMatch);
     }
 
-    #[test]
-    fn t2_local_name_street_entity_not_served_to_coarser_city_query() {
+    #[tokio::test]
+    async fn t2_local_name_street_entity_not_served_to_coarser_city_query() {
         // THE FIX (local half): an entity established under {street, city} must NOT
         // be confidently returned to a later name+city (no street) query — its
         // establishing set is not a subset of the coarser query's tokens, so the
         // lookup misses locally (deferring to a hub) rather than wrong-binding.
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_ferry", "google_place_id:FERRY", None, Some("Blue Bottle Coffee"))
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_ferry", "google_place_id:FERRY", None, Some("Blue Bottle Coffee")).await
             .unwrap();
         // Established with the full set (street folded in), as resolve_name now does.
         g.index_name(
@@ -1164,7 +1165,7 @@ mod tests {
             &["1 ferry building".into(), "san francisco".into()],
             "cx_ferry",
             Some("t"),
-        )
+        ).await
         .unwrap();
 
         // Coarser query (no street) under-specifies the establishing set → miss.
@@ -1174,7 +1175,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            resolve_name_local(&g, &coarse).unwrap().is_none(),
+            resolve_name_local(&g, &coarse).await.unwrap().is_none(),
             "a name+city query must not be confidently served a name+street entity"
         );
 
@@ -1185,33 +1186,33 @@ mod tests {
             city: Some("San Francisco".into()),
             ..Default::default()
         };
-        let hit = resolve_name_local(&g, &specific).unwrap().expect("specific hits");
+        let hit = resolve_name_local(&g, &specific).await.unwrap().expect("specific hits");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_ferry"));
     }
 
-    #[test]
-    fn t5_coarse_query_over_multiple_known_specifics_returns_candidates() {
+    #[tokio::test]
+    async fn t5_coarse_query_over_multiple_known_specifics_returns_candidates() {
         // T5: two specific entities under the SAME name+city but different streets.
         // A coarse name+city query (no street) under-specifies both → returns BOTH
         // as candidates locally, zero external (not a pick, not a miss).
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_a", "google_place_id:A", None, Some("Blue Bottle Coffee"))
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_a", "google_place_id:A", None, Some("Blue Bottle Coffee")).await
             .unwrap();
-        g.create_entity("cx_b", "google_place_id:B", None, Some("Blue Bottle Coffee"))
+        g.create_entity("cx_b", "google_place_id:B", None, Some("Blue Bottle Coffee")).await
             .unwrap();
         g.index_name(
             "blue bottle coffee",
             &["100 a st".into(), "san francisco".into()],
             "cx_a",
             Some("t"),
-        )
+        ).await
         .unwrap();
         g.index_name(
             "blue bottle coffee",
             &["200 b st".into(), "san francisco".into()],
             "cx_b",
             Some("t"),
-        )
+        ).await
         .unwrap();
 
         let coarse = NameQuery {
@@ -1219,27 +1220,27 @@ mod tests {
             city: Some("San Francisco".into()),
             ..Default::default()
         };
-        let out = resolve_name_local(&g, &coarse).unwrap().expect("ambiguous");
+        let out = resolve_name_local(&g, &coarse).await.unwrap().expect("ambiguous");
         assert_eq!(out.status, Status::Unresolved);
         assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
         assert_eq!(out.candidates.len(), 2);
     }
 
-    #[test]
-    fn t6_type_agnostic_qualifier_only_no_confident_pick() {
+    #[tokio::test]
+    async fn t6_type_agnostic_qualifier_only_no_confident_pick() {
         // T6: type-agnostic proof using ONLY --qualifier tokens (no street/city).
         // "Nova" established under {2019} and under {2021}. A bare `--name Nova`
         // must NOT confidently return one — the rule is generic, not geo.
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_2019", "wikidata:Q19", Some("Movie"), Some("Nova"))
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_2019", "wikidata:Q19", Some("Movie"), Some("Nova")).await
             .unwrap();
-        g.create_entity("cx_2021", "wikidata:Q21", Some("Movie"), Some("Nova"))
+        g.create_entity("cx_2021", "wikidata:Q21", Some("Movie"), Some("Nova")).await
             .unwrap();
-        g.index_name("nova", &["2019".into()], "cx_2019", Some("t")).unwrap();
-        g.index_name("nova", &["2021".into()], "cx_2021", Some("t")).unwrap();
+        g.index_name("nova", &["2019".into()], "cx_2019", Some("t")).await.unwrap();
+        g.index_name("nova", &["2021".into()], "cx_2021", Some("t")).await.unwrap();
 
         let bare = NameQuery { name: Some("Nova".into()), ..Default::default() };
-        let out = resolve_name_local(&g, &bare).unwrap().expect("ambiguous, not a pick");
+        let out = resolve_name_local(&g, &bare).await.unwrap().expect("ambiguous, not a pick");
         assert_eq!(out.status, Status::Unresolved);
         assert_eq!(out.candidates.len(), 2);
 
@@ -1249,16 +1250,16 @@ mod tests {
             qualifiers: vec!["2019".into()],
             ..Default::default()
         };
-        let hit = resolve_name_local(&g, &y2019).unwrap().expect("unique");
+        let hit = resolve_name_local(&g, &y2019).await.unwrap().expect("unique");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_2019"));
     }
 
-    #[test]
-    fn cardinality_memory_serves_repeat_ambiguous_query_locally() {
+    #[tokio::test]
+    async fn cardinality_memory_serves_repeat_ambiguous_query_locally() {
         // T3 (unit): a name+city hub search that returns MULTIPLE records the
         // ambiguity; a later IDENTICAL query is answered from local memory with
         // zero external calls (no transport at all on the repeat).
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
         let query = NameQuery {
             name: Some("Joe's Pizza".into()),
             city: Some("New York".into()),
@@ -1279,23 +1280,23 @@ mod tests {
             ),
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
-        let first = resolve_name(&g, &query, &ctx).unwrap();
+        let first = resolve_name(&g, &query, &ctx).await.unwrap();
         assert_eq!(first.confidence_reason, ConfidenceReason::AmbiguousAmongN(3));
         assert!(first.canonical_id.is_none());
 
         // Local-only repeat (no transport) → ambiguous from memory, zero external.
-        let repeat = resolve_name_local(&g, &query).unwrap().expect("from memory");
+        let repeat = resolve_name_local(&g, &query).await.unwrap().expect("from memory");
         assert_eq!(repeat.confidence_reason, ConfidenceReason::AmbiguousAmongN(3));
         assert_eq!(repeat.candidates.len(), 3);
         assert_eq!(repeat.harvested, 0);
         assert_eq!(repeat.new_edges, 0);
     }
 
-    #[test]
-    fn kibatsu_unique_flow_coarse_repeat_hits_locally() {
+    #[tokio::test]
+    async fn kibatsu_unique_flow_coarse_repeat_hits_locally() {
         use crate::hubs::{PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
 
-        let g = Graph::open_in_memory().unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
 
         // Step 1: name + street + city, --complete. The hub text-search returns
         // exactly ONE place → resolves + mints cx, indexed with the STREET folded
@@ -1327,7 +1328,7 @@ mod tests {
                 json!({"displayName": {"text": "Kibatsu"}, "websiteUri": "https://kibatsu.example/"}),
             ),
         ]);
-        let step1 = resolve_name(&g, &specific, &CompletionCtx::new(Arc::new(t1))).unwrap();
+        let step1 = resolve_name(&g, &specific, &CompletionCtx::new(Arc::new(t1))).await.unwrap();
         let cid = step1.canonical_id.clone().expect("step 1 resolves");
 
         // Step 2: coarse city-only query, LOCAL ONLY → MISS. Uniqueness of the
@@ -1339,7 +1340,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            resolve_name_local(&g, &coarse).unwrap().is_none(),
+            resolve_name_local(&g, &coarse).await.unwrap().is_none(),
             "step 2 (coarse local-only, no memory yet) must miss"
         );
 
@@ -1358,12 +1359,12 @@ mod tests {
             &coarse_text_url,
             json!({"places": [{"id": "KIBATSU_MAIN"}]}),
         )]);
-        let step3 = resolve_name(&g, &coarse, &CompletionCtx::new(Arc::new(t3))).unwrap();
+        let step3 = resolve_name(&g, &coarse, &CompletionCtx::new(Arc::new(t3))).await.unwrap();
         assert_eq!(step3.canonical_id.as_deref(), Some(cid.as_str()), "step 3 resolves to cx");
 
         // Step 4: coarse city-only query, LOCAL ONLY repeat → now HITS from unique
         // memory (zero external), local_name_match, nothing harvested.
-        let step4 = resolve_name_local(&g, &coarse)
+        let step4 = resolve_name_local(&g, &coarse).await
             .unwrap()
             .expect("step 4 hits from unique memory");
         assert_eq!(step4.canonical_id.as_deref(), Some(cid.as_str()));
@@ -1371,8 +1372,8 @@ mod tests {
         assert_eq!(step4.harvested, 0);
     }
 
-    #[test]
-    fn local_lookup_flips_from_unique_to_ambiguous() {
+    #[tokio::test]
+    async fn local_lookup_flips_from_unique_to_ambiguous() {
         // Flip on change: a (name, Q) recorded UNIQUE (hub returned one) that a
         // later hub call proves MULTIPLE must overwrite the unique row with an
         // ambiguous one — a subsequent LOCAL query then returns ambiguous_among_n,
@@ -1380,8 +1381,8 @@ mod tests {
         // unique hit, so the two hub outcomes are modeled by the two graph records
         // they would write; the local-consult behavior across the flip is the
         // subject under test.
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_one", "google_place_id:ONE", None, Some("Joe's Pizza"))
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_one", "google_place_id:ONE", None, Some("Joe's Pizza")).await
             .unwrap();
         let quals = vec!["new york".to_string()];
         let q = NameQuery {
@@ -1392,8 +1393,8 @@ mod tests {
 
         // Hub returned ONE → unique. A coarse local query hits it (via the unique
         // fallback: nothing is indexed in name_index under this key).
-        g.record_name_unique("joe's pizza", &quals, "cx_one").unwrap();
-        let hit = resolve_name_local(&g, &q).unwrap().expect("unique local hit");
+        g.record_name_unique("joe's pizza", &quals, "cx_one").await.unwrap();
+        let hit = resolve_name_local(&g, &q).await.unwrap().expect("unique local hit");
         assert_eq!(hit.canonical_id.as_deref(), Some("cx_one"));
         assert_eq!(hit.confidence_reason, ConfidenceReason::LocalNameMatch);
 
@@ -1402,33 +1403,33 @@ mod tests {
             (String::new(), "google_place_id:ONE".into(), None),
             (String::new(), "google_place_id:TWO".into(), None),
         ];
-        g.record_name_cardinality("joe's pizza", &quals, &cands).unwrap();
+        g.record_name_cardinality("joe's pizza", &quals, &cands).await.unwrap();
 
-        let out = resolve_name_local(&g, &q).unwrap().expect("ambiguous from memory");
+        let out = resolve_name_local(&g, &q).await.unwrap().expect("ambiguous from memory");
         assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
         assert!(out.canonical_id.is_none(), "must not serve the stale unique hit");
     }
 
-    #[test]
-    fn unique_memory_does_not_override_genuine_graph_ambiguity() {
+    #[tokio::test]
+    async fn unique_memory_does_not_override_genuine_graph_ambiguity() {
         // Safety: a stale unique fact for (name, Q) must NOT mask a genuine
         // multi-entity ambiguity discoverable from the graph. Two same-name
         // entities are indexed under the SAME establishing set = the query set, so
         // the graph scan finds both; the unique fallback must lose to that.
-        let g = Graph::open_in_memory().unwrap();
-        g.create_entity("cx_a", "google_place_id:A", None, Some("Nova")).unwrap();
-        g.create_entity("cx_b", "google_place_id:B", None, Some("Nova")).unwrap();
-        g.index_name("nova", &["berlin".into()], "cx_a", Some("t")).unwrap();
-        g.index_name("nova", &["berlin".into()], "cx_b", Some("t")).unwrap();
+        let g = SqliteStore::open_in_memory().unwrap();
+        g.create_entity("cx_a", "google_place_id:A", None, Some("Nova")).await.unwrap();
+        g.create_entity("cx_b", "google_place_id:B", None, Some("Nova")).await.unwrap();
+        g.index_name("nova", &["berlin".into()], "cx_a", Some("t")).await.unwrap();
+        g.index_name("nova", &["berlin".into()], "cx_b", Some("t")).await.unwrap();
         // A stale unique fact naming just one of them.
-        g.record_name_unique("nova", &["berlin".into()], "cx_a").unwrap();
+        g.record_name_unique("nova", &["berlin".into()], "cx_a").await.unwrap();
 
         let q = NameQuery {
             name: Some("Nova".into()),
             city: Some("Berlin".into()),
             ..Default::default()
         };
-        let out = resolve_name_local(&g, &q).unwrap().expect("ambiguous from graph");
+        let out = resolve_name_local(&g, &q).await.unwrap().expect("ambiguous from graph");
         assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
         assert!(out.canonical_id.is_none());
     }

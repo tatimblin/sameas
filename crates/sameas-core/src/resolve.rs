@@ -15,9 +15,9 @@ use anyhow::{anyhow, Result};
 
 use crate::anchor;
 use crate::confidence::{score, ConfidenceReason};
-use crate::graph::Graph;
 use crate::kind::Grain;
 use crate::model::{EntityRecord, ExternalId};
+use crate::store::GraphStore;
 
 /// Whether a resolution created a new entity, hit an existing one, or refused
 /// to resolve (no strong identifier / ambiguous).
@@ -109,14 +109,14 @@ impl Resolver for DirectRecordResolver {
 /// returned `same_as` is the whole cluster from the local graph. Edges written
 /// here carry the provenance `"input"`; use [`commit_record_with_source`] to
 /// attribute edges to a specific hub.
-pub fn commit_record(graph: &Graph, record: &EntityRecord) -> Result<ResolveOutput> {
-    commit_record_with_source(graph, record, "input")
+pub async fn commit_record(graph: &dyn GraphStore, record: &EntityRecord) -> Result<ResolveOutput> {
+    commit_record_with_source(graph, record, "input").await
 }
 
 /// Like [`commit_record`], but tags every edge it writes with `source`
 /// (e.g. `"wikidata"`, `"google_places"`) for edge provenance.
-pub fn commit_record_with_source(
-    graph: &Graph,
+pub async fn commit_record_with_source(
+    graph: &dyn GraphStore,
     record: &EntityRecord,
     source: &str,
 ) -> Result<ResolveOutput> {
@@ -143,14 +143,14 @@ pub fn commit_record_with_source(
     // 1. Which existing canonicals do the identity / affiliation keys hit?
     let mut identity_hits: Vec<String> = Vec::new();
     for id in &identity_ids {
-        if let Some(canon) = graph.find(&id.key())? {
+        if let Some(canon) = graph.find(&id.key()).await? {
             identity_hits.push(canon);
         }
     }
     dedup(&mut identity_hits);
     let mut affil_hits: Vec<String> = Vec::new();
     for id in &affiliation_ids {
-        if let Some(canon) = graph.find(&id.key())? {
+        if let Some(canon) = graph.find(&id.key()).await? {
             affil_hits.push(canon);
         }
     }
@@ -161,12 +161,12 @@ pub fn commit_record_with_source(
     if strong_ids.is_empty() {
         let mut phone_canons: Vec<String> = Vec::new();
         for id in &phone_ids {
-            phone_canons.extend(graph.find_phone(&id.key())?);
+            phone_canons.extend(graph.find_phone(&id.key()).await?);
         }
         dedup(&mut phone_canons);
         let mut candidates: Vec<Candidate> = Vec::new();
         for c in &phone_canons {
-            if let Some(e) = graph.get_entity(c)? {
+            if let Some(e) = graph.get_entity(c).await? {
                 candidates.push(Candidate {
                     canonical_id: e.canonical_id,
                     anchor: e.anchor,
@@ -206,17 +206,24 @@ pub fn commit_record_with_source(
         // Identity keys matched: legitimately the same thing. Union the identity
         // hits, then absorb affiliation hits unless they carry a conflicting
         // identity (a distinct thing sharing only the domain).
-        let winner = pick_winner(graph, &identity_hits)?;
+        let winner = pick_winner(graph, &identity_hits).await?;
         for canon in &identity_hits {
             if canon != &winner {
-                graph.merge_into(&winner, canon)?;
+                graph.merge_into(&winner, canon).await?;
             }
         }
+        // The winner's membership grows as it absorbs each affiliation hit, and a
+        // key absorbed from an earlier hit can conflict with a later one — so the
+        // comparison must see the CURRENT membership, not a snapshot from before
+        // the loop. Cache it and refresh only after a merge actually changes it
+        // (one read per merge instead of one read per candidate).
+        let mut winner_members = graph.members(&winner).await?;
         for canon in &affil_hits {
             if canon != &winner
-                && !identity_conflict(&graph.members(&winner)?, &graph.members(canon)?)
+                && !identity_conflict(&winner_members, &graph.members(canon).await?)
             {
-                graph.merge_into(&winner, canon)?;
+                graph.merge_into(&winner, canon).await?;
+                winner_members = graph.members(&winner).await?;
             }
         }
         (winner, Status::Hit)
@@ -230,12 +237,16 @@ pub fn commit_record_with_source(
             // (same entity, or one side identity-less) — mirroring the identity-
             // hits branch. Conflicting owners stay separate and keep their own
             // domain (step 4 refuses to steal it).
-            let winner = pick_winner(graph, &affil_hits)?;
+            let winner = pick_winner(graph, &affil_hits).await?;
+            // Same as the identity-hits branch: re-read after each absorb so a key
+            // gained from an earlier merge still blocks a later conflicting one.
+            let mut winner_members = graph.members(&winner).await?;
             for canon in &affil_hits {
                 if canon != &winner
-                    && !identity_conflict(&graph.members(&winner)?, &graph.members(canon)?)
+                    && !identity_conflict(&winner_members, &graph.members(canon).await?)
                 {
-                    graph.merge_into(&winner, canon)?;
+                    graph.merge_into(&winner, canon).await?;
+                    winner_members = graph.members(&winner).await?;
                 }
             }
             (winner, Status::Hit)
@@ -244,7 +255,7 @@ pub fn commit_record_with_source(
             // already shares one of them, else this is a distinct thing.
             let mut target: Option<String> = None;
             for canon in &affil_hits {
-                let c_identity = identity_keys(&graph.members(canon)?);
+                let c_identity = identity_keys(&graph.members(canon).await?);
                 if c_identity
                     .iter()
                     .any(|k| incoming_identity_keys.contains(k))
@@ -255,12 +266,12 @@ pub fn commit_record_with_source(
             }
             match target {
                 Some(c) => (c, Status::Hit),
-                None => (mint_entity(graph, record)?, Status::New),
+                None => (mint_entity(graph, record).await?, Status::New),
             }
         }
     } else {
         // Strong keys, but none matched an existing entity → a new entity.
-        (mint_entity(graph, record)?, Status::New)
+        (mint_entity(graph, record).await?, Status::New)
     };
 
     // 4. Attach every strong key to the target, except an incoming affiliation
@@ -268,7 +279,7 @@ pub fn commit_record_with_source(
     //    conflict) — don't steal a shared domain.
     for id in &strong_ids {
         let key = id.key();
-        match graph.find(&key)? {
+        match graph.find(&key).await? {
             Some(c) if c == canonical_id => {
                 matched_via.push(id.kind_tag().to_string());
             }
@@ -289,11 +300,11 @@ pub fn commit_record_with_source(
                     matched_via.push("domain (shared affiliation; distinct entity)".into());
                     continue;
                 }
-                graph.attach_with_source(&key, &canonical_id, Some(source))?;
+                graph.attach_with_source(&key, &canonical_id, Some(source)).await?;
                 new_edges += 1;
             }
             None => {
-                graph.attach_with_source(&key, &canonical_id, Some(source))?;
+                graph.attach_with_source(&key, &canonical_id, Some(source)).await?;
                 new_edges += 1;
             }
         }
@@ -302,11 +313,11 @@ pub fn commit_record_with_source(
     // 5. Record phone edges (corroborators). Attaching to the target never
     //    merges anything — a phone may edge to multiple entities.
     for id in &phone_ids {
-        let already = graph.find_phone(&id.key())?;
+        let already = graph.find_phone(&id.key()).await?;
         if already.iter().any(|c| c == &canonical_id) {
             matched_via.push("phone (corroborating)".into());
         } else {
-            graph.add_phone_edge_with_source(&id.key(), &canonical_id, Some(source))?;
+            graph.add_phone_edge_with_source(&id.key(), &canonical_id, Some(source)).await?;
             new_edges += 1;
             if !already.is_empty() {
                 matched_via.push("phone (corroborating)".into());
@@ -315,23 +326,23 @@ pub fn commit_record_with_source(
     }
 
     // 6. Sharpen the anchor from the full membership (canonical id is fixed).
-    let members = graph.members(&canonical_id)?;
+    let members = graph.members(&canonical_id).await?;
     let current = graph
-        .get_entity(&canonical_id)?
+        .get_entity(&canonical_id).await?
         .ok_or_else(|| anyhow!("entity {canonical_id} vanished mid-resolve"))?
         .anchor;
     let anchor = anchor::recompute_anchor(&members, &current);
     if anchor != current {
-        graph.set_anchor(&canonical_id, &anchor)?;
+        graph.set_anchor(&canonical_id, &anchor).await?;
     }
     graph.enrich_entity(
         &canonical_id,
         record.entity_type.as_deref(),
         record.name.as_deref(),
-    )?;
+    ).await?;
 
     let entity = graph
-        .get_entity(&canonical_id)?
+        .get_entity(&canonical_id).await?
         .ok_or_else(|| anyhow!("entity {canonical_id} not found"))?;
 
     dedup(&mut matched_via);
@@ -345,7 +356,7 @@ pub fn commit_record_with_source(
         Status::New => ConfidenceReason::SyntheticStrongKey,
         Status::Unresolved => unreachable!("unresolved handled above"),
     };
-    let provenance = graph.member_sources(&canonical_id)?;
+    let provenance = graph.member_sources(&canonical_id).await?;
 
     Ok(ResolveOutput {
         canonical_id: Some(canonical_id),
@@ -367,7 +378,7 @@ pub fn commit_record_with_source(
 
 /// Mint a fresh entity for `record`: public anchor if any, else a deterministic
 /// synthetic anchor from the strongest strong key, else a local synthetic id.
-fn mint_entity(graph: &Graph, record: &EntityRecord) -> Result<String> {
+async fn mint_entity(graph: &dyn GraphStore, record: &EntityRecord) -> Result<String> {
     let anchor = anchor::choose_anchor(&record.same_as);
     let cid = anchor::canonical_id_for(&anchor);
     graph.create_entity(
@@ -375,7 +386,7 @@ fn mint_entity(graph: &Graph, record: &EntityRecord) -> Result<String> {
         &anchor,
         record.entity_type.as_deref(),
         record.name.as_deref(),
-    )?;
+    ).await?;
     Ok(cid)
 }
 
@@ -397,21 +408,21 @@ fn identity_conflict(a: &[ExternalId], b: &[ExternalId]) -> bool {
 }
 
 /// Resolve a single typed identifier (the CLI `--flag` path).
-pub fn resolve_id(graph: &Graph, id: ExternalId) -> Result<ResolveOutput> {
+pub async fn resolve_id(graph: &dyn GraphStore, id: ExternalId) -> Result<ResolveOutput> {
     let record = EntityRecord {
         same_as: vec![id],
         ..Default::default()
     };
-    commit_record(graph, &record)
+    commit_record(graph, &record).await
 }
 
 /// Load an existing entity by canonical id (the `entity <id>` path).
-pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
+pub async fn load_entity(graph: &dyn GraphStore, canonical_id: &str) -> Result<ResolveOutput> {
     let entity = graph
-        .get_entity(canonical_id)?
+        .get_entity(canonical_id).await?
         .ok_or_else(|| anyhow!("no entity with canonical_id {canonical_id}"))?;
-    let members = graph.members(canonical_id)?;
-    let provenance = graph.member_sources(canonical_id)?;
+    let members = graph.members(canonical_id).await?;
+    let provenance = graph.member_sources(canonical_id).await?;
     Ok(ResolveOutput {
         canonical_id: Some(entity.canonical_id),
         anchor: entity.anchor,
@@ -433,11 +444,11 @@ pub fn load_entity(graph: &Graph, canonical_id: &str) -> Result<ResolveOutput> {
 
 /// Pick the union winner among candidate canonicals: strongest anchor, ties
 /// broken by canonical id for determinism.
-fn pick_winner(graph: &Graph, canonicals: &[String]) -> Result<String> {
+async fn pick_winner(graph: &dyn GraphStore, canonicals: &[String]) -> Result<String> {
     let mut best: Option<(u8, String)> = None;
     for cid in canonicals {
         let anchor = graph
-            .get_entity(cid)?
+            .get_entity(cid).await?
             .ok_or_else(|| anyhow!("entity {cid} not found"))?
             .anchor;
         let rank = anchor::anchor_key_rank(&anchor);
@@ -466,11 +477,17 @@ fn dedup(v: &mut Vec<String>) {
 /// OpenGraph / `<link rel=canonical>` fallbacks. Reads page HTML from a local
 /// fixture (offline/deterministic) or, behind the `live-fetch` feature, over
 /// HTTP.
+///
+/// Requires the `harvest` feature: parsing needs `scraper`, and `from_fixture`
+/// needs `std::fs` — neither is usable in a Worker, where a domain is only ever a
+/// plain graph key.
+#[cfg(feature = "harvest")]
 pub struct DomainResolver {
     domain: String,
     html: String,
 }
 
+#[cfg(feature = "harvest")]
 impl DomainResolver {
     /// Build a resolver from a domain and an HTML fixture file.
     pub fn from_fixture(domain: &str, fixture_path: &std::path::Path) -> Result<Self> {
@@ -503,6 +520,7 @@ impl DomainResolver {
     }
 }
 
+#[cfg(feature = "harvest")]
 impl Resolver for DomainResolver {
     fn harvest(&self) -> Result<EntityRecord> {
         use scraper::{Html, Selector};
@@ -549,6 +567,7 @@ impl Resolver for DomainResolver {
 }
 
 /// Extract identifiers from a JSON-LD value (object, array, or @graph).
+#[cfg(feature = "harvest")]
 fn harvest_jsonld(value: &serde_json::Value, record: &mut EntityRecord) {
     match value {
         serde_json::Value::Array(items) => {
@@ -588,6 +607,7 @@ fn harvest_jsonld(value: &serde_json::Value, record: &mut EntityRecord) {
     }
 }
 
+#[cfg(feature = "harvest")]
 fn harvest_same_as(value: &serde_json::Value, record: &mut EntityRecord) {
     match value {
         serde_json::Value::String(s) => {
@@ -611,6 +631,7 @@ fn harvest_same_as(value: &serde_json::Value, record: &mut EntityRecord) {
 /// (first match wins), so a new kind gains page-harvesting support just by
 /// setting `url_match` in its [`crate::kind::KindSpec`]. Anything else that is
 /// URL-shaped falls back to a `domain` edge.
+#[cfg(feature = "harvest")]
 fn guess_id_from_url(raw: &str) -> Option<ExternalId> {
     let lower = raw.to_ascii_lowercase();
 
@@ -646,12 +667,14 @@ fn guess_id_from_url(raw: &str) -> Option<ExternalId> {
     None
 }
 
+#[cfg(feature = "harvest")]
 fn push_unique(ids: &mut Vec<ExternalId>, id: ExternalId) {
     if !ids.iter().any(|existing| existing == &id) {
         ids.push(id);
     }
 }
 
+#[cfg(feature = "harvest")]
 fn meta_content(doc: &scraper::Html, selector: &str) -> Option<String> {
     let sel = scraper::Selector::parse(selector).ok()?;
     doc.select(&sel)
@@ -660,6 +683,7 @@ fn meta_content(doc: &scraper::Html, selector: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[cfg(feature = "harvest")]
 fn link_href(doc: &scraper::Html, selector: &str) -> Option<String> {
     let sel = scraper::Selector::parse(selector).ok()?;
     doc.select(&sel)
@@ -671,6 +695,7 @@ fn link_href(doc: &scraper::Html, selector: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SqliteStore;
 
     const FIXTURE: &str = r#"
     <html><head>
@@ -690,8 +715,8 @@ mod tests {
     </head><body>hi</body></html>
     "#;
 
-    #[test]
-    fn jsonld_sameas_extraction() {
+    #[tokio::test]
+    async fn jsonld_sameas_extraction() {
         let r = DomainResolver::from_html("bluebottlecoffee.com", FIXTURE.to_string()).unwrap();
         let rec = r.harvest().unwrap();
         assert_eq!(rec.entity_type.as_deref(), Some("LocalBusiness"));
@@ -704,8 +729,8 @@ mod tests {
         assert!(!keys.iter().any(|k| k.contains("facebook")));
     }
 
-    #[test]
-    fn guess_id_from_url_recognizes_yelp() {
+    #[tokio::test]
+    async fn guess_id_from_url_recognizes_yelp() {
         let id =
             guess_id_from_url("https://www.yelp.com/biz/blue-bottle-coffee-san-francisco").unwrap();
         assert_eq!(id.key(), "yelp:blue-bottle-coffee-san-francisco");
@@ -713,8 +738,8 @@ mod tests {
         assert!(guess_id_from_url("https://www.facebook.com/x").is_none());
     }
 
-    #[test]
-    fn yelp_harvested_from_jsonld_sameas() {
+    #[tokio::test]
+    async fn yelp_harvested_from_jsonld_sameas() {
         let html = r#"
         <html><head>
         <script type="application/ld+json">
@@ -733,9 +758,9 @@ mod tests {
         assert!(keys.contains(&"yelp:blue-bottle-coffee-san-francisco".to_string()));
     }
 
-    #[test]
-    fn resolve_by_yelp_hits_same_entity() {
-        let g = Graph::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn resolve_by_yelp_hits_same_entity() {
+        let g = SqliteStore::open_in_memory().unwrap();
         // Seed a cluster that includes a yelp id + a wikidata anchor.
         let out = commit_record(
             &g,
@@ -748,22 +773,22 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         // Resolving by the generic yelp key lands on the same entity.
         let hit = resolve_id(
             &g,
             ExternalId::new("yelp", "blue-bottle-coffee-san-francisco").unwrap(),
-        )
+        ).await
         .unwrap();
         assert_eq!(hit.canonical_id, out.canonical_id);
         assert_eq!(hit.status, Status::Hit);
         assert_eq!(hit.anchor, "wikidata:Q4926426");
     }
 
-    #[test]
-    fn phone_alone_does_not_merge_distinct_entities() {
-        let g = Graph::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn phone_alone_does_not_merge_distinct_entities() {
+        let g = SqliteStore::open_in_memory().unwrap();
 
         // Entity 1: domain A + shared phone.
         let rec1 = EntityRecord {
@@ -774,7 +799,7 @@ mod tests {
                 ExternalId::phone("+1-510-653-3394").unwrap(),
             ],
         };
-        let out1 = commit_record(&g, &rec1).unwrap();
+        let out1 = commit_record(&g, &rec1).await.unwrap();
 
         // Entity 2: DIFFERENT domain B + the SAME phone.
         let rec2 = EntityRecord {
@@ -785,20 +810,20 @@ mod tests {
                 ExternalId::phone("+1-510-653-3394").unwrap(),
             ],
         };
-        let out2 = commit_record(&g, &rec2).unwrap();
+        let out2 = commit_record(&g, &rec2).await.unwrap();
 
         // They must remain DISTINCT despite sharing a phone.
         assert_ne!(out1.canonical_id, out2.canonical_id);
-        assert_eq!(g.find("domain:a-cafe.com").unwrap(), out1.canonical_id.clone());
-        assert_eq!(g.find("domain:b-cafe.com").unwrap(), out2.canonical_id.clone());
+        assert_eq!(g.find("domain:a-cafe.com").await.unwrap(), out1.canonical_id.clone());
+        assert_eq!(g.find("domain:b-cafe.com").await.unwrap(), out2.canonical_id.clone());
         // The phone corroborates both.
-        let phone_canons = g.find_phone("phone:+15106533394").unwrap();
+        let phone_canons = g.find_phone("phone:+15106533394").await.unwrap();
         assert_eq!(phone_canons.len(), 2);
     }
 
-    #[test]
-    fn strong_keys_union_transitively() {
-        let g = Graph::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn strong_keys_union_transitively() {
+        let g = SqliteStore::open_in_memory().unwrap();
         // Record 1: domain + wikidata
         commit_record(
             &g,
@@ -809,7 +834,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         // Record 2: place_id + wikidata (same QID) → should union.
         let out = commit_record(
@@ -821,12 +846,12 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         // Now domain, place_id, wikidata all resolve to the same canonical.
-        assert_eq!(g.find("domain:x.com").unwrap(), out.canonical_id.clone());
+        assert_eq!(g.find("domain:x.com").await.unwrap(), out.canonical_id.clone());
         assert_eq!(
-            g.find("google_place_id:ChIJxyz").unwrap(),
+            g.find("google_place_id:ChIJxyz").await.unwrap(),
             out.canonical_id.clone()
         );
         assert_eq!(out.same_as.len(), 3);
@@ -834,9 +859,9 @@ mod tests {
     }
 
     // --- C1: an affiliation-only record must not merge distinct identities ---
-    #[test]
-    fn affiliation_only_record_does_not_merge_distinct_identities() {
-        let g = Graph::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn affiliation_only_record_does_not_merge_distinct_identities() {
+        let g = SqliteStore::open_in_memory().unwrap();
 
         // P and Q are distinct things (disjoint IMDb identity) that each carry
         // their own studio domain.
@@ -849,7 +874,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         let q = commit_record(
             &g,
@@ -860,7 +885,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         assert_ne!(p.canonical_id, q.canonical_id);
 
@@ -876,26 +901,26 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
 
         // The two IMDb identities must STILL resolve to different canonicals.
-        let after_p = g.find("imdb:tt1111111").unwrap();
-        let after_q = g.find("imdb:tt2222222").unwrap();
+        let after_p = g.find("imdb:tt1111111").await.unwrap();
+        let after_q = g.find("imdb:tt2222222").await.unwrap();
         assert!(after_p.is_some() && after_q.is_some());
         assert_ne!(
             after_p, after_q,
             "an affiliation-only record must not merge distinct-identity entities"
         );
         // Each domain stays with its own identity's owner (not stolen).
-        assert_eq!(g.find("domain:p-studio.com").unwrap(), after_p);
-        assert_eq!(g.find("domain:q-studio.com").unwrap(), after_q);
+        assert_eq!(g.find("domain:p-studio.com").await.unwrap(), after_p);
+        assert_eq!(g.find("domain:q-studio.com").await.unwrap(), after_q);
     }
 
     // --- H1: stealing a domain from an identity-less brand must not orphan it ---
-    #[test]
-    fn store_does_not_orphan_identity_less_brand_owning_the_domain() {
-        let g = Graph::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn store_does_not_orphan_identity_less_brand_owning_the_domain() {
+        let g = SqliteStore::open_in_memory().unwrap();
 
         // A domain-only brand org: no identity key, anchored on its domain.
         let brand = commit_record(
@@ -908,7 +933,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         let brand_id = brand.canonical_id.clone().unwrap();
         assert_eq!(brand.anchor, "domain:acme.com");
@@ -924,33 +949,33 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         let store_id = store.canonical_id.clone().unwrap();
         assert_ne!(brand_id, store_id);
 
         // The domain must NOT be stolen: it stays with the brand.
-        assert_eq!(g.find("domain:acme.com").unwrap().as_deref(), Some(brand_id.as_str()));
+        assert_eq!(g.find("domain:acme.com").await.unwrap().as_deref(), Some(brand_id.as_str()));
         assert_eq!(
-            g.find("google_place_id:STORE1").unwrap().as_deref(),
+            g.find("google_place_id:STORE1").await.unwrap().as_deref(),
             Some(store_id.as_str())
         );
 
         // The brand entity survives AND its anchor still names a key it owns
         // (no stale-anchor orphan).
-        let brand_row = g.get_entity(&brand_id).unwrap().expect("brand must survive");
+        let brand_row = g.get_entity(&brand_id).await.unwrap().expect("brand must survive");
         assert_eq!(brand_row.anchor, "domain:acme.com");
         assert_eq!(
-            g.find(&brand_row.anchor).unwrap().as_deref(),
+            g.find(&brand_row.anchor).await.unwrap().as_deref(),
             Some(brand_id.as_str()),
             "an entity's anchor must always name a key it actually owns"
         );
     }
 
     // --- guard against over-correction: legitimate affiliation attach still works ---
-    #[test]
-    fn legitimate_domain_attaches_to_same_identity_entity() {
-        let g = Graph::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn legitimate_domain_attaches_to_same_identity_entity() {
+        let g = SqliteStore::open_in_memory().unwrap();
 
         // Seed an entity by its identity key alone.
         let seed = commit_record(
@@ -959,7 +984,7 @@ mod tests {
                 same_as: vec![ExternalId::wikidata("Q1").unwrap()],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
         let seed_id = seed.canonical_id.clone().unwrap();
 
@@ -974,12 +999,12 @@ mod tests {
                 ],
                 ..Default::default()
             },
-        )
+        ).await
         .unwrap();
 
         assert_eq!(out.canonical_id.as_deref(), Some(seed_id.as_str()));
         assert_eq!(out.status, Status::Hit);
-        assert_eq!(g.find("domain:e.com").unwrap().as_deref(), Some(seed_id.as_str()));
+        assert_eq!(g.find("domain:e.com").await.unwrap().as_deref(), Some(seed_id.as_str()));
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"wikidata:Q1".to_string()));
         assert!(keys.contains(&"domain:e.com".to_string()));

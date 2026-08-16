@@ -9,19 +9,58 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
+async-trait = "0.1"
 url = "2"
 psl = "2"
 phonenumber = "0.3"
-scraper = "0.20"
 uuid = { version = "1", features = ["v4"] }
+# `bundled` compiles C SQLite, which cannot target wasm32 — hence optional, and
+# absent from the `d1` (Worker) build.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# HTML harvesting for DomainResolver; pulls in a large parser tree, so the
+# Worker build leaves it out.
+scraper = { version = "0.20", optional = true }
 reqwest = { version = "0.12", features = ["blocking", "json", "gzip"], optional = true }
+# Cloudflare D1 backend (wasm32 only).
+worker = { version = "0.5", features = ["d1"], optional = true }
+# A CEILING, not a caret. The `d1` feature exists to be built through
+# `worker-build` 0.1.1, which post-processes wasm-bindgen's JS output into the
+# Worker shim — and 0.2.101+ changed that codegen to an init-function form
+# worker-build never calls, producing a shim whose wasm exports are never bound. It
+# builds and deploys CLEANLY, then throws
+# `Cannot read properties of undefined (reading 'fetch')` on EVERY request.
+# `bin/worker` also pins `=0.2.100`, but that pin does not travel: this ceiling is
+# what protects an out-of-workspace consumer of `sameas-core` + `d1`. Raise both
+# together, and only after confirming the built shim still contains
+# `new WebAssembly.Instance` (asserted by bin/worker/scripts/build.mjs).
+wasm-bindgen = { version = ">=0.2.100, <0.2.101", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+# `anchor::mint_local` (reached from `choose_anchor`, so live on the resolve path)
+# needs a v4 UUID, and on wasm32 `uuid` has no randomness source unless told to use
+# the JS crypto API. Target-scoped so native builds don't pull in the JS shims.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["v4", "js"] }
 
 [features]
+default = ["sqlite", "harvest"]
+# The rusqlite backend: `SqliteStore`, schema creation + migrations. Required by
+# the CLI and by every unit test.
+sqlite = ["dep:rusqlite"]
+# The Cloudflare D1 backend: `store::d1::D1Store`. Additive — `sqlite` and `d1`
+# may both be enabled (the conformance suite runs against both).
+#
+# NOTE: this feature carries a hard `wasm-bindgen` ceiling (<0.2.101) — see the
+# dependency comment above. It is not a style preference; exceeding it produces a
+# Worker that builds and deploys cleanly and then fails on every request.
+d1 = ["dep:worker", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys"]
+# Parse a fetched HTML page for extra `sameAs` (DomainResolver::harvest).
+harvest = ["dep:scraper"]
 # Live HTTP fetch for DomainResolver. Off by default so CI + demo stay offline
 # and deterministic via HTML fixtures.
-live-fetch = ["dep:reqwest"]
+live-fetch = ["dep:reqwest", "harvest"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
