@@ -62,7 +62,7 @@ pub struct KindSpec {
 /// The registry. Adding a key = adding one entry here + a normalizer.
 ///
 /// Anchor ranks (lower = stronger): wikidata(0) < placekey(1) < domain(2) <
-/// google_place_id(3) < yelp(4). Non-anchor kinds use `None`.
+/// google_place_id(3) < yelp(4) < url(5). Non-anchor kinds use `None`.
 pub static KINDS: &[KindSpec] = &[
     KindSpec {
         tag: "placekey",
@@ -127,6 +127,31 @@ pub static KINDS: &[KindSpec] = &[
         grain: Grain::Identity,
         normalize: normalize::yelp,
         url_match: Some(match_yelp),
+    },
+    // The generic fallback for a URL at a host no kind above recognizes. `sameAs` is a URL
+    // by definition in schema.org and the set of sources is open-ended, so the *default*
+    // for a URL must be safe: `normalize::specific_url` accepts only a path-bearing URL
+    // (which names one page) and rejects a bare host (which names a site).
+    //
+    // `Grain::Identity`, because a specific page identifies a specific thing — that is what
+    // lets two reviewers who each cite only the same Michelin listing converge, while two
+    // restaurants listed on the same site stay distinct.
+    //
+    // `anchor_rank: Some(5)` — last, below every dedicated kind. A `url:` key is portable
+    // but opaque: `wikidata:Q4926426` means something to another consumer, whereas
+    // `url:guide.michelin.com/...` is only as durable as one site's URL scheme. It anchors
+    // only when nothing better exists.
+    //
+    // `url_match: None` on purpose. `guess_id_from_url` tries each kind's matcher in
+    // registry order and takes the first hit, so a `url` matcher would shadow yelp/imdb/
+    // wikidata. It is reached as an explicit fallback instead — see `guess_id_from_url`.
+    KindSpec {
+        tag: "url",
+        strong: true,
+        anchor_rank: Some(5),
+        grain: Grain::Identity,
+        normalize: normalize::specific_url,
+        url_match: None,
     },
 ];
 

@@ -660,9 +660,22 @@ fn guess_id_from_url(raw: &str) -> Option<ExternalId> {
         }
     }
 
-    // Anything else URL-shaped is treated as another domain edge.
+    // No dedicated kind recognized the host. Prefer the generic `url` kind, which accepts
+    // only a path-bearing URL — that names one page, so it is an Identity key.
+    //
+    // Falling back to `domain` for *every* URL (as this used to) is actively wrong:
+    // `guide.michelin.com/.../kan-kiin` becomes `domain:michelin.com`, a key every
+    // Michelin-listed restaurant shares. With `Grain::Affiliation` and no conflicting
+    // identity key on either side, `commit_record` adopts the cluster and unrelated
+    // restaurants merge — measured at 162-into-1 on a real corpus, reported as a 0.95
+    // `exact_strong_key` hit because a strong key is exactly what it was handed.
+    //
+    // `domain` remains the fallback for a **path-less** URL, where the host really does
+    // name the thing (a business's own site) and Affiliation grain is the right semantics.
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        return ExternalId::domain(raw).ok();
+        return ExternalId::new("url", raw)
+            .or_else(|_| ExternalId::domain(raw))
+            .ok();
     }
     None
 }

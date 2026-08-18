@@ -5,6 +5,78 @@
 
 use anyhow::{anyhow, bail, Result};
 
+/// A **specific** web page → a stable `host/path[?query]` identity key.
+///
+/// The generic fallback for a URL at a host no dedicated kind recognizes. Since `sameAs`
+/// is a URL by definition in schema.org and the set of sources is open-ended (Michelin,
+/// OpenTable, TripAdvisor, whatever comes next), a per-host allowlist can never keep up —
+/// so the *default* for a URL has to be safe.
+///
+/// **Rejects a path-less URL**, and that rejection is the whole safety property. A bare
+/// `https://guide.michelin.com/` names a directory, not a restaurant; typing it as an
+/// identity key would merge every business listed there. Path-less URLs fall through to
+/// the caller's `domain` fallback, where `Grain::Affiliation` already handles a shared
+/// host correctly. Only a URL with a discriminating path or query identifies one thing.
+///
+/// Normalization keeps identity stable across trivial spelling differences without
+/// merging distinct pages:
+/// * host lowercased, `www.` and a default port dropped — case and `www` are not identity
+/// * fragment dropped — `#reviews` is a position on one page
+/// * **path case and the query preserved** — RFC 3986 makes paths case-sensitive, and
+///   `?cid=1` vs `?cid=2` are different places
+/// * one trailing slash trimmed, so `/restaurant/a16` and `/restaurant/a16/` agree
+///
+/// Examples:
+/// * `https://guide.michelin.com/us/en/.../a16` → `guide.michelin.com/us/en/.../a16`
+/// * `https://joes-diner.weebly.com/menu` → `joes-diner.weebly.com/menu` (the **full**
+///   host, so two tenants of one site builder never collide)
+/// * `https://guide.michelin.com/` → error (path-less)
+pub fn specific_url(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("empty url");
+    }
+    // Parsed, not string-munged: a substring check is how a crafted URL smuggles in
+    // another host's identity.
+    let url = url::Url::parse(raw).map_err(|e| anyhow!("invalid url {raw:?}: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("not an http(s) url: {raw:?}");
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("url {raw:?} has no host"))?
+        .trim()
+        .to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    // Same reasoning as `registrable_domain`: an IP literal is not a name, and treating
+    // one as identity is a merge hazard.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        bail!("IP literals are not identity keys: {host:?}");
+    }
+    if host.is_empty() || !host.contains('.') {
+        bail!("url {raw:?} has no resolvable host");
+    }
+
+    let path = url.path().trim_end_matches('/');
+    let query = url.query().unwrap_or("");
+    // THE guard. Nothing discriminating → this URL names a site, not a thing.
+    if path.is_empty() && query.is_empty() {
+        bail!(
+            "url {raw:?} has no path or query, so it names a site rather than a specific \
+             thing; use `domain` for a bare host"
+        );
+    }
+
+    let mut key = format!("{host}{path}");
+    if !query.is_empty() {
+        key.push('?');
+        key.push_str(query);
+    }
+    Ok(key)
+}
+
 /// URL or bare host → registrable domain (eTLD+1), lowercased, `www.` stripped.
 ///
 /// Uses the embedded Public Suffix List (`psl`), so it is offline and
@@ -439,5 +511,108 @@ mod tests {
         assert!(placekey("5vg-7gq-tvz").is_err());
         assert!(placekey("223-227@").is_err());
         assert!(placekey("").is_err());
+    }
+
+    // --- specific_url: the generic URL identity key ---
+
+    #[test]
+    fn specific_url_rejects_a_path_less_url() {
+        // THE safety property. A bare directory host names a site, not a restaurant;
+        // accepting it as an Identity key would merge everything listed there. These fall
+        // through to `domain`, where Affiliation grain handles a shared host correctly.
+        assert!(specific_url("https://guide.michelin.com/").is_err());
+        assert!(specific_url("https://guide.michelin.com").is_err());
+        assert!(specific_url("https://www.yelp.com/").is_err());
+        // A path of only slashes is still no path.
+        assert!(specific_url("https://example.com///").is_err());
+    }
+
+    #[test]
+    fn specific_url_keeps_a_directory_listing_per_thing() {
+        // The case the whole kind exists for: two restaurants in one directory get
+        // different keys, so they never merge — while two reviewers citing the SAME
+        // listing get the same key, so they do.
+        let a16 =
+            specific_url("https://guide.michelin.com/us/en/california/san-francisco/restaurant/a16")
+                .unwrap();
+        let flour = specific_url(
+            "https://guide.michelin.com/us/en/california/san-francisco/restaurant/flour-water",
+        )
+        .unwrap();
+        assert_ne!(a16, flour);
+        assert_eq!(
+            a16,
+            "guide.michelin.com/us/en/california/san-francisco/restaurant/a16"
+        );
+    }
+
+    #[test]
+    fn specific_url_keeps_the_full_host_so_site_builders_stay_distinct() {
+        // `registrable_domain` would reduce both to `weebly.com` and merge two unrelated
+        // businesses. The full host is what prevents that.
+        let joe = specific_url("https://joes-diner.weebly.com/menu").unwrap();
+        let maria = specific_url("https://maria-tacos.weebly.com/menu").unwrap();
+        assert_ne!(joe, maria);
+        assert!(joe.starts_with("joes-diner.weebly.com"));
+    }
+
+    #[test]
+    fn specific_url_normalizes_only_what_is_not_identity() {
+        // Host case and `www.` are not identity; a fragment is a position on one page; a
+        // trailing slash is a spelling difference. All collapse to one key.
+        let variants = [
+            "https://Guide.Michelin.com/us/en/restaurant/a16",
+            "https://www.guide.michelin.com/us/en/restaurant/a16",
+            "https://guide.michelin.com/us/en/restaurant/a16/",
+            "https://guide.michelin.com/us/en/restaurant/a16#reviews",
+            "https://guide.michelin.com:443/us/en/restaurant/a16",
+        ];
+        let keys: std::collections::HashSet<String> =
+            variants.iter().map(|v| specific_url(v).unwrap()).collect();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+    }
+
+    #[test]
+    fn specific_url_preserves_path_case_and_query() {
+        // RFC 3986 makes paths case-sensitive, and `?cid=1` vs `?cid=2` are different
+        // places. Lowercasing or dropping either would merge distinct things.
+        let a = specific_url("https://maps.google.com/?cid=111").unwrap();
+        let b = specific_url("https://maps.google.com/?cid=222").unwrap();
+        assert_ne!(a, b);
+        assert!(a.ends_with("?cid=111"));
+
+        let upper = specific_url("https://example.com/Path/To/Thing").unwrap();
+        assert!(upper.ends_with("/Path/To/Thing"), "{upper}");
+    }
+
+    #[test]
+    fn specific_url_accepts_a_query_only_url() {
+        // A query is discriminating even with no path — this is how Google Maps `?cid=`
+        // links identify a place.
+        assert!(specific_url("https://maps.google.com/?cid=12345").is_ok());
+    }
+
+    #[test]
+    fn specific_url_rejects_non_http_and_ip_hosts() {
+        // A crafted or non-web URL must not become an identity key. An IP literal is not a
+        // name — the same merge hazard `registrable_domain` rejects it for.
+        assert!(specific_url("ftp://example.com/file").is_err());
+        assert!(specific_url("javascript:alert(1)").is_err());
+        assert!(specific_url("not a url").is_err());
+        assert!(specific_url("").is_err());
+        assert!(specific_url("https://1.2.3.4/page").is_err());
+        assert!(specific_url("https://[::1]/page").is_err());
+        // No dot in the host: not resolvable.
+        assert!(specific_url("https://localhost/page").is_err());
+    }
+
+    #[test]
+    fn specific_url_is_parsed_not_substring_matched() {
+        // A hostile URL naming another host in its path or query must key on ITS OWN host,
+        // never the one it mentions.
+        let key = specific_url("https://evil.com/?ref=guide.michelin.com/restaurant/a16").unwrap();
+        assert!(key.starts_with("evil.com"), "{key}");
+        let key2 = specific_url("https://evil.com/guide.michelin.com/restaurant/a16").unwrap();
+        assert!(key2.starts_with("evil.com/"), "{key2}");
     }
 }
