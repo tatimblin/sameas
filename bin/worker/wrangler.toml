@@ -20,6 +20,65 @@ database_name = "sameas-crosswalk"
 database_id = "67788b06-a209-49d8-9bdb-a45e7ea099d8"
 migrations_dir = "../../migrations"
 
+# Per-caller daily budget for OUTBOUND hub calls on `POST /resolve/name` — the
+# only route that can spend money (Google Places sits in Google's Enterprise SKU).
+# Counted per `publisher_did` bucket per UTC day in the `hub_budget` table.
+#
+# `"0"` is the kill switch: it denies every bucket, stopping all hub spend with a
+# `wrangler deploy` and no code change or secret deletion. An unset or unparseable
+# value falls back to `budget::DEFAULT_DAILY_HUB_BUDGET`, never to "unlimited".
+#
+# Hub API keys are SECRETS, not vars, and are absent from this file by
+# construction: GOOGLE_PLACES_API_KEY, TMDB_API_KEY, PLACEKEY_API_KEY, plus
+# AUTH_TOKEN. Set with `wrangler secret put <NAME>` per environment.
+[vars]
+HUB_DAILY_BUDGET = "200"
+
 [observability.logs]
+enabled = true
+invocation_logs = false
+
+# ---------------------------------------------------------------------------
+# Staging
+# ---------------------------------------------------------------------------
+# LOAD-BEARING, and the reason this block exists at all: agent-web's staging MCP
+# worker binds `service = "sameas-staging"`. Without a staging environment here
+# there is no such worker, and the binding would have to point at production —
+# every staging publish would then write into the PRODUCTION crosswalk graph, and
+# a bad staging record would be a real, user-visible false merge.
+#
+# Wrangler inheritance, both directions of the footgun:
+#   * `main`, `build`, `compatibility_date`, `workers_dev` ARE inherited — omitted
+#     here on purpose, so the two environments cannot drift.
+#   * BINDINGS AND VARS ARE NOT inherited, and a missing one is only a warning.
+#     `[[d1_databases]]` and `[vars]` are therefore repeated in full below. Do not
+#     delete them "because they are already above".
+#
+# Secrets are a separate store per environment: `wrangler secret put AUTH_TOKEN
+# --env staging` (and the three hub keys) must be run again for staging. Staging
+# should get its OWN token and its own restricted API keys — sharing production's
+# would make the staging worker able to spend the production budget.
+[env.staging]
+# Explicit rather than relying on wrangler's `<name>-<env>` derivation, because
+# the consumer's service binding matches on this exact script name.
+name = "sameas-staging"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "sameas-crosswalk-staging"
+# Provisioned 2026-08-29 (WNAM). A SEPARATE database from production on purpose:
+# the consumer's staging worker must never write into the production crosswalk
+# graph. Apply migrations before the first staging deploy:
+#
+#     npx wrangler d1 migrations apply DB --env staging --remote
+database_id = "e5f984ae-7a2b-4253-bb3d-d02e5d2e0666"
+migrations_dir = "../../migrations"
+
+[env.staging.vars]
+# Lower than production on purpose: staging exists to prove the wiring works, not
+# to build a corpus, and its hub calls bill the same account.
+HUB_DAILY_BUDGET = "50"
+
+[env.staging.observability.logs]
 enabled = true
 invocation_logs = false

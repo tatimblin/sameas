@@ -20,7 +20,13 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # HTML harvesting for DomainResolver; pulls in a large parser tree, so the
 # Worker build leaves it out.
 scraper = { version = "0.20", optional = true }
-reqwest = { version = "0.12", features = ["blocking", "json", "gzip"], optional = true }
+reqwest = { version = "0.12", features = ["json", "gzip"], optional = true }
+# Runtime (not dev-only) dependency, and ONLY under `live-fetch`:
+# `ReqwestTransport::send_with_retry` sleeps between attempts, and now that the
+# transport is async that sleep must yield the runtime instead of blocking the
+# thread. `time` is the only feature needed; the Worker build (`worker-fetch`)
+# uses `worker::Delay` instead and never pulls tokio in.
+tokio = { version = "1", features = ["time"], optional = true }
 # Cloudflare D1 backend (wasm32 only).
 worker = { version = "0.5", features = ["d1"], optional = true }
 # A CEILING, not a caret. The `d1` feature exists to be built through
@@ -55,11 +61,17 @@ sqlite = ["dep:rusqlite"]
 # dependency comment above. It is not a style preference; exceeding it produces a
 # Worker that builds and deploys cleanly and then fails on every request.
 d1 = ["dep:worker", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys"]
+# `transport::FetchTransport` — the `worker::Fetch`-backed `HttpTransport`, the
+# only one usable inside a Worker (`reqwest` cannot run in workerd). Additive and
+# independent of `d1`, but it carries the SAME hard `wasm-bindgen` ceiling, which
+# is why it enables `dep:wasm-bindgen` explicitly rather than letting `worker`
+# resolve its own: see the dependency comment above.
+worker-fetch = ["dep:worker", "dep:wasm-bindgen"]
 # Parse a fetched HTML page for extra `sameAs` (DomainResolver::harvest).
 harvest = ["dep:scraper"]
 # Live HTTP fetch for DomainResolver. Off by default so CI + demo stay offline
 # and deterministic via HTML fixtures.
-live-fetch = ["dep:reqwest", "harvest"]
+live-fetch = ["dep:reqwest", "dep:tokio", "harvest"]
 
 [dev-dependencies]
 tempfile = "3"

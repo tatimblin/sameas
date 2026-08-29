@@ -7,6 +7,9 @@
 //! GET  /                       liveness — no DB access, unauthenticated
 //! GET  /resolve?id=kind:value  resolve one identifier      (mutates, LOGGED)
 //! GET  /resolve?<kind>=value   ...same, per-kind form
+//! POST /resolve/name           resolve an entity reference: strict-grain
+//!                              identifier commit, then a name search on the
+//!                              fall-through    (mutates, SPENDS, LOGGED — token)
 //! GET  /entity/<canonical_id>  load an entity by canonical id (read)
 //! GET  /stats                  miss-rate report            (read)
 //! POST /ingest                 commit a seed record        (WRITE — token)
@@ -17,16 +20,22 @@
 //! Reads are open; write endpoints require a bearer token when `AUTH_TOKEN` is
 //! configured. Resolution is a *write* in the general case (it mints/attaches), so
 //! `/resolve` is deliberately GET-but-mutating — see [`super::handlers::resolve`],
-//! which documents that trade-off.
+//! which documents that trade-off. `/resolve/name` is token-gated for a second
+//! reason on top of writing: it can reach **paid** hubs, and `workers_dev = true`
+//! makes this worker publicly reachable, so an open route would let a stranger
+//! spend real money. Its per-caller daily budget (`super::budget`) is the second
+//! brake behind that gate.
 //!
-//! **Logging rule: `/resolve` only.** Every user-facing resolve appends a
-//! `resolutions` row, and that log *is* the miss-rate metric — which is the
-//! documented evidence gate for ever adding a fuzzy-matching layer (see
-//! `ROADMAP.md`). `/entity` and `/ingest` are deliberately EXCLUDED: a direct id
-//! lookup and a seed load are not user-facing *queries*, so counting them would
-//! skew the rate. This mirrors the CLI, which calls `record_outcome` from exactly
-//! one place (its `Resolve` arm). **A new endpoint must make this choice
-//! explicitly.** Asserted by `test/stats.test.ts`.
+//! **Logging rule: `/resolve` and `/resolve/name`.** Every user-facing resolve
+//! appends a `resolutions` row, and that log *is* the miss-rate metric — which is
+//! the documented evidence gate for ever adding a fuzzy-matching layer (see
+//! `ROADMAP.md`). `/resolve/name` is in for exactly that reason: it is the
+//! user-facing query, and its miss rate is the evidence for what to build next.
+//! `/entity` and `/ingest` are deliberately EXCLUDED: a direct id lookup and a seed
+//! load are not user-facing *queries*, so counting them would skew the rate. This
+//! mirrors the CLI, which calls `record_outcome` from exactly one place (its
+//! `Resolve` arm). **A new endpoint must make this choice explicitly.** Asserted
+//! by `test/stats.test.ts`.
 
 use worker::*;
 
@@ -46,6 +55,15 @@ pub async fn route(mut req: Request, env: Env) -> Result<Response> {
 
     match (method.clone(), path.as_str()) {
         (Method::Get, "/resolve") => handlers::resolve(&req, &env).await,
+        // Ahead of nothing in particular — but note it must stay a distinct arm
+        // from `/resolve`: matching by prefix would make a typo'd path silently
+        // hit the money-spending route.
+        (Method::Post, "/resolve/name") => {
+            if let Err(resp) = require_token(&req, &env) {
+                return Ok(resp);
+            }
+            handlers::resolve_name(&mut req, &env).await
+        }
         (Method::Get, "/stats") => handlers::stats(&env).await,
         (Method::Post, "/ingest") => {
             if let Err(resp) = require_token(&req, &env) {

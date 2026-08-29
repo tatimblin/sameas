@@ -2,12 +2,22 @@
 //! same `sameas-core` orchestration the CLI uses, so behavior cannot diverge
 //! between the two front-ends.
 
+use std::sync::Arc;
+
+use sameas_core::complete::{name_hub_for, NameHub};
 use sameas_core::confidence::reason_tag;
 use sameas_core::json::resolve_output_json;
 use sameas_core::store::d1::D1Store;
-use sameas_core::{commit_record, load_entity, EntityRecord, ExternalId, GraphStore};
+use sameas_core::transport::FetchTransport;
+use sameas_core::{
+    commit_record, commit_record_with_opts, load_entity, name_not_found, resolve_name_local,
+    CommitOpts, CompletionCtx, EntityRecord, ExternalId, GraphStore, ResolveOutput, Status,
+};
 use serde_json::json;
 use worker::*;
+
+use super::budget::{self, Reservation};
+use super::name_request::NameRequest;
 
 /// A structured error document, so a client never has to parse prose.
 pub fn error_json(message: &str, code: &str, status: u16) -> Result<Response> {
@@ -57,27 +67,388 @@ pub async fn resolve(req: &Request, env: &Env) -> Result<Response> {
     };
     match commit_record(&g, &record).await {
         Ok(out) => {
-            // Log the outcome so `/stats` can report a real miss rate — that metric
-            // is the evidence gate for ever adding a fuzzy-matching layer, so a
-            // silently empty log would make the decision undecidable. Mirrors the
-            // CLI's `record_outcome`: `/entity` and `/ingest` are excluded because a
-            // direct id lookup and a seed load are not user-facing *queries* and
-            // would skew the rate.
-            //
-            // Best-effort: a logging failure must never fail the resolution.
-            let _ = g
-                .record_resolution(
-                    out.status.as_str(),
-                    reason_tag(&out.confidence_reason),
-                    out.matched_via.first().map(|s| s.as_str()),
-                    out.confidence,
-                    Some(&input_desc),
-                )
-                .await;
+            log_resolution(&g, &out, &input_desc).await;
             ok_json(&resolve_output_json(&out, "resolve"))
         }
         Err(e) => core_error(e),
     }
+}
+
+/// Append one row to the `resolutions` log.
+///
+/// That log *is* the miss-rate metric — the documented evidence gate for ever
+/// adding a fuzzy-matching layer — so a silently empty log would make the decision
+/// undecidable rather than merely wrong. Mirrors the CLI's `record_outcome`.
+///
+/// **Which routes call this is a deliberate, per-endpoint choice**, documented in
+/// `router.rs` and asserted by `test/stats.test.ts`: `/resolve` and
+/// `/resolve/name` are user-facing *queries* and log; `/entity` and `/ingest` are a
+/// direct id lookup and a seed load, and logging them would skew the rate.
+///
+/// Best-effort: a logging failure must never fail the resolution.
+async fn log_resolution(g: &D1Store, out: &ResolveOutput, input_desc: &str) {
+    let _ = g
+        .record_resolution(
+            out.status.as_str(),
+            reason_tag(&out.confidence_reason),
+            out.matched_via.first().map(|s| s.as_str()),
+            out.confidence,
+            Some(input_desc),
+        )
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// POST /resolve/name — the disambiguation route
+// ---------------------------------------------------------------------------
+
+/// The `action` tag on this route's response documents, distinguishing them from
+/// `/resolve`'s in a consumer's logs.
+const NAME_ACTION: &str = "resolve_name";
+
+/// Which step of the orchestration produced the answer. Reported as
+/// `resolved_by`, because the two steps mean different things to the caller (an
+/// identifier verdict is about the keys it sent; a name verdict is about the
+/// world) and because "did the fall-through actually happen" is otherwise
+/// unobservable from outside.
+#[derive(Clone, Copy)]
+enum Step {
+    /// The strict-grain commit over the request's `identifiers`.
+    Identifiers,
+    /// The local graph answered the name query — zero external calls.
+    NameLocal,
+    /// The name search: hub-routed, or refused before reaching one.
+    NameSearch,
+}
+
+impl Step {
+    fn tag(self) -> &'static str {
+        match self {
+            Step::Identifiers => "identifiers",
+            Step::NameLocal => "name_local",
+            Step::NameSearch => "name_search",
+        }
+    }
+}
+
+/// Orchestration facts about one answer, added to the core's resolve document.
+struct Meta {
+    step: Step,
+    /// The hub the name query routed to, when it got that far.
+    hub: Option<NameHub>,
+    /// Whether an outbound hub call was actually attempted. `false` with a `hub`
+    /// present means the route refused to reach out (missing key).
+    hub_called: bool,
+    /// This bucket's hub-call count for today, when a call was reserved.
+    hub_calls_today: Option<u32>,
+    /// Step 1's refusal hint, carried onto a step 2 answer.
+    ///
+    /// It is the sentence that explains *why the caller's own identifiers were
+    /// not enough* ("souvla.com is a brand/site rather than one specific
+    /// thing"), which is exactly the message a consumer shows its user — and it
+    /// would otherwise be discarded the moment the name search produced the
+    /// candidate list. `hint` on the document itself belongs to whichever step
+    /// answered, so this rides alongside rather than overwriting it.
+    identifier_hint: Option<String>,
+}
+
+impl Meta {
+    fn local(step: Step) -> Meta {
+        Meta {
+            step,
+            hub: None,
+            hub_called: false,
+            hub_calls_today: None,
+            identifier_hint: None,
+        }
+    }
+
+    fn with_identifier_hint(mut self, hint: Option<String>) -> Meta {
+        self.identifier_hint = hint;
+        self
+    }
+}
+
+/// The per-hub API keys, read from Worker secrets.
+///
+/// The Worker had **no key plumbing at all** before this route: keys lived only in
+/// the CLI's `.env`, which is why `lib.rs` used to describe hub completion as
+/// unreachable here. Set them with `wrangler secret put <NAME>` — and again with
+/// `--env staging`, which is a separate secret store.
+struct HubKeys {
+    google: String,
+    tmdb: String,
+    placekey: String,
+}
+
+impl HubKeys {
+    fn read(env: &Env) -> HubKeys {
+        let read = |name: &str| {
+            env.secret(name)
+                .ok()
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+        };
+        HubKeys {
+            google: read("GOOGLE_PLACES_API_KEY"),
+            tmdb: read("TMDB_API_KEY"),
+            placekey: read("PLACEKEY_API_KEY"),
+        }
+    }
+
+    /// The secret this hub cannot run without, when it is not configured.
+    ///
+    /// An absent key is a **deployment** state, not an error: the route answers
+    /// `unresolved` with a hint naming the missing secret, and — crucially — makes
+    /// no outbound call and spends no budget. The alternative (call anyway and let
+    /// the hub 401) burns a subrequest and reports a hub outage for a
+    /// configuration problem.
+    ///
+    /// Wikidata needs no key at all, so it is always available: the type-agnostic
+    /// fallback stays free, exactly as `name_hub_for` intends.
+    ///
+    /// `PLACEKEY_API_KEY` is deliberately NOT required for `Places`: Placekey is a
+    /// best-effort enrichment inside the places branch (only attempted when the
+    /// query carries a street), and identity rests on the Google `place_id`
+    /// either way. Absent, that one sub-call fails and is swallowed — the same
+    /// contract every hub call has.
+    fn missing_for(&self, hub: NameHub) -> Option<&'static str> {
+        match hub {
+            NameHub::Places if self.google.trim().is_empty() => Some("GOOGLE_PLACES_API_KEY"),
+            NameHub::Tmdb if self.tmdb.trim().is_empty() => Some("TMDB_API_KEY"),
+            _ => None,
+        }
+    }
+}
+
+/// `POST /resolve/name` — resolve one entity reference, refusing to guess.
+///
+/// **Token-gated.** Reads are otherwise open here, but this route reaches paid
+/// hubs and `workers_dev = true` makes the worker publicly reachable, so an
+/// unauthenticated caller could spend real money. See `router.rs`.
+///
+/// **Logs to `resolutions`** — the explicit per-endpoint choice `router.rs`
+/// requires. This *is* a user-facing query, and its miss rate is the evidence gate
+/// for what to build next, so excluding it would hide the one number the feature
+/// exists to produce. Only answered resolutions log; a 400/401/429/503 is a
+/// rejected request, not a resolution outcome, and counting those would inflate
+/// the miss bucket with client bugs.
+///
+/// # Orchestration
+///
+/// 1. **Identifiers, strict grain.** Build an [`EntityRecord`] from the request's
+///    `identifiers` and commit it with `allow_affiliation_only: false`.
+///    - `Hit`/`New` → answer. A record carrying a brand domain *plus* a Michelin
+///      deep link resolves right here; that asymmetry is the design.
+///    - `Unresolved` **with** candidates (`ambiguous_among_n`) → answer; the caller
+///      asks its user to pick one.
+///    - `Unresolved` with an empty candidate list (`needs_stronger_identifier`) →
+///      fall through to (2). Nothing was written.
+/// 2. **Name search** — local graph first, hub on miss, result cached. This is
+///    where a chain's location list actually comes from.
+///
+/// Two traps, both load-bearing:
+///
+/// * `CommitOpts::default()` is **permissive** (`allow_affiliation_only: true`),
+///   which is what keeps `/ingest` and seeding working. This route must pass
+///   `false` explicitly; forgetting the field is a silent regression to the
+///   original bug (a chain's brand domain minting a brand-level entity), not a
+///   compile error.
+/// * Step 1 **cannot** produce a multi-location list. `GraphStore::find` returns
+///   `Option<String>` — a strong key has exactly one owner — and "don't steal a
+///   shared domain" means a second location never acquires the brand domain. So
+///   one brand domain reaches at most one cluster and the realistic chain case is
+///   `AmbiguousAmongN(1)`. The location picker comes from step 2.
+pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
+    let body = req.text().await?;
+    let parsed = match NameRequest::parse(&body) {
+        Ok(p) => p,
+        Err(msg) => return error_json(&msg, "invalid_input", 400),
+    };
+    let g = store(env)?;
+    let input_desc = parsed.describe();
+
+    // --- Step 1: the request's own identifiers, under the strict grain rule.
+    let mut refused_by_identifiers: Option<ResolveOutput> = None;
+    if !parsed.ids.is_empty() {
+        let record = EntityRecord {
+            entity_type: parsed.query.entity_type.clone(),
+            name: parsed.query.name.clone(),
+            same_as: parsed.ids.clone(),
+        };
+        let out = match commit_record_with_opts(
+            &g,
+            &record,
+            "resolve_name",
+            // EXPLICITLY strict. See the trap note above.
+            CommitOpts {
+                allow_affiliation_only: false,
+            },
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => return core_error(e),
+        };
+        // "Unresolved with an empty candidate list" is the frozen fall-through
+        // signal: both `needs_stronger_identifier` shapes (an identity-less
+        // affiliation cluster, and no cluster at all) demand the same caller
+        // action, and `AmbiguousAmongN` is only ever constructed with a non-empty
+        // list — so this test is exhaustive by construction.
+        let fall_through = out.status == Status::Unresolved && out.candidates.is_empty();
+        if !fall_through {
+            return answer(&g, &parsed, out, Meta::local(Step::Identifiers), &input_desc).await;
+        }
+        refused_by_identifiers = Some(out);
+    }
+    // Carried onto whatever step 2 answers with: it is the "your identifiers name
+    // a brand, not one thing" sentence, and the consumer's user-facing message
+    // needs it even when the candidates come from the name search.
+    let identifier_hint = refused_by_identifiers
+        .as_ref()
+        .and_then(|out| out.hint.clone());
+
+    // --- Step 2: the name search.
+    if parsed.query.match_name().is_empty() {
+        // No usable name to search by (absent, or punctuation that normalizes to
+        // nothing). Hand back step 1's refusal rather than inventing a verdict.
+        return match refused_by_identifiers {
+            Some(out) => answer(&g, &parsed, out, Meta::local(Step::Identifiers), &input_desc).await,
+            // Unreachable: `NameRequest::parse` rejects a body with neither a name
+            // nor a usable identifier. Kept total rather than `unreachable!()` —
+            // a panic in wasm is a 500 with no body.
+            None => error_json(
+                "nothing to resolve: `name` did not survive normalization and no usable \
+                 `identifiers` were supplied",
+                "invalid_input",
+                400,
+            ),
+        };
+    }
+
+    // 2a. Local graph first — a repeat query costs zero external calls. Run
+    //     explicitly (rather than leaning on `resolve_name`'s own local-first
+    //     step) so the budget is spent only when we are genuinely about to reach
+    //     out. `resolve_name` repeats this lookup; that is a couple of indexed D1
+    //     reads against the alternative of billing a cached query.
+    match resolve_name_local(&g, &parsed.query).await {
+        Ok(Some(out)) => {
+            let meta = Meta::local(Step::NameLocal).with_identifier_hint(identifier_hint);
+            return answer(&g, &parsed, out, meta, &input_desc).await;
+        }
+        Ok(None) => {}
+        Err(e) => return core_error(e),
+    }
+
+    // 2b. A hub call is now on the table. Route by entity type, then check that
+    //     the hub is actually configured — before touching the budget.
+    let hub = name_hub_for(parsed.query.entity_type.as_deref());
+    let keys = HubKeys::read(env);
+    if let Some(secret) = keys.missing_for(hub) {
+        let mut out = name_not_found(&parsed.query);
+        out.hint = Some(format!(
+            "not in the local graph, and the {} name search is not configured on this \
+             deployment (missing secret {secret}), so no lookup was attempted. Supply an \
+             identifier for the individual thing: a location-specific page URL with a path, a \
+             Yelp /biz/ link, or a Google Maps place URL.",
+            hub.tag()
+        ));
+        return answer(
+            &g,
+            &parsed,
+            out,
+            Meta {
+                step: Step::NameSearch,
+                hub: Some(hub),
+                hub_called: false,
+                hub_calls_today: None,
+                identifier_hint,
+            },
+            &input_desc,
+        )
+        .await;
+    }
+
+    // 2c. Per-caller daily budget. Fail CLOSED on any failure to account: an
+    //     unreadable budget table means unmetered spend on a billable hub.
+    let configured = env.var("HUB_DAILY_BUDGET").ok().map(|v| v.to_string());
+    let limit = budget::parse_limit(configured.as_deref());
+    let day = budget::utc_day(Date::now().as_millis() as f64);
+    let used = match budget::reserve(&env.d1("DB")?, &parsed.bucket, day, limit).await {
+        Ok(Reservation::Granted { used }) => used,
+        Ok(Reservation::Exhausted) => {
+            return error_json(
+                &format!(
+                    "daily hub-call budget exhausted for this caller ({limit}/day). Retry after \
+                     00:00 UTC, or resolve with a stronger identifier — identifier lookups and \
+                     repeat name queries are served locally and are never budgeted."
+                ),
+                "quota_exhausted",
+                429,
+            )
+        }
+        Err(e) => {
+            return error_json(
+                &format!("hub-call budget unavailable, so no hub call was made: {e:#}"),
+                "quota_unavailable",
+                503,
+            )
+        }
+    };
+
+    // 2d. Reach out. `resolve_name` writes the verdict into the local name index
+    //     and cardinality memory, so the next identical query is local.
+    let mut ctx = CompletionCtx::new(Arc::new(FetchTransport::new()));
+    ctx.google_key = keys.google;
+    ctx.tmdb_key = keys.tmdb;
+    ctx.placekey_key = keys.placekey;
+
+    match sameas_core::resolve_name(&g, &parsed.query, &ctx).await {
+        Ok(out) => {
+            answer(
+                &g,
+                &parsed,
+                out,
+                Meta {
+                    step: Step::NameSearch,
+                    hub: Some(hub),
+                    hub_called: true,
+                    hub_calls_today: Some(used),
+                    identifier_hint,
+                },
+                &input_desc,
+            )
+            .await
+        }
+        Err(e) => core_error(e),
+    }
+}
+
+/// Log the outcome and render it: the core's resolve document plus this route's
+/// orchestration facts.
+async fn answer(
+    g: &D1Store,
+    parsed: &NameRequest,
+    out: ResolveOutput,
+    meta: Meta,
+    input_desc: &str,
+) -> Result<Response> {
+    log_resolution(g, &out, input_desc).await;
+    let mut doc = resolve_output_json(&out, NAME_ACTION);
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("resolved_by".into(), json!(meta.step.tag()));
+        obj.insert("name_hub".into(), json!(meta.hub.map(|h| h.tag())));
+        obj.insert("hub_called".into(), json!(meta.hub_called));
+        obj.insert("identifier_hint".into(), json!(meta.identifier_hint));
+        // Which `identifiers` entries no kind recognized. Reported rather than
+        // dropped silently, so a caller sending an unsupported link can see why
+        // it did not count toward the verdict.
+        obj.insert("ignored_identifiers".into(), json!(parsed.ignored));
+        if let Some(used) = meta.hub_calls_today {
+            obj.insert("hub_calls_today".into(), json!(used));
+        }
+    }
+    ok_json(&doc)
 }
 
 /// Build the single [`ExternalId`] a request is asking about.
@@ -230,6 +601,9 @@ mod parse_identifier_tests {
             "tmdb" => "603",
             "yelp" => "blue-bottle-coffee-san-francisco",
             "placekey" => "227-222@5vg-82n-kzz",
+            // Path-bearing on purpose: `normalize::specific_url` rejects a bare
+            // host, which is the whole point of the `url` kind being Identity.
+            "url" => "https://example.com/some/page",
             other => panic!("no sample value for kind {other:?} — add one"),
         }
     }

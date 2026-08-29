@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{binding_value, push_id};
@@ -92,9 +93,10 @@ impl WikidataResolver {
     }
 }
 
+#[async_trait(?Send)]
 impl Resolver for WikidataResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
-        let value = self.transport.get_json(&self.url()?)?;
+    async fn harvest(&self) -> Result<EntityRecord> {
+        let value = self.transport.get_json(&self.url()?).await?;
         let mut record = Self::parse(&value)?;
         // Echo the input id so the harvested record joins the input's cluster.
         push_id(&mut record, self.input.kind_tag(), self.input.value());
@@ -131,8 +133,8 @@ mod tests {
         assert!(keys.contains(&"domain:warnerbros.com".to_string()));
     }
 
-    #[test]
-    fn harvest_echoes_input_and_dedupes() {
+    #[tokio::test]
+    async fn harvest_echoes_input_and_dedupes() {
         // Register the fixture under the exact URL the resolver builds (the
         // encoded SPARQL query is part of the request signature).
         let probe = WikidataResolver::new(
@@ -144,7 +146,7 @@ mod tests {
             crate::transport::FixtureTransport::from_pairs(vec![("GET", &url, matrix_sparql())]);
         let r = WikidataResolver::new(ExternalId::imdb("tt0133093").unwrap(), Arc::new(transport));
 
-        let rec = r.harvest().unwrap();
+        let rec = r.harvest().await.unwrap();
         let keys: Vec<String> = rec.same_as.iter().map(|i| i.key()).collect();
         // imdb echoed exactly once (no duplicate with the P345 binding).
         assert_eq!(keys.iter().filter(|k| *k == "imdb:tt0133093").count(), 1);

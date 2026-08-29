@@ -272,7 +272,7 @@ fn name_city_unique_match_resolves_via_place_id() {
     let h = Harness::new();
     let fx = hub_fixtures();
     let out = h.run(&[
-        "--json", "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region",
+        "--json", "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region",
         "CA", "--country", "US", "--complete", "--hub-fixtures", &fx,
     ]);
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -294,7 +294,7 @@ fn full_address_resolves_to_placekey_anchor() {
     let h = Harness::new();
     let fx = hub_fixtures();
     let out = h.run(&[
-        "--json", "resolve", "--name", "Blue Bottle Coffee", "--address", "300 Webster St",
+        "--json", "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--address", "300 Webster St",
         "--city", "Oakland", "--region", "CA", "--country", "US", "--complete",
         "--hub-fixtures", &fx,
     ]);
@@ -312,7 +312,7 @@ fn name_local_only_miss_is_unresolved() {
     // `--name` without `--complete` is a local-only lookup (no network). On an
     // empty graph it misses → unresolved, with a hint to re-run with --complete.
     let h = Harness::new();
-    let v = h.value(&["resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland"]);
+    let v = h.value(&["resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "Oakland"]);
     assert_eq!(v["status"].as_str().unwrap(), "unresolved");
     assert!(v["canonical_id"].is_null());
     assert_eq!(v["confidence_reason"].as_str().unwrap(), "needs_stronger_identifier");
@@ -334,14 +334,14 @@ fn name_query_is_cached_second_lookup_is_local() {
     let h = Harness::new();
     let fx = hub_fixtures();
     let first = h.value(&[
-        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
         "--country", "US", "--complete", "--hub-fixtures", &fx,
     ]);
     let id = first["canonical_id"].as_str().expect("first resolve should succeed");
 
     // No --complete, no --hub-fixtures → zero network. Must hit the local index.
     let second = h.value(&[
-        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
         "--country", "US",
     ]);
     assert_eq!(second["canonical_id"].as_str(), Some(id));
@@ -423,7 +423,7 @@ fn name_city_with_no_hub_match_refuses() {
         ],
     );
     let v = h.value(&[
-        "resolve", "--name", "Nowhere Cafe", "--city", "Springfield", "--complete",
+        "resolve", "--type", "restaurant", "--name", "Nowhere Cafe", "--city", "Springfield", "--complete",
         "--hub-fixtures", &fx,
     ]);
     assert_eq!(v["status"].as_str().unwrap(), "unresolved");
@@ -482,7 +482,7 @@ fn name_city_ambiguous_returns_candidates() {
         ],
     );
     let v = h.value(&[
-        "resolve", "--name", "Joe's Pizza", "--city", "New York", "--complete",
+        "resolve", "--type", "restaurant", "--name", "Joe's Pizza", "--city", "New York", "--complete",
         "--hub-fixtures", &fx,
     ]);
     assert_eq!(v["status"].as_str().unwrap(), "unresolved");
@@ -526,7 +526,7 @@ fn name_street_establishes_then_coarse_city_query_does_not_wrong_bind() {
         ],
     );
     let established = h.value(&[
-        "resolve", "--name", "Blue Bottle Coffee", "--address", "1 Ferry Building", "--city",
+        "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--address", "1 Ferry Building", "--city",
         "San Francisco", "--complete", "--hub-fixtures", &one,
     ]);
     let e_id = established["canonical_id"].as_str().expect("establish E").to_string();
@@ -550,7 +550,7 @@ fn name_street_establishes_then_coarse_city_query_does_not_wrong_bind() {
         ],
     );
     let coarse = h.value(&[
-        "resolve", "--name", "Blue Bottle Coffee", "--city", "San Francisco", "--complete",
+        "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "San Francisco", "--complete",
         "--hub-fixtures", &many,
     ]);
     assert_eq!(coarse["status"].as_str().unwrap(), "unresolved");
@@ -560,7 +560,7 @@ fn name_street_establishes_then_coarse_city_query_does_not_wrong_bind() {
 
     // And a name+city query WITHOUT --complete (pure local) does not confidently
     // return E either — it is ambiguous from memory now (recorded above).
-    let local = h.value(&["resolve", "--name", "Blue Bottle Coffee", "--city", "San Francisco"]);
+    let local = h.value(&["resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "San Francisco"]);
     assert!(local["canonical_id"].is_null(), "local must not wrong-bind: {local}");
     assert_eq!(local["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
 }
@@ -590,14 +590,14 @@ fn cardinality_memory_answers_repeat_coarse_query_with_zero_hub_calls() {
         ],
     );
     let first = h.value(&[
-        "resolve", "--name", "Joe's Pizza", "--city", "New York", "--complete",
+        "resolve", "--type", "restaurant", "--name", "Joe's Pizza", "--city", "New York", "--complete",
         "--hub-fixtures", &three,
     ]);
     assert_eq!(first["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
     assert_eq!(first["candidates"].as_array().unwrap().len(), 3);
 
     // Identical repeat, NO --complete and NO --hub-fixtures → zero network.
-    let repeat = h.value(&["resolve", "--name", "Joe's Pizza", "--city", "New York"]);
+    let repeat = h.value(&["resolve", "--type", "restaurant", "--name", "Joe's Pizza", "--city", "New York"]);
     assert_eq!(repeat["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
     assert_eq!(repeat["candidates"].as_array().unwrap().len(), 3);
     assert_eq!(repeat["harvested"].as_u64().unwrap(), 0);
@@ -606,7 +606,7 @@ fn cardinality_memory_answers_repeat_coarse_query_with_zero_hub_calls() {
     // A repeat WITH --complete but the SAME (would-error) fixtures also short-
     // circuits from memory before any hub call.
     let repeat_complete = h.value(&[
-        "resolve", "--name", "Joe's Pizza", "--city", "New York", "--complete",
+        "resolve", "--type", "restaurant", "--name", "Joe's Pizza", "--city", "New York", "--complete",
         "--hub-fixtures", &three,
     ]);
     assert_eq!(repeat_complete["confidence_reason"].as_str().unwrap(), "ambiguous_among_n");
@@ -619,14 +619,14 @@ fn name_city_unique_match_repeat_is_local_hit() {
     let h = Harness::new();
     let fx = hub_fixtures();
     let first = h.value(&[
-        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
         "--country", "US", "--complete", "--hub-fixtures", &fx,
     ]);
     let id = first["canonical_id"].as_str().expect("unique hit").to_string();
     assert_eq!(first["confidence_reason"].as_str().unwrap(), "place_unique_match");
 
     let repeat = h.value(&[
-        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
+        "resolve", "--type", "restaurant", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--region", "CA",
         "--country", "US",
     ]);
     assert_eq!(repeat["canonical_id"].as_str(), Some(id.as_str()));
@@ -669,27 +669,27 @@ fn name_city_hub_confirmed_unique_coarse_repeat_hits_locally() {
 
     // Step 1: name + street + city, --complete → mint cx (indexed WITH the street).
     let step1 = h.value(&[
-        "resolve", "--name", "Kibatsu", "--address", "500 Main St", "--city",
+        "resolve", "--type", "restaurant", "--name", "Kibatsu", "--address", "500 Main St", "--city",
         "San Francisco", "--complete", "--hub-fixtures", &fx,
     ]);
     let cid = step1["canonical_id"].as_str().expect("step 1 resolves").to_string();
 
     // Step 2: coarse city-only query, LOCAL ONLY → miss (uniqueness never confirmed).
-    let step2 = h.value(&["resolve", "--name", "Kibatsu", "--city", "San Francisco"]);
+    let step2 = h.value(&["resolve", "--type", "restaurant", "--name", "Kibatsu", "--city", "San Francisco"]);
     assert_eq!(step2["status"].as_str().unwrap(), "unresolved");
     assert!(step2["canonical_id"].is_null(), "step 2 must miss: {step2}");
 
     // Step 3: coarse city-only query WITH --complete, hub returns ONE → hits cx and
     // records the coarse (name, city) unique.
     let step3 = h.value(&[
-        "resolve", "--name", "Kibatsu", "--city", "San Francisco", "--complete",
+        "resolve", "--type", "restaurant", "--name", "Kibatsu", "--city", "San Francisco", "--complete",
         "--hub-fixtures", &fx,
     ]);
     assert_eq!(step3["canonical_id"].as_str(), Some(cid.as_str()));
 
     // Step 4: coarse city-only query, LOCAL ONLY repeat → HITS from memory
     // (local_name_match, harvested 0), zero external calls.
-    let step4 = h.value(&["resolve", "--name", "Kibatsu", "--city", "San Francisco"]);
+    let step4 = h.value(&["resolve", "--type", "restaurant", "--name", "Kibatsu", "--city", "San Francisco"]);
     assert_eq!(step4["canonical_id"].as_str(), Some(cid.as_str()));
     assert_eq!(step4["confidence_reason"].as_str().unwrap(), "local_name_match");
     assert_eq!(step4["harvested"].as_u64().unwrap(), 0);
@@ -778,13 +778,19 @@ fn geo_args_with_typed_source_are_rejected() {
     let h = Harness::new();
     let (ok, _stdout, stderr) = h.run_raw(&["resolve", "--imdb", "tt0133093", "--city", "Oakland"]);
     assert!(!ok, "geo args with a typed source must be rejected");
+    // --type is the same kind of facet: it routes a NAME query's hub and means
+    // nothing next to an exact id.
+    let (type_ok, _o, type_err) =
+        h.run_raw(&["resolve", "--imdb", "tt0133093", "--type", "movie"]);
+    assert!(!type_ok, "--type with a typed source must be rejected");
+    assert!(type_err.contains("--type"), "stderr={type_err}");
     assert!(
         stderr.contains("--name") || stderr.contains("name"),
         "error should reference --name, stderr={stderr}"
     );
 
     // The legitimate --name + geo path is unaffected (local miss, but accepted).
-    let v = h.value(&["resolve", "--name", "Somewhere", "--city", "Oakland"]);
+    let v = h.value(&["resolve", "--type", "restaurant", "--name", "Somewhere", "--city", "Oakland"]);
     assert_eq!(v["status"].as_str().unwrap(), "unresolved");
 }
 
@@ -795,6 +801,156 @@ fn empty_name_is_rejected() {
     let (ok, _stdout, stderr) = h.run_raw(&["resolve", "--name", "   "]);
     assert!(!ok, "empty --name must be rejected");
     assert!(stderr.contains("empty"), "stderr={stderr}");
+}
+
+// -------------------------------------------------------------------------
+// Hub routing by --type (U3/U6): a film name never reaches Google Places
+// -------------------------------------------------------------------------
+
+/// The TMDb `/search/multi` fixture: `Avatar` is ambiguous in BOTH ways at once —
+/// an unrelated franchise colliding on the name (the Nickelodeon series) and two
+/// works inside one franchise separated only by their year.
+const AVATAR_MULTI: &str = r#"{
+  "method": "GET",
+  "url": "https://api.themoviedb.org/3/search/multi",
+  "response": { "results": [
+    { "id": 19995, "media_type": "movie", "title": "Avatar", "release_date": "2009-12-15" },
+    { "id": 76600, "media_type": "movie", "title": "Avatar: The Way of Water",
+      "release_date": "2022-12-14" },
+    { "id": 246, "media_type": "tv", "name": "Avatar: The Last Airbender",
+      "first_air_date": "2005-02-21" },
+    { "id": 8888, "media_type": "person", "name": "James Cameron" }
+  ]}
+}"#;
+
+const AVATAR_EXTERNAL_IDS: &str = r#"{
+  "method": "GET",
+  "url": "https://api.themoviedb.org/3/movie/19995/external_ids",
+  "response": { "imdb_id": "tt0499549", "wikidata_id": "Q24871" }
+}"#;
+
+#[test]
+fn movie_name_is_ambiguous_then_a_year_qualifier_resolves_it() {
+    let h = Harness::new();
+    let fx = h.hub_dir(
+        "avatar",
+        &[
+            ("search_multi.json", AVATAR_MULTI),
+            ("external_ids.json", AVATAR_EXTERNAL_IDS),
+        ],
+    );
+
+    // 1. `--type movie` routes to TMDb (no Google fixture exists in this dir, so
+    //    a places call would simply find nothing). The answer is a candidate list
+    //    covering both ambiguity cases, and every label carries the YEAR — the
+    //    only thing that lets a human tell the 2009 film from its 2022 sequel.
+    let ambiguous = h.value(&[
+        "resolve", "--name", "Avatar", "--type", "movie", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    assert_eq!(ambiguous["status"].as_str().unwrap(), "unresolved");
+    assert_eq!(
+        ambiguous["confidence_reason"].as_str().unwrap(),
+        "ambiguous_among_n"
+    );
+    let labels: Vec<String> = ambiguous["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(labels.len(), 3, "the person result is not a candidate: {labels:?}");
+    // Case (c): one franchise, two works, told apart ONLY by the year.
+    assert!(labels.contains(&"Avatar (2009 film)".to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&"Avatar: The Way of Water (2022 film)".to_string()),
+        "{labels:?}"
+    );
+    // Case (b): a different franchise entirely, colliding on the name.
+    assert!(
+        labels.contains(&"Avatar: The Last Airbender (2005 TV series)".to_string()),
+        "{labels:?}"
+    );
+    // Every label carries a 4-digit year.
+    for label in &labels {
+        assert!(
+            label.chars().filter(|c| c.is_ascii_digit()).count() >= 4,
+            "label without a year: {label}"
+        );
+    }
+    // Each candidate also carries an echo-able ref; the series is NOT keyed in
+    // TMDb's movie namespace.
+    let refs: Vec<String> = ambiguous["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["anchor"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(refs[0], "tmdb:19995");
+    assert_eq!(refs[2], "url:themoviedb.org/tv/246");
+
+    // 2. The year narrows it to exactly one — and it resolves, crosswalking out
+    //    to IMDb + Wikidata through the existing forward completion.
+    let unique = h.value(&[
+        "resolve", "--name", "Avatar", "--type", "movie", "--qualifier", "2009",
+        "--complete", "--hub-fixtures", &fx,
+    ]);
+    let cid = unique["canonical_id"].as_str().expect("2009 resolves uniquely");
+    assert_eq!(unique["name"].as_str().unwrap(), "Avatar");
+    let same_as: Vec<String> = unique["sameAs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(same_as.contains(&"tmdb:19995".to_string()), "{same_as:?}");
+    assert!(same_as.contains(&"imdb:tt0499549".to_string()), "{same_as:?}");
+
+    // 3. The narrowed query is now local: the repeat needs no hub at all.
+    let repeat = h.value(&["resolve", "--name", "Avatar", "--type", "movie", "--qualifier", "2009"]);
+    assert_eq!(repeat["canonical_id"].as_str().unwrap(), cid);
+    assert_eq!(repeat["confidence_reason"].as_str().unwrap(), "local_name_match");
+
+    // 4. The BARE name stays ambiguous from memory — resolving one work never
+    //    collapses the others into it.
+    let bare_repeat = h.value(&["resolve", "--name", "Avatar", "--type", "movie"]);
+    assert_eq!(
+        bare_repeat["confidence_reason"].as_str().unwrap(),
+        "ambiguous_among_n"
+    );
+    assert_eq!(bare_repeat["candidates"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn an_untyped_name_query_does_not_reach_google_places() {
+    // The routing safety property: no --type means the FREE hub. The fixture dir
+    // holds only a Google Text Search response; routing to Wikidata means it is
+    // never read, so the query misses instead of silently spending money.
+    let h = Harness::new();
+    let fx = h.hub_dir(
+        "places_only",
+        &[(
+            "findplace.json",
+            r#"{ "method": "POST", "url": "https://places.googleapis.com/v1/places:searchText",
+                 "response": { "places": [ { "id": "SHOULD_NOT_BE_USED" } ] } }"#,
+        )],
+    );
+    let v = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--complete",
+        "--hub-fixtures", &fx,
+    ]);
+    assert_eq!(v["status"].as_str().unwrap(), "unresolved");
+    assert!(
+        v["sameAs"].as_array().unwrap().is_empty(),
+        "an untyped query must not bind a Google place_id: {v}"
+    );
+
+    // The SAME query with --type restaurant does route to Places and resolves.
+    let typed = h.value(&[
+        "resolve", "--name", "Blue Bottle Coffee", "--city", "Oakland", "--type", "restaurant",
+        "--complete", "--hub-fixtures", &fx,
+    ]);
+    assert!(typed["canonical_id"].as_str().is_some(), "{typed}");
 }
 
 // -------------------------------------------------------------------------
@@ -869,7 +1025,7 @@ fn stats_reports_miss_rate() {
     // Two exact hits + one miss (name with no hub, local miss → unresolved).
     h.run(&["resolve", "--id", "wikidata:Q1"]);
     h.run(&["resolve", "--id", "google_place_id:SP"]);
-    h.run(&["resolve", "--name", "Ghost Diner", "--city", "Nowhere"]);
+    h.run(&["resolve", "--type", "restaurant", "--name", "Ghost Diner", "--city", "Nowhere"]);
 
     let v = h.value(&["stats"]);
     assert_eq!(v["total"].as_u64().unwrap(), 3);

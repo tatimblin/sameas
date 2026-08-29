@@ -110,10 +110,17 @@ struct ResolveArgs {
     #[arg(long)]
     input: Option<PathBuf>,
 
-    /// Resolve a place by name (+ address/city). Reverse-resolves to a Placekey
-    /// anchor and a Google place_id; requires --complete.
+    /// Resolve an entity by name (+ qualifiers). Reverse-resolves through the hub
+    /// its --type routes to; requires --complete to reach out.
     #[arg(long)]
     name: Option<String>,
+    /// Entity type for --name, as an NSID leaf (matched case-insensitively, and a
+    /// full `info.cursive.creativeWork.movie` is accepted too). It picks the hub:
+    /// `place`/`localBusiness`/`foodEstablishment`/`restaurant` → Google Places
+    /// (the only BILLABLE hub); `movie`/`tvSeries` → TMDb; anything else, or no
+    /// --type at all → Wikidata. Applies ONLY to --name.
+    #[arg(long = "type")]
+    entity_type: Option<String>,
     /// Street address for --name (a full address yields a precise Placekey).
     /// Applies ONLY to --name; combining it with a typed source is rejected.
     #[arg(long)]
@@ -237,7 +244,11 @@ fn describe_resolve(args: &ResolveArgs) -> String {
     } else if let Some(id) = &args.id {
         id.clone()
     } else if args.name.is_some() {
-        "name".to_string()
+        // IDs only, no provider content — the type is a routing key, not content.
+        match &args.entity_type {
+            Some(t) => format!("name:{t}"),
+            None => "name".to_string(),
+        }
     } else if args.input.is_some() {
         "record".to_string()
     } else {
@@ -265,6 +276,9 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
         if !args.qualifiers.is_empty() {
             offenders.push("--qualifier");
         }
+        if args.entity_type.is_some() {
+            offenders.push("--type");
+        }
         if !offenders.is_empty() {
             bail!(
                 "{} appl{} only to --name; combine with --name or drop {}",
@@ -283,7 +297,7 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
         let query = NameQuery {
             name: Some(name.clone()),
             qualifiers: args.qualifiers.clone(),
-            entity_type: None,
+            entity_type: args.entity_type.clone(),
             street: args.address.clone(),
             city: args.city.clone(),
             region: args.region.clone(),
@@ -300,7 +314,7 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
     }
 
     // Build an EntityRecord from whichever typed source was given.
-    let record = build_input_record(graph, args)?;
+    let record = build_input_record(graph, args).await?;
 
     if args.complete {
         let ctx = build_completion_ctx(args)?;
@@ -312,11 +326,12 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
 /// Build the input record for a non-name source. `--domain` without page
 /// harvesting is just a single domain key; everything else is a one-id record
 /// (or a harvested/loaded record).
-fn build_input_record(_graph: &dyn GraphStore, args: &ResolveArgs) -> Result<EntityRecord> {
+async fn build_input_record(_graph: &dyn GraphStore, args: &ResolveArgs) -> Result<EntityRecord> {
     if let Some(domain) = &args.domain {
         if args.fixture.is_some() || args.fetch {
-            let resolver = build_domain_resolver(domain, args.fixture.as_deref(), args.fetch)?;
-            return resolver.harvest();
+            let resolver =
+                build_domain_resolver(domain, args.fixture.as_deref(), args.fetch).await?;
+            return resolver.harvest().await;
         }
         return Ok(one_id(ExternalId::domain(domain)?));
     }
@@ -375,20 +390,20 @@ fn build_live_completion_ctx() -> Result<CompletionCtx> {
 }
 
 #[cfg(feature = "live-fetch")]
-fn build_domain_resolver(
+async fn build_domain_resolver(
     domain: &str,
     fixture: Option<&Path>,
     fetch: bool,
 ) -> Result<DomainResolver> {
     match (fixture, fetch) {
         (Some(path), _) => DomainResolver::from_fixture(domain, path),
-        (None, true) => DomainResolver::from_live(domain),
+        (None, true) => DomainResolver::from_live(domain).await,
         (None, false) => bail!("no fixture or --fetch given for --domain harvest"),
     }
 }
 
 #[cfg(not(feature = "live-fetch"))]
-fn build_domain_resolver(
+async fn build_domain_resolver(
     domain: &str,
     fixture: Option<&Path>,
     fetch: bool,
@@ -407,7 +422,7 @@ async fn ingest_one(graph: &dyn GraphStore, file: &Path) -> Result<ResolveOutput
     let record = EntityRecord::from_path(file)
         .with_context(|| format!("ingesting {}", file.display()))?;
     let resolver = DirectRecordResolver::new(record);
-    let record = resolver.harvest()?;
+    let record = resolver.harvest().await?;
     commit_record(graph, &record).await
 }
 

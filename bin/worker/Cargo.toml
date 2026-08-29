@@ -17,9 +17,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # The Worker is the D1 backend only: no rusqlite (cannot target wasm32) and no
-# HTML harvesting (a domain is just a graph key here).
+# HTML harvesting (a domain is just a graph key here). `worker-fetch` adds the
+# `worker::Fetch`-backed `HttpTransport`, the only one that works in workerd —
+# `live-fetch`/`reqwest` is a native-only path and must never be enabled here.
 sameas-core = { path = "../../crates/sameas-core", default-features = false, features = [
     "d1",
+    "worker-fetch",
 ] }
 
 worker = { version = "0.5", features = ["d1"] }

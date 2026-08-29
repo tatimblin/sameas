@@ -4,14 +4,18 @@
 //! Google Places (`GET`), and Placekey (`POST` + `apikey` header). This module
 //! centralizes the request/parse so adapters only build URLs and read fields.
 //!
-//! Two implementations mirror M1's `DomainResolver::from_fixture` / `from_live`
-//! split:
+//! Three implementations, one per environment:
 //! * [`FixtureTransport`] — offline, deterministic; serves canned JSON keyed by
 //!   a **secret-stripped** request signature. Used by tests and the demo so CI
 //!   stays offline.
-//! * `ReqwestTransport` — real HTTP, behind the `live-fetch` feature.
+//! * `ReqwestTransport` — real HTTP for native builds (CLI), behind the
+//!   `live-fetch` feature.
+//! * `FetchTransport` — real HTTP inside a Cloudflare Worker (`worker::Fetch`),
+//!   behind the `worker-fetch` feature. `reqwest` cannot run on
+//!   `wasm32-unknown-unknown` in workerd, which is why this exists at all.
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -23,19 +27,26 @@ pub const SECRET_PARAMS: &[&str] = &["key", "api_key", "apikey"];
 /// Anything that can fetch JSON from a hub. Adapters capture one of these at
 /// construction (`Arc<dyn HttpTransport>`), since `Resolver::harvest(&self)`
 /// takes no transport parameter.
+///
+/// **Why `?Send`.** Same rationale as [`crate::store::GraphStore`]: the Worker
+/// implementation (`FetchTransport`) is built on `worker::Fetch`, whose futures
+/// hold `JsValue`s and are therefore `!Send`. Workers are single-threaded, so a
+/// `Send` bound would buy nothing and cost `SendWrapper` gymnastics at every call;
+/// the CLI drives this with a current-thread runtime.
+#[async_trait(?Send)]
 pub trait HttpTransport {
     /// HTTP GET returning parsed JSON.
-    fn get_json(&self, url: &str) -> Result<Value>;
+    async fn get_json(&self, url: &str) -> Result<Value>;
 
     /// HTTP GET with request headers (e.g. `X-Goog-Api-Key` + `X-Goog-FieldMask`
     /// for Google Places API New). Defaults to a plain GET — offline fixtures
     /// match on the URL and ignore headers, so they need no override.
-    fn get_json_with_headers(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Value> {
-        self.get_json(url)
+    async fn get_json_with_headers(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Value> {
+        self.get_json(url).await
     }
 
     /// HTTP POST with headers and a JSON body, returning parsed JSON.
-    fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value>;
+    async fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value>;
 }
 
 /// A canonical, secret-free signature of a request, used as the fixture key.
@@ -157,23 +168,45 @@ impl FixtureTransport {
     }
 }
 
+#[async_trait(?Send)]
 impl HttpTransport for FixtureTransport {
-    fn get_json(&self, url: &str) -> Result<Value> {
+    async fn get_json(&self, url: &str) -> Result<Value> {
         self.lookup("GET", url)
     }
 
-    fn post_json(&self, url: &str, _headers: &[(&str, &str)], _body: &Value) -> Result<Value> {
+    async fn post_json(
+        &self,
+        url: &str,
+        _headers: &[(&str, &str)],
+        _body: &Value,
+    ) -> Result<Value> {
         self.lookup("POST", url)
     }
 }
 
-/// Real HTTP transport (opt-in). A single reused blocking client carries a
-/// descriptive `User-Agent` (mandatory for Wikidata SPARQL — 403 without),
-/// sensible timeouts, gzip, and a JSON `Accept`. Calls retry transient failures
-/// (timeouts, 429, 5xx) and map non-2xx to a clear, class-named error.
+/// Descriptive `User-Agent`, mandatory for Wikidata SPARQL (403 without it).
+/// `$transport` names which of the two live transports sent the request, so a hub
+/// operator (and our own logs) can tell a CLI call from a Worker call.
+#[cfg(any(feature = "live-fetch", feature = "worker-fetch"))]
+macro_rules! user_agent {
+    ($transport:literal) => {
+        concat!(
+            "sameas/",
+            env!("CARGO_PKG_VERSION"),
+            " (https://example.com/sameas) ",
+            $transport
+        )
+    };
+}
+
+/// Real HTTP transport for native builds (opt-in). A single reused async client
+/// carries a descriptive `user_agent!`, sensible timeouts, gzip, and a JSON
+/// `Accept`. Calls
+/// retry transient failures (timeouts, 429, 5xx) and map non-2xx to a clear,
+/// class-named error.
 #[cfg(feature = "live-fetch")]
 pub struct ReqwestTransport {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     max_attempts: u32,
 }
 
@@ -186,13 +219,9 @@ impl ReqwestTransport {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             // Descriptive UA per Wikimedia's User-Agent policy.
-            .user_agent(concat!(
-                "sameas/",
-                env!("CARGO_PKG_VERSION"),
-                " (https://example.com/sameas) reqwest"
-            ))
+            .user_agent(user_agent!("reqwest"))
             .default_headers(headers)
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
@@ -208,15 +237,20 @@ impl ReqwestTransport {
     /// Send with bounded retry on transient failures (transport timeout/connect,
     /// HTTP 429, 5xx), honoring `Retry-After` when present, else exponential
     /// backoff. Never retries other 4xx.
-    fn send_with_retry(
+    ///
+    /// The backoff is `tokio::time::sleep`, not `std::thread::sleep`: blocking the
+    /// thread inside an async runtime stalls every other task on it. That is what
+    /// makes `tokio` a runtime (not dev-only) dependency of this crate — but only
+    /// under `live-fetch`, so the Worker build never pulls it in.
+    async fn send_with_retry(
         &self,
-        build: impl Fn() -> reqwest::blocking::RequestBuilder,
-    ) -> reqwest::Result<reqwest::blocking::Response> {
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> reqwest::Result<reqwest::Response> {
         use std::time::Duration;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            match build().send() {
+            match build().send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     let transient =
@@ -229,13 +263,13 @@ impl ReqwestTransport {
                             .and_then(|s| s.parse::<u64>().ok())
                             .map(Duration::from_secs)
                             .unwrap_or_else(|| Duration::from_millis(200 * 2u64.pow(attempt)));
-                        std::thread::sleep(wait);
+                        tokio::time::sleep(wait).await;
                         continue;
                     }
                     return Ok(resp);
                 }
                 Err(e) if attempt < self.max_attempts && (e.is_timeout() || e.is_connect()) => {
-                    std::thread::sleep(Duration::from_millis(200 * 2u64.pow(attempt)));
+                    tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -246,14 +280,15 @@ impl ReqwestTransport {
     /// Read a response as JSON, mapping a non-2xx to an `anyhow` error that names
     /// the class (auth / not-found / rate-limited / other) with a body snippet —
     /// so callers can tell "bad key" from "no data".
-    fn read_json(resp: reqwest::blocking::Response, what: &str) -> Result<Value> {
+    async fn read_json(resp: reqwest::Response, what: &str) -> Result<Value> {
         let status = resp.status();
         if status.is_success() {
             return resp
                 .json::<Value>()
+                .await
                 .map_err(|e| anyhow!("{what}: decoding response body: {e}"));
         }
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(300).collect();
         match status.as_u16() {
             401 | 403 => Err(anyhow!(
@@ -267,12 +302,13 @@ impl ReqwestTransport {
 }
 
 #[cfg(feature = "live-fetch")]
+#[async_trait(?Send)]
 impl HttpTransport for ReqwestTransport {
-    fn get_json(&self, url: &str) -> Result<Value> {
-        self.get_json_with_headers(url, &[])
+    async fn get_json(&self, url: &str) -> Result<Value> {
+        self.get_json_with_headers(url, &[]).await
     }
 
-    fn get_json_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
+    async fn get_json_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
         let resp = self
             .send_with_retry(|| {
                 let mut req = self.client.get(url);
@@ -281,11 +317,12 @@ impl HttpTransport for ReqwestTransport {
                 }
                 req
             })
+            .await
             .map_err(|e| anyhow!("GET {url}: {e}"))?;
-        Self::read_json(resp, &format!("GET {url}"))
+        Self::read_json(resp, &format!("GET {url}")).await
     }
 
-    fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
+    async fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
         let resp = self
             .send_with_retry(|| {
                 let mut req = self.client.post(url).json(body);
@@ -294,8 +331,186 @@ impl HttpTransport for ReqwestTransport {
                 }
                 req
             })
+            .await
             .map_err(|e| anyhow!("POST {url}: {e}"))?;
-        Self::read_json(resp, &format!("POST {url}"))
+        Self::read_json(resp, &format!("POST {url}")).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FetchTransport — the Cloudflare Worker transport
+// ---------------------------------------------------------------------------
+
+/// Real HTTP transport inside a Cloudflare Worker, behind the `worker-fetch`
+/// feature.
+///
+/// `reqwest` is not an option here: even its wasm32 backend targets a browser's
+/// `window.fetch`, and the blocking client this crate used before U1 cannot exist
+/// in workerd at all. `worker::Fetch` is the platform primitive, and its futures
+/// are `!Send` — which is exactly why [`HttpTransport`] is `#[async_trait(?Send)]`.
+///
+/// Retry policy is deliberately identical to [`ReqwestTransport`]'s (bounded at
+/// `max_attempts`, transient = 429/5xx/send-error, `Retry-After` honored, else
+/// exponential backoff) with `worker::Delay` standing in for `tokio::time::sleep`.
+/// Keeping the two in step means a hub that flakes behaves the same on the CLI and
+/// in the Worker — the alternative (no retry in the Worker) would have made
+/// Worker-only failures unreproducible locally.
+///
+/// Caveat inherited from the shared policy: a subrequest still counts against the
+/// Worker's per-request subrequest limit on every attempt, and `Delay` burns wall
+/// clock inside the request. Three attempts with 400ms/800ms backoff is the
+/// bounded worst case.
+#[cfg(feature = "worker-fetch")]
+pub struct FetchTransport {
+    max_attempts: u32,
+}
+
+#[cfg(feature = "worker-fetch")]
+impl Default for FetchTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "worker-fetch")]
+impl FetchTransport {
+    /// Three attempts, matching `ReqwestTransport::new`.
+    pub fn new() -> Self {
+        FetchTransport { max_attempts: 3 }
+    }
+
+    /// Override the attempt cap. `1` disables retry entirely.
+    pub fn with_max_attempts(max_attempts: u32) -> Self {
+        FetchTransport {
+            max_attempts: max_attempts.max(1),
+        }
+    }
+
+    /// Build one `worker::Request`. Rebuilt per attempt: a `Request` body is a
+    /// one-shot stream, so a retry cannot reuse the previous instance.
+    fn build(
+        method: worker::Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<worker::Request> {
+        use wasm_bindgen::JsValue;
+
+        let mut h = worker::Headers::new();
+        let mut set = |k: &str, v: &str| -> Result<()> {
+            h.set(k, v)
+                .map_err(|e| anyhow!("building request for {url}: header {k}: {e}"))
+        };
+        set("Accept", "application/json")?;
+        set("User-Agent", user_agent!("workers-rs"))?;
+        let serialized = match body {
+            Some(v) => {
+                set("Content-Type", "application/json")?;
+                Some(
+                    serde_json::to_string(v)
+                        .map_err(|e| anyhow!("building request for {url}: serializing body: {e}"))?,
+                )
+            }
+            None => None,
+        };
+        // Caller headers last so an explicit override (e.g. Placekey's own
+        // Content-Type) wins over the defaults above.
+        for (k, v) in headers {
+            set(k, v)?;
+        }
+
+        let mut init = worker::RequestInit::new();
+        init.with_method(method).with_headers(h);
+        if let Some(s) = serialized {
+            init.with_body(Some(JsValue::from_str(&s)));
+        }
+        worker::Request::new_with_init(url, &init)
+            .map_err(|e| anyhow!("building request for {url}: {e}"))
+    }
+
+    async fn send(
+        &self,
+        method: worker::Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        use std::time::Duration;
+
+        let what = format!("{method} {url}");
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let req = Self::build(method.clone(), url, headers, body)?;
+            match worker::Fetch::Request(req).send().await {
+                Ok(mut resp) => {
+                    let status = resp.status_code();
+                    let transient = status == 429 || (500..600).contains(&status);
+                    if transient && attempt < self.max_attempts {
+                        let wait = resp
+                            .headers()
+                            .get("retry-after")
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| Duration::from_millis(200 * 2u64.pow(attempt)));
+                        worker::Delay::from(wait).await;
+                        continue;
+                    }
+                    return Self::read_json(&mut resp, &what).await;
+                }
+                // `worker::Fetch` does not classify errors (no `is_timeout` /
+                // `is_connect` the way reqwest has), so every send failure is
+                // treated as transient. A malformed URL fails in `build` above and
+                // never reaches here.
+                Err(_) if attempt < self.max_attempts => {
+                    worker::Delay::from(Duration::from_millis(200 * 2u64.pow(attempt))).await;
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("{what}: {e}")),
+            }
+        }
+    }
+
+    /// Mirrors `ReqwestTransport::read_json`'s error classes so a hub failure
+    /// reads identically whichever transport produced it.
+    async fn read_json(resp: &mut worker::Response, what: &str) -> Result<Value> {
+        let status = resp.status_code();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| anyhow!("{what}: reading response body: {e}"))?;
+        if (200..300).contains(&status) {
+            return serde_json::from_str(&body)
+                .map_err(|e| anyhow!("{what}: decoding response body: {e}"));
+        }
+        let snippet: String = body.chars().take(300).collect();
+        match status {
+            401 | 403 => Err(anyhow!(
+                "{what}: authentication/authorization denied (HTTP {status}): {snippet}"
+            )),
+            404 => Err(anyhow!("{what}: not found (HTTP 404): {snippet}")),
+            429 => Err(anyhow!("{what}: rate limited (HTTP 429): {snippet}")),
+            _ => Err(anyhow!("{what}: unexpected HTTP {status}: {snippet}")),
+        }
+    }
+}
+
+#[cfg(feature = "worker-fetch")]
+#[async_trait(?Send)]
+impl HttpTransport for FetchTransport {
+    async fn get_json(&self, url: &str) -> Result<Value> {
+        self.get_json_with_headers(url, &[]).await
+    }
+
+    async fn get_json_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
+        self.send(worker::Method::Get, url, headers, None).await
+    }
+
+    async fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
+        self.send(worker::Method::Post, url, headers, Some(body))
+            .await
     }
 }
 
@@ -320,8 +535,8 @@ mod tests {
         assert!(a.contains("place_id=ChIJ"));
     }
 
-    #[test]
-    fn fixture_transport_serves_by_signature() {
+    #[tokio::test]
+    async fn fixture_transport_serves_by_signature() {
         let t = FixtureTransport::from_pairs(vec![(
             "GET",
             "https://query.wikidata.org/sparql?format=json&query=abc",
@@ -330,8 +545,12 @@ mod tests {
         // Different key/order still matches the fixture.
         let got = t
             .get_json("https://query.wikidata.org/sparql?query=abc&format=json")
+            .await
             .unwrap();
         assert_eq!(got, json!({"ok": true}));
-        assert!(t.get_json("https://query.wikidata.org/sparql?query=zzz").is_err());
+        assert!(t
+            .get_json("https://query.wikidata.org/sparql?query=zzz")
+            .await
+            .is_err());
     }
 }

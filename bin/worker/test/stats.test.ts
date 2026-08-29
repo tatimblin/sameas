@@ -1,6 +1,6 @@
 import { beforeEach, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { dispatch, post, resetDb, scalar } from "./helpers";
+import { dispatch, post, postAnon, resetDb, scalar } from "./helpers";
 
 // BUG 3 REGRESSION.
 //
@@ -99,6 +99,53 @@ it("a refused resolve is logged as a MISS", async () => {
   expect(s.exact).toBe(0);
   expect(s.miss_rate).toBe(1);
   expect(s.by_reason).toEqual({ needs_stronger_identifier: 1 });
+});
+
+it("/resolve/name LOGS — the explicit per-endpoint choice", async () => {
+  // `router.rs` requires every new endpoint to decide this deliberately. This one
+  // logs: it is the user-facing query, and its miss rate is the evidence gate for
+  // what gets built next, so excluding it would hide the one number the feature
+  // exists to produce.
+  const res = await post(
+    "/resolve/name",
+    JSON.stringify({
+      publisher_did: "did:test:stats",
+      name: "Souvla",
+      entity_type: "restaurant",
+      identifiers: ["https://www.yelp.com/biz/souvla-hayes-valley"],
+    }),
+  );
+  expect(res.status).toBe(200);
+  expect(await rows()).toBe(1);
+  expect(
+    await scalar(
+      `SELECT COUNT(*) AS n FROM resolutions
+        WHERE status_tag = 'new' AND input_desc LIKE 'name=Souvla%'`,
+    ),
+  ).toBe(1);
+
+  // And a refusal lands in the MISS bucket, which is the whole point: a route
+  // that only logged its successes would report a miss rate of zero forever.
+  await post(
+    "/resolve/name",
+    JSON.stringify({
+      publisher_did: "did:test:stats",
+      name: "Souvla",
+      entity_type: "restaurant",
+      identifiers: ["https://souvla.com"],
+    }),
+  );
+  const s = (await (await dispatch("/stats")).json()) as Stats;
+  expect(s.total).toBe(2);
+  expect(s.miss).toBe(1);
+});
+
+it("a rejected /resolve/name request writes NO resolutions row", async () => {
+  // 400/401/429/503 are rejected requests, not resolution outcomes — counting
+  // them would inflate the miss bucket with client bugs.
+  await postAnon("/resolve/name", JSON.stringify({ name: "Souvla" }));
+  await post("/resolve/name", JSON.stringify({ name: "no bucket" }));
+  expect(await rows()).toBe(0);
 });
 
 it("/entity writes NO resolutions row", async () => {

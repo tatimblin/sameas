@@ -615,4 +615,78 @@ mod tests {
         let key2 = specific_url("https://evil.com/guide.michelin.com/restaurant/a16").unwrap();
         assert!(key2.starts_with("evil.com/"), "{key2}");
     }
+
+    // --- The normalizer half of the URL-projection round trip ---------------
+    //
+    // `KindSpec::to_url` projects a stored value back to a canonical public URL
+    // (see `kind.rs`). `kind::tests::url_projections_round_trip` asserts the
+    // whole loop through the registry's classifier; these assert the piece that
+    // lives here — that each normalizer reads its own projection back out
+    // unchanged. Kept next to the normalizers so a change to one of them fails
+    // here, where the reason is obvious, rather than only in `kind.rs`.
+
+    #[test]
+    fn normalizers_read_back_their_own_url_projections() {
+        assert_eq!(
+            yelp("https://www.yelp.com/biz/souvla-hayes-valley-san-francisco").unwrap(),
+            "souvla-hayes-valley-san-francisco"
+        );
+        assert_eq!(
+            place_id("ChIJN1t_tDeuEmsRUsoyG83frY4").unwrap(),
+            "ChIJN1t_tDeuEmsRUsoyG83frY4"
+        );
+        assert_eq!(
+            qid("https://www.wikidata.org/wiki/Q83495").unwrap(),
+            "Q83495"
+        );
+        assert_eq!(
+            imdb("https://www.imdb.com/title/tt0133093/").unwrap(),
+            "tt0133093"
+        );
+        assert_eq!(tmdb("https://www.themoviedb.org/movie/603").unwrap(), "603");
+        let michelin = "guide.michelin.com/us/en/california/san-francisco/restaurant/a16";
+        assert_eq!(
+            specific_url(&format!("https://{michelin}")).unwrap(),
+            michelin
+        );
+    }
+
+    #[test]
+    fn maps_place_id_projection_is_merge_eligible() {
+        // The downstream consumer only clusters records on an http(s) URL that
+        // carries a path OR a query; a bare origin is dropped. The Maps
+        // projection satisfies BOTH clauses independently, so it survives either
+        // one being tightened later.
+        let projected = "https://www.google.com/maps/place/?q=place_id:ChIJN1t_tDeuEmsRUsoyG83frY4";
+        let parsed = url::Url::parse(projected).unwrap();
+        assert!(matches!(parsed.scheme(), "http" | "https"));
+        assert!(!parsed.path().trim_matches('/').is_empty(), "needs a path");
+        assert!(!parsed.query().unwrap_or("").is_empty(), "needs a query");
+
+        // And `specific_url` — the strictest gate in this file, which rejects a
+        // path-less URL outright — accepts it too.
+        let key = specific_url(projected).unwrap();
+        assert_eq!(
+            key,
+            "google.com/maps/place?q=place_id:ChIJN1t_tDeuEmsRUsoyG83frY4"
+        );
+    }
+
+    #[test]
+    fn a_bare_brand_origin_is_still_refused() {
+        // The negative control for the projection table: `domain` deliberately
+        // has no `to_url`, and this is why. `https://souvla.com` names the
+        // chain, not a location, and it is not a usable clustering anchor —
+        // exactly the record that can never collapse with anything.
+        assert!(specific_url("https://souvla.com").is_err());
+        assert_eq!(
+            registrable_domain("https://souvla.com").unwrap(),
+            "souvla.com"
+        );
+        // The escape hatch: a location page projects and clusters fine.
+        assert_eq!(
+            specific_url("https://souvla.com/hayes-valley").unwrap(),
+            "souvla.com/hayes-valley"
+        );
+    }
 }

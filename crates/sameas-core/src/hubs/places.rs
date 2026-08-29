@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::push_id;
@@ -23,8 +24,17 @@ const BASE: &str = "https://places.googleapis.com";
 /// Fields for Place Details. `websiteUri`/phone are the Enterprise SKU — required
 /// for our use. Never use the `*` wildcard mask in production.
 const DETAILS_MASK: &str = "id,displayName,websiteUri,internationalPhoneNumber,nationalPhoneNumber";
+/// Fields for [`PlaceDetailsResolver::describe`] — name + address only, so a
+/// candidate can be *labelled* without buying the Enterprise fields the crosswalk
+/// needs. Same endpoint, strictly cheaper mask.
+const DESCRIBE_MASK: &str = "id,displayName,formattedAddress";
 /// Text Search fields use the `places.` prefix (results nest under `places[]`).
-const TEXT_SEARCH_MASK: &str = "places.id,places.displayName";
+///
+/// `formattedAddress` rides along **in the same request and the same SKU tier as
+/// `displayName`**, which was already in this mask. That one word is what makes
+/// an ambiguous place list self-describing for free: without it every un-graphed
+/// candidate needs its own Place Details call to become choosable.
+const TEXT_SEARCH_MASK: &str = "places.id,places.displayName,places.formattedAddress";
 
 // ---------------------------------------------------------------------------
 // Place Details: place_id → website, phone
@@ -73,15 +83,52 @@ impl PlaceDetailsResolver {
         }
         Ok(record)
     }
+
+    /// Read just the display name + formatted address from a Place Details
+    /// response — what a human needs to tell two same-named locations apart.
+    pub fn parse_description(value: &Value) -> (Option<String>, Option<String>) {
+        let name = value
+            .get("displayName")
+            .and_then(|d| d.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+        let address = value
+            .get("formattedAddress")
+            .and_then(|a| a.as_str())
+            .filter(|a| !a.trim().is_empty())
+            .map(|s| s.to_string());
+        (name, address)
+    }
+
+    /// Fetch `(display name, formatted address)` for one candidate.
+    ///
+    /// The **only** billable per-candidate call on the ambiguity path, so it is
+    /// budgeted by the caller (see `PLACE_DETAILS_FANOUT_CAP` in
+    /// `crate::complete`) and asks for the cheap mask, not the crosswalk one.
+    pub async fn describe(&self) -> Result<(Option<String>, Option<String>)> {
+        let headers = [
+            ("X-Goog-Api-Key", self.api_key.as_str()),
+            ("X-Goog-FieldMask", DESCRIBE_MASK),
+        ];
+        let value = self
+            .transport
+            .get_json_with_headers(&self.url(), &headers)
+            .await?;
+        Ok(Self::parse_description(&value))
+    }
 }
 
+#[async_trait(?Send)]
 impl Resolver for PlaceDetailsResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
+    async fn harvest(&self) -> Result<EntityRecord> {
         let headers = [
             ("X-Goog-Api-Key", self.api_key.as_str()),
             ("X-Goog-FieldMask", DETAILS_MASK),
         ];
-        let value = self.transport.get_json_with_headers(&self.url(), &headers)?;
+        let value = self
+            .transport
+            .get_json_with_headers(&self.url(), &headers)
+            .await?;
         let mut record = Self::parse(&value)?;
         push_id(&mut record, "google_place_id", self.place_id.value());
         Ok(record)
@@ -99,6 +146,15 @@ pub enum TextSearchInput {
     Text(String),
     /// A phone number in E.164 form.
     Phone(String),
+}
+
+/// One Text Search result: the id to bind to, plus whatever the field mask
+/// returned to make it choosable.
+#[derive(Clone, Debug)]
+pub struct PlaceCandidate {
+    pub place_id: String,
+    pub name: Option<String>,
+    pub address: Option<String>,
 }
 
 pub struct PlaceTextSearchResolver {
@@ -131,15 +187,31 @@ impl PlaceTextSearchResolver {
     /// Run the search and return every candidate `place_id` (best-effort; used by
     /// the completion layer to detect ambiguity). POSTs with the api-key +
     /// field-mask headers.
-    pub(crate) fn candidates(&self) -> Result<Vec<String>> {
+    ///
+    /// `pub`, not `pub(crate)`: the ambiguity list is what a caller outside this
+    /// crate (the Worker's name route) turns into "which one did you mean?".
+    pub async fn candidates(&self) -> Result<Vec<String>> {
+        Ok(self
+            .search()
+            .await?
+            .into_iter()
+            .map(|c| c.place_id)
+            .collect())
+    }
+
+    /// Like [`Self::candidates`], but keeping the name + address the same
+    /// response already carried, so an ambiguous list is choosable without a
+    /// per-candidate Place Details call.
+    pub async fn search(&self) -> Result<Vec<PlaceCandidate>> {
         let headers = [
             ("X-Goog-Api-Key", self.api_key.as_str()),
             ("X-Goog-FieldMask", TEXT_SEARCH_MASK),
         ];
         let value = self
             .transport
-            .post_json(&self.url(), &headers, &self.body())?;
-        Self::parse_all(&value)
+            .post_json(&self.url(), &headers, &self.body())
+            .await?;
+        Ok(Self::parse_candidates(&value))
     }
 
     /// Parse a Text Search (New) response, returning the best candidate's id.
@@ -151,28 +223,47 @@ impl PlaceTextSearchResolver {
     /// An absent/empty `places` array means no match (the New API has no
     /// `ZERO_RESULTS` status — it returns 200 with no `places`).
     pub fn parse_all(value: &Value) -> Result<Vec<String>> {
-        Ok(value
+        Ok(Self::parse_candidates(value)
+            .into_iter()
+            .map(|c| c.place_id)
+            .collect())
+    }
+
+    /// Parse a Text Search (New) response into candidates, **preserving Google's
+    /// rank order**, carrying whatever display name / address the field mask
+    /// returned.
+    pub fn parse_candidates(value: &Value) -> Vec<PlaceCandidate> {
+        value
             .get("places")
             .and_then(|p| p.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|p| p.get("id").and_then(|v| v.as_str()))
-                    .map(|s| s.to_string())
+                    .filter_map(|p| {
+                        let place_id = p.get("id").and_then(|v| v.as_str())?.to_string();
+                        let (name, address) = PlaceDetailsResolver::parse_description(p);
+                        Some(PlaceCandidate {
+                            place_id,
+                            name,
+                            address,
+                        })
+                    })
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default()
     }
 }
 
+#[async_trait(?Send)]
 impl Resolver for PlaceTextSearchResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
+    async fn harvest(&self) -> Result<EntityRecord> {
         let headers = [
             ("X-Goog-Api-Key", self.api_key.as_str()),
             ("X-Goog-FieldMask", TEXT_SEARCH_MASK),
         ];
         let value = self
             .transport
-            .post_json(&self.url(), &headers, &self.body())?;
+            .post_json(&self.url(), &headers, &self.body())
+            .await?;
         let mut record = EntityRecord::default();
         if let Some(place_id) = Self::parse(&value)? {
             push_id(&mut record, "google_place_id", &place_id);
@@ -216,6 +307,41 @@ mod tests {
         // A place with no website/phone yields an empty record (not an error).
         let rec = PlaceDetailsResolver::parse(&json!({ "id": "ChIJabc" })).unwrap();
         assert!(rec.same_as.is_empty());
+    }
+
+    #[test]
+    fn text_search_candidates_carry_name_and_address() {
+        // The mask asks for formattedAddress, so an ambiguous list is choosable
+        // from the SEARCH response alone — no per-candidate Details call.
+        let v = json!({ "places": [
+            { "id": "ChIJ_hayes", "displayName": { "text": "Souvla" },
+              "formattedAddress": "517 Hayes St, San Francisco, CA 94102, USA" },
+            { "id": "ChIJ_marina", "displayName": { "text": "Souvla" },
+              "formattedAddress": "2272 Chestnut St, San Francisco, CA 94123, USA" }
+        ]});
+        let c = PlaceTextSearchResolver::parse_candidates(&v);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].place_id, "ChIJ_hayes");
+        assert_eq!(c[0].name.as_deref(), Some("Souvla"));
+        assert!(c[0].address.as_deref().unwrap().starts_with("517 Hayes St"));
+        // Same name, different address — the address is the whole disambiguator.
+        assert_eq!(c[1].name.as_deref(), Some("Souvla"));
+        assert_ne!(c[0].address, c[1].address);
+    }
+
+    #[test]
+    fn details_description_is_name_plus_address() {
+        let v = json!({
+            "id": "ChIJ_hayes",
+            "displayName": { "text": "Souvla" },
+            "formattedAddress": "517 Hayes St, San Francisco, CA 94102, USA"
+        });
+        let (name, address) = PlaceDetailsResolver::parse_description(&v);
+        assert_eq!(name.as_deref(), Some("Souvla"));
+        assert!(address.unwrap().contains("Hayes"));
+        // Blank/missing fields read as absent, never as an empty label.
+        let (n, a) = PlaceDetailsResolver::parse_description(&json!({ "formattedAddress": "  " }));
+        assert!(n.is_none() && a.is_none());
     }
 
     #[test]

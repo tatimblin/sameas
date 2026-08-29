@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::push_id;
@@ -64,8 +65,9 @@ impl TmdbResolver {
     }
 }
 
+#[async_trait(?Send)]
 impl Resolver for TmdbResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
+    async fn harvest(&self) -> Result<EntityRecord> {
         let mut record = EntityRecord::default();
         // Echo the input id up front.
         push_id(&mut record, self.input.kind_tag(), self.input.value());
@@ -73,7 +75,10 @@ impl Resolver for TmdbResolver {
         // Resolve to a TMDb movie id.
         let tmdb_id = match self.input.kind_tag() {
             "imdb" => {
-                let v = self.transport.get_json(&self.find_url(self.input.value()))?;
+                let v = self
+                    .transport
+                    .get_json(&self.find_url(self.input.value()))
+                    .await?;
                 // Capture the title + type for display (light metadata, like the
                 // name Place Details returns for a business).
                 if let Some(first) = v
@@ -98,7 +103,10 @@ impl Resolver for TmdbResolver {
         };
 
         // Crosswalk out to imdb + wikidata via external_ids.
-        let ext = self.transport.get_json(&self.external_ids_url(&tmdb_id))?;
+        let ext = self
+            .transport
+            .get_json(&self.external_ids_url(&tmdb_id))
+            .await?;
         let ext_rec = Self::parse_external_ids(&ext, &tmdb_id)?;
         for id in ext_rec.same_as {
             if !record.same_as.iter().any(|e| e == &id) {
@@ -131,8 +139,8 @@ mod tests {
         assert!(keys.contains(&"wikidata:Q83495".to_string()));
     }
 
-    #[test]
-    fn harvest_chains_find_then_external_ids() {
+    #[tokio::test]
+    async fn harvest_chains_find_then_external_ids() {
         let input = ExternalId::imdb("tt0133093").unwrap();
         let probe = TmdbResolver::new(
             input,
@@ -150,7 +158,7 @@ mod tests {
             "KEY".into(),
             Arc::new(transport),
         );
-        let rec = r.harvest().unwrap();
+        let rec = r.harvest().await.unwrap();
         let keys: Vec<String> = rec.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"tmdb:603".to_string()));
         assert!(keys.contains(&"wikidata:Q83495".to_string()));
