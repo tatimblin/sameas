@@ -13,6 +13,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = path.join(__dirname, "../../migrations");
 
 /**
+ * The `GOOGLE_PLACES_API_KEY` bound below. Not a secret and not a real key — the
+ * outbound stub only ever compares it to itself, and nothing in this config can
+ * reach the network. Its job is to prove the key travels from the Worker secret,
+ * through `PlaceTextSearchResolver`, into an `X-Goog-Api-Key` header that actually
+ * arrives — the one link in that chain no fixture test can check, because
+ * `FixtureTransport` matches on the URL and ignores headers entirely.
+ */
+const PLACES_TEST_KEY = "test-places-key-not-a-real-secret";
+
+/** The five SF Souvla locations: `[place_id, displayName, formattedAddress]`. */
+const SOUVLA_PLACES: [string, string, string][] = [
+  ["ChIJ_SOUVLA_HAYES", "Souvla", "517 Hayes St, San Francisco, CA 94102"],
+  ["ChIJ_SOUVLA_DIVIS", "Souvla", "531 Divisadero St, San Francisco, CA 94117"],
+  ["ChIJ_SOUVLA_VALENCIA", "Souvla", "758 Valencia St, San Francisco, CA 94110"],
+  ["ChIJ_SOUVLA_MARINA", "Souvla", "2272 Chestnut St, San Francisco, CA 94123"],
+  ["ChIJ_SOUVLA_FIDI", "Souvla", "101 California St, San Francisco, CA 94111"],
+];
+
+/**
  * Canned hub responses, keyed by the URL the adapter builds. `null` means "no
  * fixture" — see `outboundService` below, which turns that into a 400.
  *
@@ -86,8 +105,85 @@ export default defineConfig({
           // `FetchTransport` does not burn its retry budget on it — and the body
           // names the URL, so an unfixtured call reads as a clear miss instead of
           // a mystery. This is the only network any test can see.
-          outboundService(request: Request) {
+          async outboundService(request: Request) {
             const url = new URL(request.url);
+            // Google Places Text Search (New) — the ONLY POST-with-headers-and-body
+            // hub, and until now the only `FetchTransport` method with no coverage
+            // at all (the free hubs are GETs, and the Places branch was unreachable
+            // in tests because no `GOOGLE_PLACES_API_KEY` was bound). That gap is
+            // exactly where the Souvla staging failure lives.
+            //
+            // This stub VALIDATES rather than just answering: it checks the four
+            // things the transport has to get right and, when one is wrong, replies
+            // the way Google itself would. A `FetchTransport` bug therefore shows up
+            // as a specific `hub_error` in the test output instead of a silent
+            // empty list — which is the whole point of the change under test.
+            if (url.href === "https://places.googleapis.com/v1/places:searchText") {
+              const deny = (status: number, msg: string) =>
+                new Response(
+                  JSON.stringify({ error: { status: "DENIED", message: msg } }),
+                  { status, headers: { "content-type": "application/json" } },
+                );
+              if (request.method !== "POST") {
+                return deny(405, `expected POST, got ${request.method}`);
+              }
+              // Google 403s a request whose key header never arrived. So do we —
+              // if the header is dropped in `FetchTransport::build`, the test sees
+              // the same failure production would.
+              if (request.headers.get("x-goog-api-key") !== PLACES_TEST_KEY) {
+                return deny(403, "API key missing or not authorized");
+              }
+              // A missing/blank field mask is a 400 INVALID_ARGUMENT at Google, and
+              // is invisible to every fixture test (FixtureTransport ignores headers).
+              // NB `X-Goog-FieldMask` lowercases to `x-goog-fieldmask` — one
+              // word, no hyphen before "mask".
+              if (!request.headers.get("x-goog-fieldmask")) {
+                return deny(400, "X-Goog-FieldMask is required for this method");
+              }
+              let parsed: unknown;
+              try {
+                parsed = await request.json();
+              } catch {
+                return deny(400, "body was not JSON");
+              }
+              const q = (parsed as { textQuery?: unknown }).textQuery;
+              if (typeof q !== "string" || q.length === 0) {
+                return deny(400, `textQuery missing: ${JSON.stringify(parsed)}`);
+              }
+              if (!q.toLowerCase().includes("souvla")) {
+                return Response.json({});
+              }
+              // The five SF locations the hand-replay returns. `formattedAddress`
+              // is what makes them choosable without a Place Details call each.
+              return Response.json({
+                places: SOUVLA_PLACES.map(([id, name, address]) => ({
+                  id,
+                  displayName: { text: name },
+                  formattedAddress: address,
+                })),
+              });
+            }
+            // A hub that is REACHABLE but REFUSES us — the failure mode the
+            // `hub_error` plumbing exists for, and the one that is otherwise
+            // indistinguishable from a genuine zero-result. 403 rather than 5xx on
+            // purpose: `FetchTransport` treats 403 as non-transient, so this is
+            // exactly one outbound attempt and the test does not depend on retry
+            // timing. Body shaped like Google's PERMISSION_DENIED so the assertion
+            // about the snippet reaching the caller is about a realistic string.
+            if (
+              url.hostname === "www.wikidata.org" &&
+              (url.searchParams.get("search") ?? "").toLowerCase() === "forbidden"
+            ) {
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    status: "PERMISSION_DENIED",
+                    message: "Requests from referer <empty> are blocked.",
+                  },
+                }),
+                { status: 403, headers: { "content-type": "application/json" } },
+              );
+            }
             const fixture = hubFixture(url);
             if (fixture) {
               return Response.json(fixture);

@@ -34,6 +34,18 @@ migrations_dir = "../../migrations"
 [vars]
 HUB_DAILY_BUDGET = "200"
 
+# `invocation_logs = false` suppresses only the per-invocation `cf-worker-event`
+# record (request/response metadata, wall + CPU time). CUSTOM logs are a separate
+# feature of the same dataset, so `console_warn!` / `console_error!` from the
+# Worker ARE still ingested, indexed and queryable through the Workers
+# Observability API with this exactly as it stands — turning invocation logs on is
+# not required to see them, and it has a per-invocation cost.
+#
+# The one thing it does cost: a custom log has no sibling invocation record, so
+# nothing external supplies the request URL, status or timing. Custom log lines
+# here must therefore be SELF-SUFFICIENT — see the `hub_error` warn in
+# `services/handlers.rs`, which carries the hub, the quota bucket, the calls-today
+# count and the input description in the message itself for that reason.
 [observability.logs]
 enabled = true
 invocation_logs = false

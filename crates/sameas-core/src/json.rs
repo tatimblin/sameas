@@ -88,6 +88,17 @@ pub fn resolve_output_json(out: &ResolveOutput, action: &str) -> Value {
         "confidence_reason": reason_tag(&out.confidence_reason),
         "matched_via": out.matched_via,
         "hint": out.hint,
+        // ADDITIVE, and `null` on the overwhelming majority of answers. Present
+        // means an external hub call failed while producing this document: the
+        // answer stands, but it was computed on less than the full evidence.
+        //
+        // Emitted unconditionally (rather than omitted when absent) for the same
+        // reason `sameAs_urls` is: a consumer must be able to tell "this server
+        // reports hub failures and there was none" from "this server predates the
+        // field", and `undefined` conflates them.
+        //
+        // Already secret-redacted at the transport — see `transport::redact_url`.
+        "hub_error": out.hub_error,
         "sameAs": same_as,
         "sameAs_urls": same_as_urls,
         "provenance": provenance,
@@ -122,6 +133,7 @@ mod tests {
             candidates,
             hint: None,
             provenance: vec![],
+            hub_error: None,
         }
     }
 

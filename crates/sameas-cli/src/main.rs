@@ -544,6 +544,12 @@ fn print_pretty(out: &ResolveOutput, action: &str) {
     if let Some(hint) = &out.hint {
         println!("  {:<12} {}", "hint:", hint);
     }
+    // Printed for the same reason it is on the wire: an empty candidate list that
+    // came from a 403 must not look like an empty candidate list that came from
+    // the hub. `--json` carries it too.
+    if let Some(err) = &out.hub_error {
+        println!("  {:<12} {}", "hub_error:", err);
+    }
     println!(
         "  {:<12} {} identifiers",
         "completion:",
