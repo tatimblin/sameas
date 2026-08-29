@@ -79,6 +79,15 @@ signal for the calling app. Type-agnostic — works for any schema.org Thing.
   `confidence_reason` (`exact_strong_key`, `hub_crosswalk`, `placekey_city_only`,
   `ambiguous_among_n`, `needs_stronger_identifier`, …). A low score says *what to
   fix*, so an app can ask its user for a stronger identifier and re-resolve.
+- **Best-effort hubs, *reported* failures** (`hub_error`) — an external hub that
+  is down, denies our key, or rate-limits us never fails a resolution: whatever
+  the local graph knows is still returned. But the failure is no longer silent.
+  `hub_error` carries the transport's own classification (auth / not-found /
+  rate-limited / decode, plus a body snippet, API keys redacted) out to the
+  caller, and a refusal caused by a hub outage says so in its `hint` instead of
+  telling the user to supply a better identifier for a lookup that never
+  happened. Absent/`null` on a healthy answer; present does **not** imply
+  failure overall — pair it with `status`.
 
 Deferred to a later milestone: `link`/`merge`/`split` corrections and miss-rate
 metrics (`sameas stats`). Fuzzy/name-based matching stays deferred and

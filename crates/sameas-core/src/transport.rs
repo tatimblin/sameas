@@ -49,6 +49,38 @@ pub trait HttpTransport {
     async fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value>;
 }
 
+/// Rewrite every [`SECRET_PARAMS`] value in a URL's query string to `REDACTED`,
+/// preserving everything else verbatim.
+///
+/// **Load-bearing, not cosmetic.** Hub error messages embed the request URL
+/// (`GET {url}: authentication/authorization denied …`), and TMDb carries its key
+/// as a `?api_key=` query parameter (see `hubs::tmdb_search::url`). Those messages
+/// are now reported to the caller as `ResolveOutput::hub_error` and travel all the
+/// way out to an MCP error envelope — i.e. to an agent, and to whoever is reading
+/// its output. Without this, the first TMDb 401 we ever diagnosed would have
+/// printed our TMDb key to a user.
+///
+/// Applied at the point the error string is *built* (both live transports) rather
+/// than at the point it is displayed, so a future caller that logs a hub error
+/// cannot reintroduce the leak by forgetting to redact.
+///
+/// Google Places and Placekey pass their keys as headers, and headers are never
+/// interpolated into a message — this covers the one kind of key that is in a URL.
+pub fn redact_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let redacted = query
+        .split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some((k, _)) if SECRET_PARAMS.contains(&k) => format!("{k}=REDACTED"),
+            _ => kv.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{redacted}")
+}
+
 /// A canonical, secret-free signature of a request, used as the fixture key.
 /// Format: `METHOD host+path?sorted-non-secret-query`. The body is deliberately
 /// ignored (Placekey's body varies by name/address; the endpoint alone is a
@@ -318,8 +350,8 @@ impl HttpTransport for ReqwestTransport {
                 req
             })
             .await
-            .map_err(|e| anyhow!("GET {url}: {e}"))?;
-        Self::read_json(resp, &format!("GET {url}")).await
+            .map_err(|e| anyhow!("GET {}: {e}", redact_url(url)))?;
+        Self::read_json(resp, &format!("GET {}", redact_url(url))).await
     }
 
     async fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value> {
@@ -332,8 +364,8 @@ impl HttpTransport for ReqwestTransport {
                 req
             })
             .await
-            .map_err(|e| anyhow!("POST {url}: {e}"))?;
-        Self::read_json(resp, &format!("POST {url}")).await
+            .map_err(|e| anyhow!("POST {}: {e}", redact_url(url)))?;
+        Self::read_json(resp, &format!("POST {}", redact_url(url))).await
     }
 }
 
@@ -397,9 +429,10 @@ impl FetchTransport {
         use wasm_bindgen::JsValue;
 
         let mut h = worker::Headers::new();
+        let safe = redact_url(url);
         let mut set = |k: &str, v: &str| -> Result<()> {
             h.set(k, v)
-                .map_err(|e| anyhow!("building request for {url}: header {k}: {e}"))
+                .map_err(|e| anyhow!("building request for {safe}: header {k}: {e}"))
         };
         set("Accept", "application/json")?;
         set("User-Agent", user_agent!("workers-rs"))?;
@@ -408,7 +441,7 @@ impl FetchTransport {
                 set("Content-Type", "application/json")?;
                 Some(
                     serde_json::to_string(v)
-                        .map_err(|e| anyhow!("building request for {url}: serializing body: {e}"))?,
+                        .map_err(|e| anyhow!("building request for {safe}: serializing body: {e}"))?,
                 )
             }
             None => None,
@@ -425,7 +458,7 @@ impl FetchTransport {
             init.with_body(Some(JsValue::from_str(&s)));
         }
         worker::Request::new_with_init(url, &init)
-            .map_err(|e| anyhow!("building request for {url}: {e}"))
+            .map_err(|e| anyhow!("building request for {safe}: {e}"))
     }
 
     async fn send(
@@ -437,7 +470,9 @@ impl FetchTransport {
     ) -> Result<Value> {
         use std::time::Duration;
 
-        let what = format!("{method} {url}");
+        // Redacted: `what` is the prefix of every error this call can produce, and
+        // those errors are surfaced to the caller as `ResolveOutput::hub_error`.
+        let what = format!("{method} {}", redact_url(url));
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -533,6 +568,37 @@ mod tests {
         assert_eq!(a, b);
         assert!(!a.contains("SECRET"));
         assert!(a.contains("place_id=ChIJ"));
+    }
+
+    #[test]
+    fn redact_url_keeps_the_diagnostic_and_drops_the_key() {
+        // TMDb is the one hub with its key in the URL, so this is the string that
+        // would otherwise reach an agent inside `hub_error`.
+        let out = redact_url(
+            "https://api.themoviedb.org/3/search/multi?query=Avatar&include_adult=false&api_key=sk-live-123",
+        );
+        assert!(!out.contains("sk-live-123"), "the key must not survive: {out}");
+        assert!(out.contains("api_key=REDACTED"));
+        // Everything that makes the message useful is preserved verbatim.
+        assert!(out.contains("query=Avatar"));
+        assert!(out.contains("include_adult=false"));
+        assert!(out.starts_with("https://api.themoviedb.org/3/search/multi?"));
+    }
+
+    #[test]
+    fn redact_url_is_total_on_urls_with_no_query() {
+        // Google Places posts to a bare path and carries its key in a header.
+        let url = "https://places.googleapis.com/v1/places:searchText";
+        assert_eq!(redact_url(url), url);
+        assert_eq!(redact_url(""), "");
+    }
+
+    #[test]
+    fn redact_url_covers_every_secret_param_name() {
+        for p in SECRET_PARAMS {
+            let out = redact_url(&format!("https://h/x?{p}=SECRET"));
+            assert!(!out.contains("SECRET"), "{p} leaked: {out}");
+        }
     }
 
     #[tokio::test]

@@ -13,10 +13,19 @@
 //! parses, validates or interprets it, and stores it in `hub_budget` and nowhere
 //! else. sameas must not know what a DID is (PROJECT_GOALS non-goal #3).
 //!
-//! **Reserved before the call, not after.** A hub call that fails still cost a
-//! subrequest and, for Places, may still have been billed — so the counter is
-//! incremented up front and never refunded. Over-counting a failure is the safe
+//! **Reserved before the call, not after, and never refunded.** A hub call that
+//! fails still cost a subrequest and, for Places, may still have been billed — so
+//! the counter is incremented up front. Over-counting a failure is the safe
 //! direction; under-counting is how a retry loop spends a month's budget.
+//!
+//! The no-refund half of that used to be forced: a hub failure was swallowed by
+//! `.unwrap_or_default()` in `sameas-core`, so the handler could not have refunded
+//! selectively even if it wanted to — it never learned that anything had gone
+//! wrong. `ResolveOutput::hub_error` removes that constraint, and the policy is
+//! kept anyway, on purpose. The full argument lives at the reservation site in
+//! `handlers::resolve_name` (step 2c); the short version is that this counter
+//! meters attempts to spend rather than answers received, and refunding would make
+//! a *broken* hub the cheapest one to hammer.
 //!
 //! **This is the kill switch.** `HUB_DAILY_BUDGET = "0"` denies every bucket, which
 //! stops all outbound hub spend without deleting secrets or redeploying.

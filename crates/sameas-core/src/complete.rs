@@ -353,6 +353,7 @@ fn ambiguous_output(query: &NameQuery, mut candidates: Vec<Candidate>) -> Resolv
         confidence_reason: reason,
         candidates,
         provenance: Vec::new(),
+        hub_error: None,
         hint,
     }
 }
@@ -363,6 +364,67 @@ fn append_hint(out: &mut ResolveOutput, extra: String) {
         Some(existing) => format!("{existing}; {extra}"),
         None => extra,
     });
+}
+
+/// The `hub_error` string for a failed candidate lookup: which hub, then the
+/// transport's own classification chain.
+///
+/// `{e:#}` (alternate) rather than `{e}` on purpose — anyhow's alternate Display
+/// walks the whole cause chain, and the classification (`authentication/
+/// authorization denied (HTTP 403): <body snippet>`) is produced by
+/// `transport::…::read_json` at the *bottom* of that chain. Plain `{e}` would print
+/// only the outermost context and flatten exactly the detail this exists to
+/// preserve. The URL inside is already secret-redacted by the transport.
+fn hub_failure(hub: NameHub, e: &anyhow::Error) -> String {
+    format!("{}: {e:#}", hub.tag())
+}
+
+/// The sentence that replaces "supply a stronger identifier" when the lookup
+/// itself is what failed.
+///
+/// Kept separate from [`crate::resolve`]'s hint because it says the opposite
+/// thing: that one is a true statement about the caller's input, this one is an
+/// admission that we never got far enough to have an opinion about their input.
+const HUB_FAILED_HINT: &str = "the external lookup FAILED, so this is not a verdict about what \
+     you supplied — nothing was checked against the hub and nothing was written. See `hub_error` \
+     for the underlying failure. Retrying may succeed; if it does not, this is an outage or a \
+     misconfiguration on our side, not a missing identifier on yours.";
+
+/// Attach a captured hub failure to an answer, and stop that answer from blaming
+/// the caller for it.
+///
+/// Two distinct jobs, deliberately in one place so they cannot drift apart:
+///
+/// 1. **Report.** `hub_error` rides out on every answer the failure touched, even
+///    a successful one (a Text Search can 403 while a Placekey still resolves the
+///    entity — the answer is right, but it was computed on less evidence and the
+///    operator still needs to know the hub is down).
+/// 2. **Stop the lie.** An `Unresolved` answer with no candidates otherwise
+///    carries `hub_miss`'s "…returned no match for this name — supply an
+///    identifier", which asserts a fact about the world that we did not learn.
+///    That sentence is *replaced*, not appended to: leaving it in place and adding
+///    a caveat still leads with the accusation, and the consumer's user-facing
+///    message is usually the first sentence.
+///
+/// When candidates ARE present the existing hint is kept and the notice appended:
+/// that hint carries real information (e.g. the Place Details fan-out shortfall)
+/// and the answer is genuinely a choose-one, not a failure.
+///
+/// `confidence_reason` is deliberately NOT changed. It is a frozen wire tag that
+/// consumers switch on, and `needs_stronger_identifier` still describes the shape
+/// of the answer (unresolved, nothing to choose from). The *machine-readable*
+/// "was this our fault" signal is the presence of `hub_error`; the hint is the
+/// human-readable one.
+fn apply_hub_error(out: &mut ResolveOutput, hub_error: Option<String>) {
+    let Some(err) = hub_error else { return };
+    if out.status == Status::Unresolved {
+        if out.candidates.is_empty() {
+            out.hint = Some(HUB_FAILED_HINT.to_string());
+        } else {
+            append_hint(out, HUB_FAILED_HINT.to_string());
+        }
+    }
+    out.hub_error = Some(err);
 }
 
 /// A structured "not found in the local graph" result — used when a name query
@@ -384,6 +446,7 @@ pub fn name_not_found(query: &NameQuery) -> ResolveOutput {
         confidence_reason: reason,
         candidates: Vec::new(),
         provenance: Vec::new(),
+        hub_error: None,
         hint: Some(
             "not in local graph — re-run with --complete to reach external hubs".into(),
         ),
@@ -483,6 +546,21 @@ async fn resolve_name_places(
     query: &NameQuery,
     ctx: &CompletionCtx,
 ) -> Result<ResolveOutput> {
+    // The inner function keeps its half-dozen early returns; the capture is applied
+    // once, here, so a new `return Ok(...)` inside it cannot forget to carry the
+    // failure — which is precisely how `.unwrap_or_default()` stayed invisible.
+    let mut hub_error: Option<String> = None;
+    let mut out = places_branch(graph, query, ctx, &mut hub_error).await?;
+    apply_hub_error(&mut out, hub_error);
+    Ok(out)
+}
+
+async fn places_branch(
+    graph: &dyn GraphStore,
+    query: &NameQuery,
+    ctx: &CompletionCtx,
+    hub_error: &mut Option<String>,
+) -> Result<ResolveOutput> {
     let name = query.match_name();
     let quals = query.establishing_qualifiers();
 
@@ -494,7 +572,13 @@ async fn resolve_name_places(
         ctx.google_key.clone(),
         ctx.transport.clone(),
     );
-    let places: Vec<PlaceCandidate> = ts.search().await.unwrap_or_default();
+    // Best-effort, but no longer SILENT: a 403 from a referrer-restricted key and
+    // a genuine "Google knows of no such place" both used to arrive here as an
+    // empty vec, and the caller was told the second one either way.
+    let places: Vec<PlaceCandidate> = ts.search().await.unwrap_or_else(|e| {
+        *hub_error = Some(hub_failure(NameHub::Places, &e));
+        Vec::new()
+    });
 
     // Ambiguous on the place itself: refuse to commit a place_id (and keep the
     // Placekey out, to avoid a half-built entity). Ask for a stronger query.
@@ -601,12 +685,26 @@ async fn resolve_name_search(
     ctx: &CompletionCtx,
     hub: NameHub,
 ) -> Result<ResolveOutput> {
+    // Same shape as the places branch — see `resolve_name_places`.
+    let mut hub_error: Option<String> = None;
+    let mut out = search_branch(graph, query, ctx, hub, &mut hub_error).await?;
+    apply_hub_error(&mut out, hub_error);
+    Ok(out)
+}
+
+async fn search_branch(
+    graph: &dyn GraphStore,
+    query: &NameQuery,
+    ctx: &CompletionCtx,
+    hub: NameHub,
+    hub_error: &mut Option<String>,
+) -> Result<ResolveOutput> {
     let name = query.match_name();
     let quals = query.establishing_qualifiers();
     let text = query.name.clone().unwrap_or_default();
 
     // Best-effort, like every other hub call: a hub failure is a miss, not an
-    // error that fails the whole resolution.
+    // error that fails the whole resolution — but it is now a *reported* miss.
     let found: Vec<HubCandidate> = match hub {
         NameHub::Tmdb => {
             TmdbSearchResolver::new(text, ctx.tmdb_key.clone(), ctx.transport.clone())
@@ -619,7 +717,10 @@ async fn resolve_name_search(
                 .await
         }
     }
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        *hub_error = Some(hub_failure(hub, &e));
+        Vec::new()
+    });
 
     let found = narrow_by_qualifiers(found, &quals);
 
@@ -815,6 +916,7 @@ fn hub_miss(query: &NameQuery, hub: NameHub) -> ResolveOutput {
         confidence_reason: reason,
         candidates: Vec::new(),
         provenance: Vec::new(),
+        hub_error: None,
         hint: Some(format!(
             "{} returned no match for this name — supply an identifier (a URL or a {}: id)",
             hub.tag(),
@@ -2155,4 +2257,184 @@ mod tests {
         assert!(out.hint.is_none(), "nothing dropped: {:?}", out.hint);
     }
 
+    // -----------------------------------------------------------------------
+    // Hub failures are REPORTED, not swallowed
+    //
+    // The bug these cover: `.unwrap_or_default()` mapped every hub error onto an
+    // empty candidate list, which is byte-identical to the hub answering "I know
+    // of nothing by that name". Publishing a Souvla review with only
+    // `sameAs: ["https://souvla.com"]` therefore came back as a confident
+    // `needs_stronger_identifier` — blaming the author — when what actually
+    // happened was that the Places call never succeeded.
+    // -----------------------------------------------------------------------
+
+    /// A transport whose every request fails with exactly the error the live
+    /// transports build, classification and body snippet included.
+    ///
+    /// Not `FixtureTransport` with an empty table: its "no fixture for request …"
+    /// error is a *test-harness* message, so a test built on it would prove only
+    /// that some string arrives — not that the auth/not-found/rate-limited
+    /// classification survives the trip. This mirrors `read_json`'s output, which
+    /// is the thing that has to reach the caller intact.
+    struct FailingTransport {
+        message: String,
+    }
+
+    impl FailingTransport {
+        /// The verbatim shape of a `FetchTransport`/`ReqwestTransport` 403 — the
+        /// leading hypothesis for the staging failure (a referrer/IP-restricted
+        /// Google key that works from a laptop and is denied from Cloudflare's
+        /// edge).
+        fn denied() -> Arc<dyn HttpTransport> {
+            Arc::new(FailingTransport {
+                message: "POST https://places.googleapis.com/v1/places:searchText: \
+                          authentication/authorization denied (HTTP 403): \
+                          {\"error\":{\"status\":\"PERMISSION_DENIED\",\"message\":\
+                          \"Requests from referer <empty> are blocked.\"}}"
+                    .into(),
+            })
+        }
+
+        fn rate_limited() -> Arc<dyn HttpTransport> {
+            Arc::new(FailingTransport {
+                message: "GET https://www.wikidata.org/w/api.php?action=wbsearchentities: \
+                          rate limited (HTTP 429): slow down"
+                    .into(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl HttpTransport for FailingTransport {
+        async fn get_json(&self, _url: &str) -> Result<serde_json::Value> {
+            Err(anyhow::anyhow!("{}", self.message))
+        }
+        async fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Err(anyhow::anyhow!("{}", self.message))
+        }
+    }
+
+    /// The Souvla replay, at the layer where the bug lives.
+    #[tokio::test]
+    async fn a_failing_places_search_is_reported_and_does_not_blame_the_caller() {
+        let g = SqliteStore::open_in_memory().unwrap();
+        let query = NameQuery {
+            entity_type: Some("info.cursive.organization.restaurant".into()),
+            name: Some("Souvla".into()),
+            city: Some("San Francisco".into()),
+            ..Default::default()
+        };
+        let ctx = CompletionCtx::new(FailingTransport::denied());
+        let out = resolve_name(&g, &query, &ctx).await.unwrap();
+
+        // 1. Resolution still SUCCEEDS as an operation — best-effort semantics are
+        //    preserved. It just could not resolve anything.
+        assert_eq!(out.status, Status::Unresolved);
+        assert!(out.canonical_id.is_none());
+
+        // 2. The failure is reported, with the transport's classification intact
+        //    rather than flattened to "hub failed".
+        let err = out.hub_error.expect("a 403 must reach the caller");
+        assert!(err.starts_with("google_places:"), "names the hub: {err}");
+        assert!(err.contains("HTTP 403"), "keeps the status: {err}");
+        assert!(
+            err.contains("authentication/authorization denied"),
+            "keeps the CLASS: {err}"
+        );
+        assert!(
+            err.contains("Requests from referer"),
+            "keeps the body snippet — the part that identifies WHICH restriction \
+             rejected us: {err}"
+        );
+
+        // 3. And it does NOT tell the author their identifier was too weak.
+        let hint = out.hint.expect("a failure must still explain itself");
+        assert!(
+            !hint.contains("supply an identifier") && !hint.contains("Supply an identifier"),
+            "the caller is not at fault here: {hint}"
+        );
+        assert!(hint.contains("FAILED"), "{hint}");
+        assert!(hint.contains("hub_error"), "points at the detail: {hint}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_free_hub_search_is_reported_too() {
+        // The TMDb/Wikidata branch is a separate call site and regressed
+        // independently; `hub_miss`'s "returned no match for this name — supply an
+        // identifier" is the sentence being replaced here.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Avatar".into()),
+            ..Default::default()
+        };
+        let ctx = CompletionCtx::new(FailingTransport::rate_limited());
+        let out = resolve_name(&g, &query, &ctx).await.unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        let err = out.hub_error.expect("a 429 must reach the caller");
+        assert!(err.starts_with("wikidata:"), "{err}");
+        assert!(err.contains("rate limited (HTTP 429)"), "{err}");
+        let hint = out.hint.expect("hint");
+        assert!(
+            !hint.contains("returned no match"),
+            "the hub said nothing at all — claiming it reported a miss is a lie: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_genuine_zero_result_is_still_a_clean_miss() {
+        // The other half of the distinction: when the hub really does answer and
+        // really does know nothing, `hub_error` stays absent and the "supply an
+        // identifier" advice is CORRECT and must survive. A change that reported a
+        // hub_error on every miss would be just as useless as reporting none.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let query = NameQuery {
+            name: Some("Nonesuch".into()),
+            ..Default::default()
+        };
+        let url = WikidataSearchResolver::new(
+            "Nonesuch",
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .url();
+        let transport =
+            FixtureTransport::from_pairs(vec![("GET", &url, json!({"search": []}))]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let out = resolve_name(&g, &query, &ctx).await.unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert!(
+            out.hub_error.is_none(),
+            "the hub answered; nothing failed: {:?}",
+            out.hub_error
+        );
+        assert!(out.hint.unwrap().contains("supply an identifier"));
+    }
+
+    #[tokio::test]
+    async fn hub_error_reaches_the_wire_document() {
+        // End of the core's own leg: whatever `resolve_name` captured has to be in
+        // the JSON both front-ends emit, or none of the above is observable.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let query = NameQuery {
+            entity_type: Some("restaurant".into()),
+            name: Some("Souvla".into()),
+            ..Default::default()
+        };
+        let ctx = CompletionCtx::new(FailingTransport::denied());
+        let out = resolve_name(&g, &query, &ctx).await.unwrap();
+        let doc = crate::json::resolve_output_json(&out, "resolve_name");
+        assert!(
+            doc["hub_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("HTTP 403"),
+            "hub_error must be on the wire: {doc}"
+        );
+    }
 }

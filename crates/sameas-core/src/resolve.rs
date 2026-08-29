@@ -112,6 +112,30 @@ pub struct ResolveOutput {
     /// Per-member edge provenance: `(key, source)`, e.g.
     /// `("wikidata:Q83495", Some("wikidata"))`.
     pub provenance: Vec<(String, Option<String>)>,
+    /// A **non-fatal** external-hub failure that degraded this answer.
+    ///
+    /// Hub calls are best-effort by contract: a hub that is down must not fail the
+    /// whole resolution, because everything the local graph already knows is still
+    /// a valid answer. But `.unwrap_or_default()` made "the hub 403'd" and "the hub
+    /// genuinely knows of nothing" the *same* observation — an empty candidate list
+    /// — so a broken key or a blocked egress IP presented as a confident
+    /// `needs_stronger_identifier` verdict, and the only way to tell them apart was
+    /// to replay the request by hand. This field is the difference.
+    ///
+    /// **A string, not an enum.** `read_json` in [`crate::transport`] already
+    /// classifies the failure (auth / not-found / rate-limited / decode / other)
+    /// with the method, the redacted URL and a body snippet; re-encoding that as a
+    /// Rust enum would mean parsing our own message back into a taxonomy, i.e. a
+    /// second source of truth that can silently disagree with the transport's. It
+    /// is also the shape the consumer needs: agent-web's `sanitizeContext` keeps
+    /// scalars and *drops* nested objects, so a struct would arrive as nothing at
+    /// all. The string is pre-redacted at the transport (see
+    /// [`crate::transport::redact_url`]) — never interpolate a raw hub URL here.
+    ///
+    /// Set is not the same as failed-overall: a resolution can succeed on a
+    /// Placekey while the Text Search errored. Read it as "this answer was
+    /// computed with less than the full evidence", and pair it with `status`.
+    pub hub_error: Option<String>,
 }
 
 /// Anything that can produce a record to resolve.
@@ -271,6 +295,7 @@ pub async fn commit_record_with_opts(
             confidence_reason: reason,
             candidates,
             provenance: Vec::new(),
+            hub_error: None,
             hint: None,
         });
     }
@@ -345,6 +370,7 @@ pub async fn commit_record_with_opts(
             confidence_reason: reason,
             candidates,
             provenance: Vec::new(),
+            hub_error: None,
             hint,
         });
     }
@@ -524,6 +550,7 @@ pub async fn commit_record_with_opts(
         confidence_reason: reason,
         candidates: Vec::new(),
         provenance,
+        hub_error: None,
         hint: None,
     })
 }
@@ -590,6 +617,7 @@ pub async fn load_entity(graph: &dyn GraphStore, canonical_id: &str) -> Result<R
         confidence_reason: ConfidenceReason::DirectLookup,
         candidates: Vec::new(),
         provenance,
+        hub_error: None,
         hint: None,
     })
 }

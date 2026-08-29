@@ -37,6 +37,7 @@ interface NameResponse {
   confidence_reason: string;
   hint: string | null;
   identifier_hint: string | null;
+  hub_error: string | null;
   sameAs: string[];
   sameAs_urls: string[];
   candidates: Candidate[];
@@ -344,6 +345,139 @@ it("a hub that finds nothing is a reported miss, not an error", async () => {
   expect(json.confidence_reason).toBe("needs_stronger_identifier");
   expect(json.hub_called).toBe(true);
   expect(await entityCount()).toBe(0);
+});
+
+it("a hub that finds nothing reports NO hub_error", async () => {
+  // The control for the two tests below. A miss and a failure are both
+  // `unresolved` + `needs_stronger_identifier` + zero candidates; `hub_error` is
+  // the ONLY thing that separates them, so it has to be absent here.
+  const { json } = await resolveName({ name: "Nothing At All Here" });
+  expect(json.hub_error).toBeNull();
+  expect(json.hint).toContain("supply an identifier");
+});
+
+it("a hub that REFUSES us says so, and does not blame the caller", async () => {
+  // The staging bug, end to end through the real FetchTransport: the hub is
+  // reached, denies the request, and the route used to hand back a confident
+  // "supply a stronger identifier" with an empty candidate list — the exact
+  // shape a genuine zero-result has.
+  const { res, json } = await resolveName({ name: "Forbidden" });
+
+  // Still a 200 with a usable document: a hub outage is non-fatal by contract.
+  expect(res.status).toBe(200);
+  expect(json.status).toBe("unresolved");
+  expect(json.hub_called).toBe(true);
+  expect(json.candidates).toHaveLength(0);
+  expect(await entityCount()).toBe(0);
+
+  // The classification survives the whole trip — hub tag, HTTP status, error
+  // class and body snippet — rather than being flattened to "hub failed".
+  expect(json.hub_error).toBeTruthy();
+  expect(json.hub_error).toContain("wikidata:");
+  expect(json.hub_error).toContain("HTTP 403");
+  expect(json.hub_error).toContain("authentication/authorization denied");
+  expect(json.hub_error).toContain("Requests from referer");
+
+  // And the hint no longer tells the user to supply a better identifier for a
+  // lookup that never happened.
+  expect(json.hint).toBeTruthy();
+  expect(json.hint?.toLowerCase()).not.toContain("supply an identifier");
+  expect(json.hint).toContain("FAILED");
+});
+
+// --- The Google Places POST path ---------------------------------------------
+//
+// Everything above this line that reaches a hub reaches it with a GET (the free
+// hubs). Google Places Text Search is a POST carrying an `X-Goog-Api-Key` header,
+// an `X-Goog-FieldMask` header and a JSON body — and it is the call the Souvla
+// publish actually made. It had NO coverage anywhere: `FixtureTransport` matches
+// on the URL and ignores headers, so no core test can see a dropped key header,
+// and the Worker suite could not reach the branch at all because no
+// `GOOGLE_PLACES_API_KEY` was bound.
+//
+// `GOOGLE_PLACES_API_KEY` is set per-test rather than in the miniflare bindings so
+// the "a hub whose key is absent is not called" test above keeps meaning what it
+// says. The stub in vitest.config.mts answers a malformed request the way Google
+// would, so a transport bug surfaces as a specific `hub_error`.
+async function withPlacesKey<T>(fn: () => Promise<T>): Promise<T> {
+  const e = env as unknown as Record<string, string | undefined>;
+  const previous = e.GOOGLE_PLACES_API_KEY;
+  e.GOOGLE_PLACES_API_KEY = "test-places-key-not-a-real-secret";
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete e.GOOGLE_PLACES_API_KEY;
+    else e.GOOGLE_PLACES_API_KEY = previous;
+  }
+}
+
+it("the Souvla publish returns the five locations to pick from", async () => {
+  // The bug this whole feature exists to fix, replayed at the route: a review
+  // carrying only the brand domain must come back AMBIGUOUS with a choosable
+  // list, not `needs_stronger_identifier` with nothing in it.
+  const { json } = await withPlacesKey(() =>
+    resolveName({
+      name: "Souvla",
+      entity_type: "restaurant",
+      city: "San Francisco",
+      identifiers: ["https://souvla.com"],
+    }).then((r) => r),
+  );
+
+  // No hub_error: the POST — key header, field mask, JSON body — was built
+  // correctly and accepted. This is the assertion that exonerates (or convicts)
+  // `FetchTransport::post_json`, which nothing else in either repo exercises.
+  expect(json.hub_error).toBeNull();
+
+  expect(json.status).toBe("unresolved");
+  expect(json.confidence_reason).toBe("ambiguous_among_n");
+  expect(json.candidates).toHaveLength(5);
+  // Choosable: the address is what tells one branch of a chain from another.
+  expect(json.candidates[0].name).toContain("517 Hayes St");
+  expect(json.candidates[0].anchor).toBe("google_place_id:ChIJ_SOUVLA_HAYES");
+  expect(json.candidates[0].url).toContain("ChIJ_SOUVLA_HAYES");
+  // Step 1's "souvla.com is a brand" sentence still rides along.
+  expect(json.identifier_hint).toContain("brand");
+  // Refusing to guess means nothing was written.
+  expect(await entityCount()).toBe(0);
+});
+
+it("a Places key the hub rejects is reported, not silently empty", async () => {
+  // The leading hypothesis for the staging failure: a key that works from a
+  // laptop and is denied from Cloudflare's edge. The stub 403s any request whose
+  // `X-Goog-Api-Key` is not the expected one, so this is that failure exactly.
+  const e = env as unknown as Record<string, string | undefined>;
+  e.GOOGLE_PLACES_API_KEY = "a-key-google-does-not-accept";
+  try {
+    const { json } = await resolveName({
+      name: "Souvla",
+      entity_type: "restaurant",
+      identifiers: ["https://souvla.com"],
+    });
+    expect(json.hub_called).toBe(true);
+    expect(json.candidates).toEqual([]);
+    expect(json.hub_error).toContain("google_places:");
+    expect(json.hub_error).toContain("HTTP 403");
+    expect(json.hub_error).toContain("API key missing or not authorized");
+    // The response no longer reads as a verdict on the author's identifier.
+    expect(json.hint).toContain("FAILED");
+    expect(json.hint?.toLowerCase()).not.toContain("supply an identifier");
+  } finally {
+    delete e.GOOGLE_PLACES_API_KEY;
+  }
+});
+
+it("a failed hub call still consumes budget — the deliberate no-refund policy", async () => {
+  // Reserved before the call and never given back. The counter meters attempts
+  // to spend, not answers received: we cannot know what the hub billed, and
+  // refunding would make a BROKEN hub the cheapest one to retry against. The
+  // cost of the policy is bounded (one day of one bucket's allowance) and is now
+  // visible in the same response, via `hub_error`.
+  expect(await budgetUsed()).toBe(0);
+  const { json } = await resolveName({ name: "Forbidden" });
+  expect(json.hub_error).toBeTruthy();
+  expect(json.hub_calls_today).toBe(1);
+  expect(await budgetUsed()).toBe(1);
 });
 
 // --- The budget --------------------------------------------------------------

@@ -371,6 +371,33 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
 
     // 2c. Per-caller daily budget. Fail CLOSED on any failure to account: an
     //     unreadable budget table means unmetered spend on a billable hub.
+    //
+    //     **A failed hub call is NOT refunded.** Now that `hub_error` exists the
+    //     refund is finally implementable — the failure is observable at exactly
+    //     the point the reservation is held — so this is a decision, not an
+    //     omission. Three reasons it stays a charge:
+    //
+    //       * The counter meters *attempts to spend*, not answers received. It
+    //         cannot know what was billed: Google bills Text Search per accepted
+    //         request, the classes we would refund (403, 429, 5xx, decode) are the
+    //         ones whose billing status we are least sure of, and a decode error
+    //         is a call that was served and paid for. Refunding on our own read of
+    //         the response is guessing at Google's invoice.
+    //       * Refunding makes a *broken* hub the cheapest thing to call. Every
+    //         retry against a 403ing key would cost zero budget, so the one
+    //         failure mode where a client will retry hardest is the one with no
+    //         backpressure at all — burning subrequests and `FetchTransport`'s
+    //         retry/backoff wall clock inside every request, unbounded.
+    //       * The cost of NOT refunding is bounded and now diagnosable: the caller
+    //         loses some of a daily allowance, sees `hub_error` in the same
+    //         response saying why, and the operator sees the `console_warn!`. The
+    //         cost of refunding is an unbounded loop against a hub we cannot bill
+    //         for. Bounded-and-visible beats unbounded-and-quiet.
+    //
+    //     The lever for the "our bug ate the user's quota" case is deliberately
+    //     operational rather than automatic: fix the key, or set
+    //     `HUB_DAILY_BUDGET = "0"` to stop the bleeding, then let the UTC-day
+    //     rollover restore the allowance.
     let configured = env.var("HUB_DAILY_BUDGET").ok().map(|v| v.to_string());
     let limit = budget::parse_limit(configured.as_deref());
     let day = budget::utc_day(Date::now().as_millis() as f64);
@@ -405,6 +432,32 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
 
     match sameas_core::resolve_name(&g, &parsed.query, &ctx).await {
         Ok(out) => {
+            // A hub failure comes back as `Ok` — it is non-fatal by contract — so
+            // without this line the *only* record of an outage would be in the
+            // response body of whoever happened to trigger it. Warn-level because
+            // it is actionable and rare: a burst of these means a key is dead, an
+            // egress IP is blocked, or a hub is down, and every one of them burned
+            // a caller's budget for nothing.
+            //
+            // `hub_calls_today` is included deliberately: it is the number that
+            // says how much of this bucket's day our outage has already consumed,
+            // and it is what justifies reaching for the `HUB_DAILY_BUDGET = "0"`
+            // kill switch while the hub is broken.
+            //
+            // The message is pre-redacted in `sameas-core` (`transport::redact_url`),
+            // so no API key can reach the log. `input_desc` is the same string
+            // already written to `resolutions`, so this adds no new PII surface.
+            if let Some(err) = &out.hub_error {
+                console_warn!(
+                    "hub_error hub={} bucket={} calls_today={} input=[{}] status={} err={}",
+                    hub.tag(),
+                    parsed.bucket,
+                    used,
+                    input_desc,
+                    out.status.as_str(),
+                    err
+                );
+            }
             answer(
                 &g,
                 &parsed,
