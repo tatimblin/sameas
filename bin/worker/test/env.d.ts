@@ -11,6 +11,8 @@
 /** The bindings this worker sees under test. No KV — it has only the D1 crosswalk. */
 interface TestEnv {
   DB: D1Database;
+  /** From wrangler.toml's `[vars]` — the per-caller daily hub-call budget. */
+  HUB_DAILY_BUDGET: string;
   /** Supplied by vitest.config.mts's miniflare bindings, not by wrangler.toml. */
   AUTH_TOKEN: string;
   TEST_MIGRATIONS: import("cloudflare:test").D1Migration[];

@@ -15,8 +15,9 @@
 //!   [`SqliteStore`] for the CLI/tests, `store::d1::D1Store` for the Worker.
 //! * [`anchor`] — deterministic canonical-anchor selection.
 //! * [`resolve`] — [`Resolver`] trait, adapters, and orchestration.
-//! * [`transport`] — HTTP/JSON transport for hub adapters (offline fixture +
-//!   live `reqwest`); see M2 hub bootstrapping.
+//! * [`transport`] — async HTTP/JSON transport for hub adapters (offline fixture,
+//!   native `reqwest`, and `worker::Fetch` for the Worker); see M2 hub
+//!   bootstrapping.
 //! * [`confidence`] — the `0.0`–`1.0` confidence gradient.
 
 pub mod anchor;
@@ -41,8 +42,8 @@ pub use correct::{link, merge, split, LinkOutcome};
 pub use kind::{spec_for_tag, Grain, KindSpec, KINDS};
 pub use model::{EntityRecord, ExternalId};
 pub use resolve::{
-    commit_record, commit_record_with_source, load_entity, resolve_id, DirectRecordResolver,
-    Resolver, ResolveOutput, Status,
+    commit_record, commit_record_with_opts, commit_record_with_source, load_entity, resolve_id,
+    Candidate, CommitOpts, DirectRecordResolver, Resolver, ResolveOutput, Status,
 };
 pub use store::{EntityRow, GraphStore, NameCardinality, StatsReport};
 pub use transport::{FixtureTransport, HttpTransport};

@@ -57,7 +57,7 @@ canonical entity and returns the completed identifier set — from the local gra
   (QID > Placekey* > domain > place_id > yelp > synthetic). *Placekey reserved.*
 - CLI: `sameas resolve` (`--domain`/`--phone`/`--place-id`/`--imdb`/`--input`,
   plus generic `--id kind:value` for any registered kind), `sameas entity <id>`,
-  `sameas ingest <file|dir>`.
+  `sameas ingest <file|dir>`. (M3 adds `link`/`merge`/`split`/`stats`.)
 - **Demo**: seed records + HTML fixture + `examples/demo.sh` showing one
   identifier in → canonical ID + completed identifiers out, and the same entity
   reached from phone / place_id / domain / yelp.
@@ -118,7 +118,7 @@ phone alone is refused.
 **Objective:** Handle entities in no public hub, keep the graph correct, and
 measure whether a fuzzy layer is ever warranted.
 
-**Deliverables** *(disambiguation core implemented; corrections + metrics deferred)*
+**Deliverables** *(implemented)*
 - **Entity-grain rule** *(implemented)* — each kind has a `grain`
   (`Identity`/`Affiliation`/`Weak`, `kind.rs`); a shared **Affiliation** key (a
   chain/studio domain) never merges two entities with disjoint **Identity** keys,
@@ -135,17 +135,33 @@ measure whether a fuzzy layer is ever warranted.
   end user for a stronger identifier and re-resolve.
 - **Ambiguity signal** *(implemented)* — a name/text query matching several
   places returns `candidates` and refuses rather than guess-merging.
-- `sameas link` / `merge` / `split` with edge re-pointing — **deferred**.
-- **Miss-rate instrumentation** (`sameas stats`) — **deferred**; the evidence gate
-  for the optional fuzzy phase.
+- **Correction ops** *(implemented)* — `sameas link` / `merge` / `split` over the
+  same core (`correct.rs`). `link` asserts two keys name one entity
+  (create/attach/merge as needed); `merge` collapses entities keeping the
+  strongest anchor and re-anchoring over the union; `split` detaches named
+  strong keys onto a fresh entity — **the only recovery path for a false merge**.
+  A **same-kind identity-conflict guard** refuses `merge`/`link` that would join
+  two distinct locations/films (two `google_place_id`s, two QIDs) unless
+  `--force`; cross-kind links (place_id ↔ QID) are exactly what the operator
+  means and pass. Weak (phone) keys are rejected as a link/split basis
+  (corroborator only).
+- **Miss-rate instrumentation** *(implemented)* — `sameas stats` over an
+  append-only `resolutions` log (`graph.rs`); every user-facing `resolve` records
+  its finalized `(status, confidence_reason, matched_via, confidence)`. `stats`
+  buckets outcomes into **exact / hub / miss** and reports the headline **miss
+  rate** — the evidence gate for the optional fuzzy phase. Logging is best-effort
+  (never fails a resolve); `entity`/`ingest` are excluded (not user queries).
 
 **Key components:** grain-gated union, deterministic anchors, resolve-or-refuse,
-confidence reason + candidates. (Correction ops + metrics: next.)
+confidence reason + candidates, correction ops (`correct.rs`), miss-rate log +
+`stats`.
 
 **Exit criteria:** two chain locations sharing a domain stay distinct *(met)*; a
 place with only a name/city returns "needs a stronger identifier" rather than a
 guessed merge *(met)*; a strong-key entity with no public anchor reproduces its
-canonical id *(met)*. Correction ops (`split`) and reported miss rate: deferred.
+canonical id *(met)*; a false merge can be undone with `split` and the two
+entities reproduce their own anchors *(met)*; the miss rate is reported by
+`sameas stats` *(met)*.
 
 > **Note on synthetic IDs.** The original wording ("a local restaurant with no
 > public ID gets a stable synthetic canonical") was refined by a product decision:
@@ -156,18 +172,33 @@ canonical id *(met)*. Correction ops (`split`) and reported miss rate: deferred.
 
 ---
 
-## M4 — HTTP API layer
+## M4 — HTTP API layer *(partially shipped)*
 **Objective:** Expose `sameas-core` over HTTP for non-CLI consumers (e.g. the
 ATProto AppView). Pure front-end — no new domain logic.
 
 **Deliverables**
-- `sameas-api` (bin): `axum` + `tokio` over the same core.
-- Endpoints 1:1 with CLI capability: `POST /resolve`, `GET /entity/{id}`,
-  `POST /link`, `POST /merge`, `POST /split`.
-- Request/response DTOs, error mapping, config, request logging.
+- ~~`sameas-api` (bin): `axum` + `tokio`~~ — **superseded.** The front-end is
+  `bin/worker`, a Cloudflare Worker (Rust→WASM) over `store::d1::D1Store`, since
+  the consumer is itself a Worker and a same-account **service binding** removes
+  both the egress hop and the need to expose a public origin. `axum`/`tokio`
+  never entered the tree.
+- Shipped: `GET /resolve` (per-kind and `?id=kind:value`), `GET /entity/{id}`,
+  `GET /stats`, `POST /ingest` (token-gated), and `POST /resolve/name`
+  *(token-gated)* — the disambiguation route: a strict-grain commit over the
+  caller's identifiers, falling through to a hub-routed name search that returns
+  **candidates** rather than guessing which location/work was meant.
+- Still open: `POST /link` / `/merge` / `/split` — the correction ops exist in the
+  core (`correct.rs`) and are reachable only from the CLI.
+- Hub API keys (`GOOGLE_PLACES_API_KEY`, `TMDB_API_KEY`, `PLACEKEY_API_KEY`) are
+  Worker secrets, per environment. `/resolve/name` is the only route that can
+  spend: bearer-gated, with a per-caller daily call budget (`hub_budget`;
+  `HUB_DAILY_BUDGET = "0"` is the kill switch) and local-first caching in front of
+  every hub.
 
 **Exit criteria:** every CLI capability is reachable over HTTP with equivalent
 behavior; a consumer resolves a record and reads back the completed entity.
+*(Resolution, entity reads, ingest, stats and name disambiguation: met. The
+correction ops: not yet.)*
 
 ---
 
@@ -188,15 +219,37 @@ are cached and refreshed within policy.
 ---
 
 ## Optional (evidence-gated) — Fuzzy matching
-**Only if M3's measured miss rate is materially large.** Entities that share no
-resolvable identifier but are the same real thing are the *residual* the exact
-crosswalk can't close. Address it in order of cost, cheapest first:
-1. String similarity on normalized name/address (`strsim`) + geo gate — no model.
-2. Only if still insufficient: an embedding model (local ONNX via `ort`) as one
-   signal, trained/evaluated against the miss-rate data collected in M3.
+**Only if M3's measured miss rate is materially large** — and now that
+`sameas stats` exists, that is a number, not a guess. The gate reads the log:
+run the corpus, read `sameas stats`, and only proceed if the **miss** bucket is
+both large *and* dominated by `needs_stronger_identifier` on inputs that are
+genuinely "same entity, different spelling" (as opposed to `ambiguous_among_n`,
+which wants better disambiguation, or thin hub coverage, which wants more hubs —
+neither is fixed by fuzzy matching). Entities that share no resolvable identifier
+but are the same real thing are the *residual* the exact crosswalk can't close.
+Address it in order of cost, cheapest first:
+1. **String similarity, no model** — `strsim` (Jaro-Winkler / edit distance) on
+   normalized name/address, **gated by geography** (the geo gate substitutes for
+   the identity signal exact keys provided). Likely closes most of the residual.
+2. **Only if still insufficient: embeddings.** A local ONNX model (via `ort`)
+   produces name/address embeddings as **one signal among several**, trained and
+   evaluated against the miss-rate data captured by `stats` in M3.
+   - **Vector store: `sqlite-vec`** (or similar) — the natural fit here: it loads
+     into the *same* SQLite file (no separate service, preserving the CLI-first,
+     one-file ethos), and at per-entity-lookup scale its exact brute-force KNN is
+     ample (no ANN index needed). Store a geohash/S2 cell as a partition column so
+     KNN runs only within nearby cells — the geo gate at retrieval time.
+   - **Retrieval, not decision.** `sqlite-vec` returns nearest *candidates*; they
+     flow into the existing conservative machinery (confidence + gated union +
+     `split` escape hatch) exactly like every other candidate. Fuzzy matching
+     never silently unions — it proposes, the gate disposes.
+   - **Note:** an embedding is a lossy derivation of name/address content, so this
+     is a *deliberate* relaxation of "store IDs, not content" (far less exposure
+     than raw provider strings, but a decision to make explicitly, not by drift).
 
 This is where the original "embedding" idea lives — demoted from centerpiece to a
-conditional enhancement justified by data, not assumption.
+conditional enhancement justified by data, not assumption. **Nothing here is built
+until `stats` justifies it.**
 
 ---
 
@@ -217,11 +270,15 @@ conditional enhancement justified by data, not assumption.
 
 ## Dependency order
 ```
-M1 (crosswalk core, resolve/complete, CLI)
-   └▶ M2 (hub bootstrapping)      ── requires M1 graph + resolver trait
-          └▶ M3 (long-tail, corrections, miss-rate)  ── requires M1–M2 resolution paths
-                 └▶ M5 (hardening)                    ── requires M4 surface + M3 metrics
+M1 (crosswalk core, resolve/complete, CLI)                    ── done
+   └▶ M2 (hub bootstrapping)      ── requires M1 graph + resolver trait   ── done
+          └▶ M3 (long-tail, corrections, miss-rate)  ── requires M1–M2 paths ── done
+                 ├▶ M4 (HTTP API)   ── requires M3 correction ops in core (link/merge/split)
+                 │                     so the endpoints stay "no new domain logic"
+                 └▶ M5 (hardening)  ── requires M4 surface + M3 miss-rate metrics
 
-M4 (HTTP API) ── front-end over sameas-core; can begin once M1 resolve exists, grows through M3.
-Optional fuzzy phase ── gated on M3 miss-rate evidence.
+Optional fuzzy phase ── gated on M3's *measured* miss rate (`sameas stats`), not assumption.
 ```
+M4's `POST /link|/merge|/split` are a thin front-end over M3's correction ops —
+which is why those ops landed in the core (`correct.rs`) as part of closing M3,
+before M4 begins.

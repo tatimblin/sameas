@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 
 use crate::anchor;
 use crate::confidence::{score, ConfidenceReason};
@@ -34,6 +35,39 @@ impl Status {
             Status::New => "new",
             Status::Hit => "hit",
             Status::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// What to supply instead of a brand/site-level key. Appended to every
+/// affiliation-only refusal so the caller can tell the user what *would* work,
+/// and so the cheap fixes (a page URL the user already has) are named before
+/// anything reaches a paid hub.
+const STRONGER_IDENTIFIER_HINT: &str = "Supply an identifier for the individual thing: a \
+     location-specific page URL with a path (https://example.com/hayes-valley), a Yelp \
+     /biz/ link, or a Google Maps place URL (https://www.google.com/maps/place/?q=place_id:...).";
+
+/// Knobs on a commit. Constructed by the caller so a new policy question is a
+/// new field here rather than a new `commit_record_*` overload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitOpts {
+    /// Whether a record whose *every* strong key is [`Grain::Affiliation`] (a
+    /// bare brand/site domain and nothing else) may mint or attach.
+    ///
+    /// `true` — today's behavior, and what bulk ingest needs: the seed corpus is
+    /// full of records identified only by their own domain, and refusing those
+    /// would empty the graph. `false` — the publish path, where a chain's brand
+    /// domain must not silently stand in for one of its locations; the commit is
+    /// refused with candidates or a hint instead. See [`commit_record_with_opts`].
+    pub allow_affiliation_only: bool,
+}
+
+impl Default for CommitOpts {
+    /// The permissive default, matching [`commit_record`] / ingest. Only the
+    /// publish path opts into the stricter grain rule.
+    fn default() -> Self {
+        CommitOpts {
+            allow_affiliation_only: true,
         }
     }
 }
@@ -81,8 +115,16 @@ pub struct ResolveOutput {
 }
 
 /// Anything that can produce a record to resolve.
+///
+/// Async because the hub adapters in [`crate::hubs`] implement it over
+/// [`crate::transport::HttpTransport`], which is async so it can be backed by
+/// `worker::Fetch` inside a Cloudflare Worker. `?Send` for the same reason the
+/// transport and [`crate::store::GraphStore`] are: `worker::Fetch` futures hold
+/// `JsValue`s. The offline implementations below have no `.await` in them and
+/// never yield.
+#[async_trait(?Send)]
 pub trait Resolver {
-    fn harvest(&self) -> Result<EntityRecord>;
+    async fn harvest(&self) -> Result<EntityRecord>;
 }
 
 /// Harvests identifiers directly from an already-typed record (seed ingest,
@@ -97,8 +139,9 @@ impl DirectRecordResolver {
     }
 }
 
+#[async_trait(?Send)]
 impl Resolver for DirectRecordResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
+    async fn harvest(&self) -> Result<EntityRecord> {
         Ok(self.record.clone())
     }
 }
@@ -115,10 +158,45 @@ pub async fn commit_record(graph: &dyn GraphStore, record: &EntityRecord) -> Res
 
 /// Like [`commit_record`], but tags every edge it writes with `source`
 /// (e.g. `"wikidata"`, `"google_places"`) for edge provenance.
+///
+/// Keeps the permissive [`CommitOpts::default`] grain policy, so `/ingest`, the
+/// CLI and hub completion behave exactly as before.
 pub async fn commit_record_with_source(
     graph: &dyn GraphStore,
     record: &EntityRecord,
     source: &str,
+) -> Result<ResolveOutput> {
+    commit_record_with_opts(graph, record, source, CommitOpts::default()).await
+}
+
+/// [`commit_record_with_source`] plus an explicit policy ([`CommitOpts`]).
+///
+/// The one policy today is `allow_affiliation_only`. With it `false`, a record
+/// whose only strong keys are [`Grain::Affiliation`] — a bare brand/site domain —
+/// is **refused** rather than resolved, because such a key may name a chain, a
+/// studio or a brand rather than the one thing the caller meant. Three outcomes,
+/// all [`Status::Unresolved`] and all writing nothing:
+///
+/// | Graph state | `confidence_reason` | `candidates` |
+/// |---|---|---|
+/// | affiliation cluster(s) with identity keys | [`ConfidenceReason::AmbiguousAmongN`] | the identity-bearing entities |
+/// | affiliation cluster(s), none identity-bearing | [`ConfidenceReason::NeedsStrongerIdentifier`] | empty |
+/// | no cluster at all | [`ConfidenceReason::NeedsStrongerIdentifier`] | empty |
+///
+/// `AmbiguousAmongN(n)` is emitted **only** with `n == candidates.len() >= 1`;
+/// an ambiguous verdict never carries an empty candidate list. The two
+/// `NeedsStrongerIdentifier` cases are the caller's cue to fall through to a name
+/// search (that orchestration lives in the caller, not here); `hint` distinguishes
+/// them for humans.
+///
+/// A bare domain is refused only when it is the *sole* strong grain: a co-present
+/// Identity key (a Michelin deep link, a Yelp `/biz/` slug, a place id) resolves
+/// normally and carries the domain along with it.
+pub async fn commit_record_with_opts(
+    graph: &dyn GraphStore,
+    record: &EntityRecord,
+    source: &str,
+    opts: CommitOpts,
 ) -> Result<ResolveOutput> {
     let strong_ids: Vec<&ExternalId> = record.strong_ids().collect();
     let phone_ids: Vec<&ExternalId> = record.phone_ids().collect();
@@ -194,6 +272,80 @@ pub async fn commit_record_with_source(
             candidates,
             provenance: Vec::new(),
             hint: None,
+        });
+    }
+
+    // 2b. Refuse when EVERY strong key is Affiliation grain (a brand/site domain
+    //     and nothing else). `strong_ids` is non-empty here, so this is exactly
+    //     "no Identity-grain key to go on". Until now Grain::Affiliation only had
+    //     defensive consequences (don't steal a shared domain in step 4, don't
+    //     merge identity-conflicting owners in step 3) — never interrogative
+    //     ones, so `sameAs: ["https://souvla.com"]` on a review of one location of
+    //     a chain sailed straight through and minted a brand-level entity.
+    //
+    //     Opt-in, because bulk ingest legitimately loads domain-only records.
+    //     Nothing is written on any of these paths: the gate sits ahead of every
+    //     mint / merge / attach below.
+    if !opts.allow_affiliation_only && affiliation_ids.len() == strong_ids.len() {
+        // One candidate per distinct entity the affiliation key(s) reach — not
+        // one per member key, which would list the same entity once per identity
+        // key it holds. Identity-less clusters are excluded: a brand org whose
+        // only key is the shared domain answers no better than the domain did.
+        // `EntityRow::anchor` is Identity-preferring (see `anchor::entity_anchor`),
+        // so candidates do not all collapse back onto the brand domain.
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for canon in &affil_hits {
+            if identity_keys(&graph.members(canon).await?).is_empty() {
+                continue;
+            }
+            if let Some(e) = graph.get_entity(canon).await? {
+                candidates.push(Candidate {
+                    canonical_id: e.canonical_id,
+                    anchor: e.anchor,
+                    name: e.name,
+                });
+            }
+        }
+
+        let affil_keys: Vec<String> = affiliation_ids.iter().map(|id| id.key()).collect();
+        let joined = affil_keys.join(", ");
+        // `AmbiguousAmongN` is reachable only with at least one candidate, so an
+        // ambiguous verdict never comes back with an empty list to choose from.
+        let (reason, hint) = if candidates.is_empty() {
+            let lead = if affil_hits.is_empty() {
+                format!("{joined} is not in the graph, and it names a brand or site rather than one specific thing.")
+            } else {
+                format!("{joined} is in the graph, but only as a brand/site with no identifying key of its own.")
+            };
+            (
+                ConfidenceReason::NeedsStrongerIdentifier,
+                Some(format!("{lead} {STRONGER_IDENTIFIER_HINT}")),
+            )
+        } else {
+            (
+                ConfidenceReason::AmbiguousAmongN(candidates.len()),
+                Some(format!(
+                    "{joined} may be shared across several things. Pick one of the candidates, \
+                     or: {STRONGER_IDENTIFIER_HINT}"
+                )),
+            )
+        };
+
+        return Ok(ResolveOutput {
+            canonical_id: None,
+            anchor: String::new(),
+            entity_type: record.entity_type.clone(),
+            name: record.name.clone(),
+            same_as: Vec::new(),
+            matched_via: Vec::new(),
+            status: Status::Unresolved,
+            harvested,
+            new_edges: 0,
+            confidence: score(&reason),
+            confidence_reason: reason,
+            candidates,
+            provenance: Vec::new(),
+            hint,
         });
     }
 
@@ -509,20 +661,25 @@ impl DomainResolver {
 
     /// Fetch the page over HTTP (requires the `live-fetch` feature).
     #[cfg(feature = "live-fetch")]
-    pub fn from_live(domain: &str) -> Result<Self> {
+    pub async fn from_live(domain: &str) -> Result<Self> {
         let reg = crate::normalize::registrable_domain(domain)?;
         let url = format!("https://{reg}/");
-        let body = reqwest::blocking::get(&url)
+        let resp = reqwest::get(&url)
+            .await
             .and_then(|r| r.error_for_status())
-            .and_then(|r| r.text())
+            .map_err(|e| anyhow!("fetching {url}: {e}"))?;
+        let body = resp
+            .text()
+            .await
             .map_err(|e| anyhow!("fetching {url}: {e}"))?;
         Ok(DomainResolver { domain: reg, html: body })
     }
 }
 
 #[cfg(feature = "harvest")]
+#[async_trait(?Send)]
 impl Resolver for DomainResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
+    async fn harvest(&self) -> Result<EntityRecord> {
         use scraper::{Html, Selector};
 
         let doc = Html::parse_document(&self.html);
@@ -631,8 +788,13 @@ fn harvest_same_as(value: &serde_json::Value, record: &mut EntityRecord) {
 /// (first match wins), so a new kind gains page-harvesting support just by
 /// setting `url_match` in its [`crate::kind::KindSpec`]. Anything else that is
 /// URL-shaped falls back to a `domain` edge.
-#[cfg(feature = "harvest")]
-fn guess_id_from_url(raw: &str) -> Option<ExternalId> {
+///
+/// **Not** behind the `harvest` feature, despite living among the HTML-harvesting
+/// helpers: it touches only the kind registry and `ExternalId`, never `scraper`.
+/// The Worker build (`default-features = false, features = ["d1", "worker-fetch"]`)
+/// needs it to turn a caller's raw `sameAs` URLs into `kind:value` keys, and pulling
+/// `harvest` in for that would drag the whole `scraper` parser tree into wasm.
+pub fn guess_id_from_url(raw: &str) -> Option<ExternalId> {
     let lower = raw.to_ascii_lowercase();
 
     const SOCIAL: &[&str] = &[
@@ -660,9 +822,22 @@ fn guess_id_from_url(raw: &str) -> Option<ExternalId> {
         }
     }
 
-    // Anything else URL-shaped is treated as another domain edge.
+    // No dedicated kind recognized the host. Prefer the generic `url` kind, which accepts
+    // only a path-bearing URL — that names one page, so it is an Identity key.
+    //
+    // Falling back to `domain` for *every* URL (as this used to) is actively wrong:
+    // `guide.michelin.com/.../kan-kiin` becomes `domain:michelin.com`, a key every
+    // Michelin-listed restaurant shares. With `Grain::Affiliation` and no conflicting
+    // identity key on either side, `commit_record` adopts the cluster and unrelated
+    // restaurants merge — measured at 162-into-1 on a real corpus, reported as a 0.95
+    // `exact_strong_key` hit because a strong key is exactly what it was handed.
+    //
+    // `domain` remains the fallback for a **path-less** URL, where the host really does
+    // name the thing (a business's own site) and Affiliation grain is the right semantics.
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        return ExternalId::domain(raw).ok();
+        return ExternalId::new("url", raw)
+            .or_else(|_| ExternalId::domain(raw))
+            .ok();
     }
     None
 }
@@ -718,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn jsonld_sameas_extraction() {
         let r = DomainResolver::from_html("bluebottlecoffee.com", FIXTURE.to_string()).unwrap();
-        let rec = r.harvest().unwrap();
+        let rec = r.harvest().await.unwrap();
         assert_eq!(rec.entity_type.as_deref(), Some("LocalBusiness"));
         assert_eq!(rec.name.as_deref(), Some("Blue Bottle Coffee"));
         let keys: Vec<String> = rec.same_as.iter().map(|i| i.key()).collect();
@@ -753,7 +928,7 @@ mod tests {
         </head><body></body></html>
         "#;
         let r = DomainResolver::from_html("bluebottlecoffee.com", html.to_string()).unwrap();
-        let rec = r.harvest().unwrap();
+        let rec = r.harvest().await.unwrap();
         let keys: Vec<String> = rec.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"yelp:blue-bottle-coffee-san-francisco".to_string()));
     }
@@ -1008,5 +1183,328 @@ mod tests {
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"wikidata:Q1".to_string()));
         assert!(keys.contains(&"domain:e.com".to_string()));
+    }
+
+    // ---------------------------------------------------------------------
+    // Grain refusal: an affiliation-only record (a bare brand domain) must ask
+    // "which one?" instead of minting a brand-level entity.
+    // ---------------------------------------------------------------------
+
+    /// The publish-path policy: a bare brand domain is not enough on its own.
+    const STRICT: CommitOpts = CommitOpts {
+        allow_affiliation_only: false,
+    };
+
+    /// The Souvla bug on a graph that already knows one location: refuse and hand
+    /// back the location(s) the domain reaches, anchored on their identity keys.
+    #[tokio::test]
+    async fn affiliation_only_is_ambiguous_when_the_domain_reaches_an_identity() {
+        let g = SqliteStore::open_in_memory().unwrap();
+
+        // One known location: its own place id + the shared chain domain.
+        let hayes = commit_record(
+            &g,
+            &EntityRecord {
+                name: Some("Souvla Hayes Valley".into()),
+                same_as: vec![
+                    ExternalId::google_place_id("ChIJHAYES").unwrap(),
+                    ExternalId::domain("souvla.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let hayes_id = hayes.canonical_id.clone().unwrap();
+
+        // The bug report: a review carrying only the chain domain.
+        let out = commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                name: Some("Souvla".into()),
+                same_as: vec![ExternalId::domain("souvla.com").unwrap()],
+                ..Default::default()
+            },
+            "input",
+            STRICT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.canonical_id, None);
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(1));
+        assert_eq!(out.candidates.len(), 1);
+        assert_eq!(out.candidates[0].canonical_id, hayes_id);
+        // anchor.rs: Identity grain beats Affiliation, so a candidate never
+        // collapses back onto the brand domain that produced the ambiguity.
+        assert_eq!(out.candidates[0].anchor, "google_place_id:ChIJHAYES");
+        assert!(out.hint.is_some());
+        // Nothing was written: no second (brand-level) entity was minted, and the
+        // domain still belongs to the location that owned it.
+        assert_eq!(out.new_edges, 0);
+        assert_eq!(
+            g.find("domain:souvla.com").await.unwrap().as_deref(),
+            Some(hayes_id.as_str())
+        );
+    }
+
+    /// `n` is the number of *distinct entities*, and always equals
+    /// `candidates.len()` — an ambiguous verdict is never empty-handed.
+    #[tokio::test]
+    async fn affiliation_only_lists_every_distinct_owner() {
+        let g = SqliteStore::open_in_memory().unwrap();
+        let p = commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::imdb("tt1111111").unwrap(),
+                    ExternalId::domain("p-studio.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let q = commit_record(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::imdb("tt2222222").unwrap(),
+                    ExternalId::domain("q-studio.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                same_as: vec![
+                    ExternalId::domain("p-studio.com").unwrap(),
+                    ExternalId::domain("q-studio.com").unwrap(),
+                ],
+                ..Default::default()
+            },
+            "input",
+            STRICT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        let ids: HashSet<String> = out
+            .candidates
+            .iter()
+            .map(|c| c.canonical_id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from([p.canonical_id.unwrap(), q.canonical_id.unwrap()])
+        );
+    }
+
+    /// The cluster exists but holds no identity key (the winner absorbed only
+    /// identity-less hits). There is nothing to choose between, so this must NOT
+    /// come back as "ambiguous" with an empty list — the caller has to be able to
+    /// tell it apart and fall through to a name search.
+    #[tokio::test]
+    async fn affiliation_only_with_identity_less_cluster_signals_fallthrough() {
+        let g = SqliteStore::open_in_memory().unwrap();
+
+        // A brand org: domain + phone, no identity key at all.
+        let brand = commit_record(
+            &g,
+            &EntityRecord {
+                name: Some("Souvla".into()),
+                same_as: vec![
+                    ExternalId::domain("souvla.com").unwrap(),
+                    ExternalId::phone("+1-415-555-0100").unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(brand.anchor, "domain:souvla.com");
+
+        let out = commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                same_as: vec![ExternalId::domain("souvla.com").unwrap()],
+                ..Default::default()
+            },
+            "input",
+            STRICT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(
+            out.confidence_reason,
+            ConfidenceReason::NeedsStrongerIdentifier,
+            "a zero-candidate refusal must not masquerade as ambiguity"
+        );
+        assert!(out.candidates.is_empty());
+        assert!(out.hint.unwrap().contains("souvla.com"));
+    }
+
+    /// Souvla on an empty graph: nothing to offer, so name what would work.
+    #[tokio::test]
+    async fn affiliation_only_with_no_cluster_needs_a_stronger_identifier() {
+        let g = SqliteStore::open_in_memory().unwrap();
+
+        let out = commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                entity_type: Some("Restaurant".into()),
+                name: Some("Souvla".into()),
+                same_as: vec![ExternalId::domain("souvla.com").unwrap()],
+            },
+            "input",
+            STRICT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.canonical_id, None);
+        assert_eq!(
+            out.confidence_reason,
+            ConfidenceReason::NeedsStrongerIdentifier
+        );
+        assert!(out.candidates.is_empty());
+        // The input is echoed back so the caller can still run a name search.
+        assert_eq!(out.name.as_deref(), Some("Souvla"));
+        assert_eq!(out.entity_type.as_deref(), Some("Restaurant"));
+        let hint = out
+            .hint
+            .expect("a refusal with no candidates must say what to supply");
+        assert!(
+            hint.contains("/biz/"),
+            "hint should name the Yelp escape hatch: {hint}"
+        );
+        assert!(
+            hint.contains("place_id"),
+            "hint should name the Maps escape hatch: {hint}"
+        );
+        // Refused means refused: no entity, no edge.
+        assert!(g.find("domain:souvla.com").await.unwrap().is_none());
+        assert_eq!(out.new_edges, 0);
+    }
+
+    /// The asymmetry that keeps the rule safe for single-location businesses: a
+    /// bare domain is refused only as the SOLE strong grain. Zuni Café carries
+    /// both its own site and a Michelin deep link, and resolves on the latter.
+    #[tokio::test]
+    async fn a_co_present_identity_key_rescues_a_bare_domain() {
+        let g = SqliteStore::open_in_memory().unwrap();
+
+        let out = commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                name: Some("Zuni Café".into()),
+                same_as: vec![
+                    ExternalId::domain("zunicafe.com").unwrap(),
+                    ExternalId::new(
+                        "url",
+                        "https://guide.michelin.com/us/en/california/san-francisco/restaurant/zuni-cafe",
+                    )
+                    .unwrap(),
+                ],
+                ..Default::default()
+            },
+            "input",
+            STRICT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, Status::New);
+        assert!(out.canonical_id.is_some());
+        // The domain rides along on the identity key that carried the record.
+        let keys: HashSet<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains("domain:zunicafe.com"));
+        assert!(out.anchor.starts_with("url:guide.michelin.com/"));
+    }
+
+    /// Regression for the 151 bare-origin domains in the agent-web seed corpus:
+    /// `/ingest`, the CLI and hub completion all go through the permissive
+    /// entry points, and must keep minting domain-only entities.
+    #[tokio::test]
+    async fn domain_only_ingest_still_succeeds() {
+        let g = SqliteStore::open_in_memory().unwrap();
+
+        for (i, domain) in ["zunicafe.com", "flourandwater.com", "souvla.com"]
+            .iter()
+            .enumerate()
+        {
+            let record = EntityRecord {
+                entity_type: Some("Restaurant".into()),
+                name: Some(format!("Seed {i}")),
+                same_as: vec![ExternalId::domain(domain).unwrap()],
+            };
+
+            // The default entry point.
+            let out = commit_record(&g, &record).await.unwrap();
+            assert_eq!(out.status, Status::New, "{domain} must still mint");
+            assert_eq!(out.anchor, format!("domain:{domain}"));
+            assert!(out.candidates.is_empty());
+            assert!(out.hint.is_none());
+            let cid = out.canonical_id.clone().unwrap();
+            assert_eq!(
+                g.find(&format!("domain:{domain}"))
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(cid.as_str())
+            );
+
+            // The source-tagged entry point re-resolves to the same entity.
+            let again = commit_record_with_source(&g, &record, "seed")
+                .await
+                .unwrap();
+            assert_eq!(again.status, Status::Hit);
+            assert_eq!(again.canonical_id.as_deref(), Some(cid.as_str()));
+
+            // And so does an explicit permissive CommitOpts.
+            let opted = commit_record_with_opts(&g, &record, "seed", CommitOpts::default())
+                .await
+                .unwrap();
+            assert_eq!(opted.status, Status::Hit);
+            assert_eq!(opted.canonical_id.as_deref(), Some(cid.as_str()));
+        }
+    }
+
+    /// The gate is grain-shaped, not domain-shaped: a phone-only record still
+    /// takes the older no-strong-key refusal, unchanged by the new branch.
+    #[tokio::test]
+    async fn strict_opts_leave_the_no_strong_key_refusal_alone() {
+        let g = SqliteStore::open_in_memory().unwrap();
+        let out = commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                name: Some("Nameless".into()),
+                same_as: vec![ExternalId::phone("+1-415-555-0199").unwrap()],
+                ..Default::default()
+            },
+            "input",
+            STRICT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(
+            out.confidence_reason,
+            ConfidenceReason::NeedsStrongerIdentifier
+        );
+        assert!(
+            out.hint.is_none(),
+            "the phone path keeps its existing shape"
+        );
     }
 }

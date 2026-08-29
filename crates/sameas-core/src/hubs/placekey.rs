@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::push_id;
@@ -64,13 +65,17 @@ impl PlacekeyResolver {
     }
 }
 
+#[async_trait(?Send)]
 impl Resolver for PlacekeyResolver {
-    fn harvest(&self) -> Result<EntityRecord> {
+    async fn harvest(&self) -> Result<EntityRecord> {
         let headers = [
             ("apikey", self.api_key.as_str()),
             ("Content-Type", "application/json"),
         ];
-        let value = self.transport.post_json(ENDPOINT, &headers, &self.body())?;
+        let value = self
+            .transport
+            .post_json(ENDPOINT, &headers, &self.body())
+            .await?;
         let mut record = EntityRecord::default();
         if let Some(pk) = Self::parse(&value) {
             push_id(&mut record, "placekey", &pk);
@@ -94,8 +99,8 @@ mod tests {
         assert_eq!(PlacekeyResolver::parse(&json!({})), None);
     }
 
-    #[test]
-    fn harvest_yields_placekey_id() {
+    #[tokio::test]
+    async fn harvest_yields_placekey_id() {
         let transport = FixtureTransport::from_pairs(vec![(
             "POST",
             ENDPOINT,
@@ -109,7 +114,7 @@ mod tests {
             ..Default::default()
         };
         let r = PlacekeyResolver::new(query, String::new(), Arc::new(transport));
-        let rec = r.harvest().unwrap();
+        let rec = r.harvest().await.unwrap();
         let keys: Vec<String> = rec.same_as.iter().map(|i| i.key()).collect();
         assert_eq!(keys, vec!["placekey:227-223@5vg-7gq-tvz".to_string()]);
     }

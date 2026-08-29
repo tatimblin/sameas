@@ -1,0 +1,80 @@
+name: Deploy production
+
+# Manual only, on purpose. sameas has one consumer (the agent-web MCP server), so
+# a 24h bake train like agent-web's buys less than it costs here — but production
+# should still never move without someone deciding it should.
+#
+# Deploy staging first and confirm it is healthy; this workflow does not check.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (defaults to main)"
+        type: string
+        default: main
+        required: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: bin/worker/package-lock.json
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/worker-build
+          key: worker-build-0.1.1-${{ runner.os }}
+      - run: command -v worker-build || cargo install worker-build@0.1.1 --locked
+
+      - run: npm ci
+        working-directory: bin/worker
+
+      # `npm run deploy` (no `:staging`) applies migrations against the production
+      # D1 and omits `--env`, which targets the production script. Note the deploy
+      # footgun this avoids: a bare `wrangler deploy` skips migrations entirely.
+      - name: Deploy sameas
+        working-directory: bin/worker
+        run: npm run deploy
+
+      # Optional: set the repo variable WORKERS_DEV_SUBDOMAIN to enable. Skipped
+      # rather than failed when unset, so a missing convenience variable can never
+      # fail a deploy that actually succeeded.
+      - name: Health check
+        if: vars.WORKERS_DEV_SUBDOMAIN != ''
+        run: |
+          url="https://sameas.${{ vars.WORKERS_DEV_SUBDOMAIN }}.workers.dev/health"
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "$url"; then
+              echo "" && echo "sameas is up"
+              exit 0
+            fi
+            echo "attempt $i failed; retrying in 5s" && sleep 5
+          done
+          echo "::error::sameas did not answer /health at $url"
+          exit 1

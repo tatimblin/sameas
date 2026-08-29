@@ -159,7 +159,7 @@ export TMDB_API_KEY=…            # optional, for movie crosswalk
 
 BIN=./target/debug/sameas
 "$BIN" --db /tmp/live.db resolve --place-id "ChIJN1t_tDeuEmsRUsoyG83frY4" --complete
-"$BIN" --db /tmp/live.db resolve --name "Blue Bottle Coffee" \
+"$BIN" --db /tmp/live.db resolve --name "Blue Bottle Coffee" --type restaurant \
   --address "300 Webster St" --city Oakland --region CA --country US --complete
 ```
 
@@ -190,9 +190,23 @@ calls**:
 
 ```sh
 # First time: reaches the hub, then caches the name → entity mapping
-sameas resolve --name "Blue Bottle Coffee" --city Oakland --region CA --complete
+sameas resolve --name "Blue Bottle Coffee" --type restaurant --city Oakland --region CA --complete
 # Again (no --complete, no network): served locally, confidence_reason local_name_match
-sameas resolve --name "Blue Bottle Coffee" --city Oakland --region CA
+sameas resolve --name "Blue Bottle Coffee" --type restaurant --city Oakland --region CA
+```
+
+`--type` picks **which hub** answers, by NSID leaf (case-insensitive):
+`place`/`localBusiness`/`foodEstablishment`/`restaurant` → Google Places Text
+Search (the only **billable** hub); `movie`/`tvSeries` → TMDb `/search/multi`;
+anything else — **including no `--type` at all** → Wikidata `wbsearchentities`.
+The fallback is free on purpose: an unrecognized or missing type degrades to a
+worse answer, never to a surprise bill.
+
+```sh
+# Ambiguous both ways at once: a different franchise (the Nickelodeon series) and
+# a same-franchise sequel. Every candidate label carries the year.
+sameas resolve --name Avatar --type movie --complete
+sameas resolve --name Avatar --type movie --qualifier 2009 --complete   # → one
 ```
 
 The qualifier is **type-agnostic** — a free-form facet, not a fixed
@@ -235,8 +249,8 @@ sameas resolve --domain example.com --fetch                        # needs: --fe
 sameas resolve --imdb tt0133093 --complete --hub-fixtures examples/fixtures/hubs
 sameas resolve --place-id "ChIJ..." --complete --hub-fixtures examples/fixtures/hubs
 # Name + address (address may be just a city) -> Placekey anchor + place_id:
-sameas resolve --name "Blue Bottle Coffee" --city Oakland --region CA --country US \
-  --complete --hub-fixtures examples/fixtures/hubs
+sameas resolve --name "Blue Bottle Coffee" --type restaurant --city Oakland --region CA \
+  --country US --complete --hub-fixtures examples/fixtures/hubs
 # Live (needs: --features live-fetch, and TMDB_API_KEY / GOOGLE_PLACES_API_KEY /
 # PLACEKEY_API_KEY env vars): drop --hub-fixtures.
 # sameas resolve --imdb tt0133093 --complete

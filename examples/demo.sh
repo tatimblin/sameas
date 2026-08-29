@@ -103,14 +103,14 @@ sameas2 resolve --place-id EXAMPLE_blue_bottle_oakland --complete --hub-fixtures
 hr
 echo "STEP 7c name + full address -> Placekey anchor + place_id (reverse) then website + phone"
 echo "        (Placekey needs a street; name+city alone resolves via place_id at low confidence)"
-echo "\$ sameas resolve --name 'Blue Bottle Coffee' --address '300 Webster St' --city Oakland --region CA --country US --complete --hub-fixtures examples/fixtures/hubs"
-sameas2 resolve --name "Blue Bottle Coffee" --address "300 Webster St" --city Oakland --region CA --country US --complete --hub-fixtures "$HUBS"
+echo "\$ sameas resolve --name 'Blue Bottle Coffee' --type restaurant --address '300 Webster St' --city Oakland --region CA --country US --complete --hub-fixtures examples/fixtures/hubs"
+sameas2 resolve --name "Blue Bottle Coffee" --type restaurant --address "300 Webster St" --city Oakland --region CA --country US --complete --hub-fixtures "$HUBS"
 
 hr
 echo "STEP 7d Same name query again — served from the LOCAL name index (no --complete,"
 echo "        no hub fixtures) => zero external calls. Type-agnostic: qualifier is any facet."
-echo "\$ sameas resolve --name 'Blue Bottle Coffee' --address '300 Webster St' --city Oakland --region CA --country US"
-sameas2 resolve --name "Blue Bottle Coffee" --address "300 Webster St" --city Oakland --region CA --country US
+echo "\$ sameas resolve --name 'Blue Bottle Coffee' --type restaurant --address '300 Webster St' --city Oakland --region CA --country US"
+sameas2 resolve --name "Blue Bottle Coffee" --type restaurant --address "300 Webster St" --city Oakland --region CA --country US
 echo "  ^ confidence_reason 'local_name_match' — resolved from the graph, nothing reached out."
 
 hr
@@ -153,8 +153,8 @@ sameas3 resolve --domain kibatsu.com
 
 hr
 echo "STEP 8c Too little to be sure -> REFUSE (confidence is a control signal)"
-echo "\$ sameas resolve --name 'Ghost Kitchen' --city Nowhere --complete --hub-fixtures examples/fixtures/hubs_miss"
-sameas3 resolve --name "Ghost Kitchen" --city Nowhere --complete --hub-fixtures "$MISS"
+echo "\$ sameas resolve --name 'Ghost Kitchen' --type restaurant --city Nowhere --complete --hub-fixtures examples/fixtures/hubs_miss"
+sameas3 resolve --name "Ghost Kitchen" --type restaurant --city Nowhere --complete --hub-fixtures "$MISS"
 echo "  ^ no resolvable identifier -> status 'unresolved' + reason: the caller should"
 echo "    ask its end user for a stronger identifier, then re-resolve."
 

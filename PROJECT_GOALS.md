@@ -65,6 +65,13 @@ and meaningful — a synthetic local ID is minted only when none exists:
 ```
 Wikidata QID  >  Placekey (places)  >  registrable domain (orgs)  >  Google place_id  >  synthetic local id
 ```
+> **Refinement (see ROADMAP M3).** The "mint a synthetic ID on 0 hits" wording
+> below is superseded for hub-less *physical places*: rather than a name-hash
+> synthetic (which risks merging two same-name places), they anchor on a
+> **Placekey** derived from their address (a strong key), and an input with
+> nothing resolvable is **refused** with a "needs a stronger identifier" signal.
+> A deterministic synthetic anchor is still used for strong-key entities that
+> simply lack a *public* anchor (so they reproduce across runs).
 
 ### Completion sources
 1. **Local graph first** (cheap, offline): once an entity's edges are known, any
@@ -96,6 +103,7 @@ entity  <canonical_id>           -> { anchor, sameAs[], members[] }
 link    <id_a> <id_b>            -> assert two identifiers are the same entity
 merge   <canonical_ids...>       -> combine entities
 split   <identifier>             -> detach a mis-linked identifier
+stats                            -> exact/hub/miss breakdown + miss rate
 ```
 `resolve` *is* completion — the returned `sameAs[]` is the completed identifier
 set. No `embed`/`score` in the public surface.

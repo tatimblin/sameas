@@ -1,0 +1,93 @@
+name: Deploy staging
+
+# Merge to main deploys `sameas-staging`. Production is a deliberate manual
+# dispatch — see deploy-production.yml.
+#
+# This workflow exists because the worker running in production was deployed from
+# an UNCOMMITTED working tree: the deploy predates `ff5ccae` (the commit that added
+# bin/worker) by ~21 hours and predates the generic `url` Identity kind entirely.
+# What is running could not be reproduced from git. That is the failure mode this
+# prevents.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize deploys and never cancel one in flight: `deploy:staging` applies D1
+# migrations before it uploads, and a half-applied migration set is worse than a
+# queued deploy.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    # Scopes the environment secrets. The token is shared with the agent-web
+    # project by decision; the account is 778838fb88e85040996c703227a005ca.
+    environment: staging
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: bin/worker/package-lock.json
+
+      # Same pin and cache key as ci.yml. worker-build's version is part of the
+      # wasm-bindgen contract — it is the tool whose shim codegen the `<0.2.101`
+      # ceiling exists to satisfy — so it is pinned, not floating.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/worker-build
+          key: worker-build-0.1.1-${{ runner.os }}
+      - run: command -v worker-build || cargo install worker-build@0.1.1 --locked
+
+      - run: npm ci
+        working-directory: bin/worker
+
+      # One script, because the ordering inside it is load-bearing:
+      #   db:migrations:apply:staging  — schema first; migrations are additive, so
+      #                                  the running worker tolerates the gap
+      #   build:clean                  — `env -u WORKER_BUILD_FEATURES`, so a
+      #                                  test-endpoints build can never ship
+      #   check:shim (twice)           — asserts the shim binds its wasm exports.
+      #                                  Without it a broken shim deploys cleanly
+      #                                  and then fails on EVERY request.
+      - name: Deploy sameas-staging
+        working-directory: bin/worker
+        run: npm run deploy:staging
+
+      # A read-only probe. `/health` touches no D1 and needs no token, so this
+      # proves the shim actually bound its exports at runtime rather than merely
+      # passing the static check above.
+      # Optional: set the repo variable WORKERS_DEV_SUBDOMAIN to enable. Skipped
+      # rather than failed when unset, so a missing convenience variable can never
+      # fail a deploy that actually succeeded.
+      - name: Health check
+        if: vars.WORKERS_DEV_SUBDOMAIN != ''
+        run: |
+          url="https://sameas-staging.${{ vars.WORKERS_DEV_SUBDOMAIN }}.workers.dev/health"
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "$url"; then
+              echo "" && echo "sameas-staging is up"
+              exit 0
+            fi
+            echo "attempt $i failed; retrying in 5s" && sleep 5
+          done
+          echo "::error::sameas-staging did not answer /health at $url"
+          exit 1
