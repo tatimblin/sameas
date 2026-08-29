@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable, so the deploy workflows gate on the SAME job graph rather than a
+  # copy that can drift. Nothing ships that CI has not just proven green.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
