@@ -48,9 +48,26 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.cargo/bin/worker-build
-          key: worker-build-0.1.1-${{ runner.os }}
-      - run: command -v worker-build || cargo install worker-build@0.1.1 --locked
+          # The install METADATA must be cached alongside the binary. `cargo
+          # install` consults .crates.toml/.crates2.json, not the filesystem: with
+          # the binary restored but no metadata it does not see a completed
+          # install, tries again, collides with the file it just restored, and
+          # hard-errors "binary `worker-build` already exists in destination".
+          # custom_build.sh runs `cargo install` unconditionally on every build,
+          # so caching the bare binary breaks every deploy after the first.
+          path: |
+            ~/.cargo/bin/worker-build
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: worker-build-0.1.1-v2-${{ runner.os }}
+      # Gate on CARGO's view (`cargo install --list`), not `command -v`. The two
+      # can disagree — a restored binary with no install metadata looks present to
+      # the shell and absent to cargo — and custom_build.sh reruns `cargo install`
+      # on every build, so it is cargo's opinion that decides whether the build
+      # succeeds. `--force` makes the repair idempotent from any cache state.
+      - run: |
+          cargo install --list | grep -q '^worker-build v0\.1\.1' \
+            || cargo install worker-build@0.1.1 --locked --force
 
       - run: npm ci
         working-directory: bin/worker
