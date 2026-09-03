@@ -501,6 +501,15 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
     if let Some(domain) = &website_input {
         match resolve_by_website(&g, domain, &parsed.query, &ctx, &mut website_hub_error).await {
             Ok(Some(out)) => {
+                // Step 1's refusal hint says "that domain names a brand — supply an
+                // identifier for the individual thing". On a RESOLVED website answer
+                // that sentence is now false: the domain is exactly what identified
+                // the thing. Carry it only when the caller still has something to
+                // fix (an ambiguous or unresolved verdict).
+                let identifier_hint = match out.canonical_id {
+                    Some(_) => None,
+                    None => identifier_hint,
+                };
                 return answer(
                     &g,
                     &parsed,

@@ -374,6 +374,9 @@ it("an organization's homepage resolves to its QID, before any name search", asy
   expect(json.canonical_id).toBeTruthy();
   expect(json.sameAs).toContain("wikidata:Q17431399");
   expect(json.sameAs).toContain("domain:uber.com");
+  // Step 1's "that domain names a brand, supply something better" hint must NOT
+  // ride along on a resolved answer — the domain is what identified the thing.
+  expect(json.identifier_hint).toBeNull();
   expect(await budgetUsed()).toBe(1);
 
   // One-time cost: the origin now belongs to the org's cluster, so the identical
