@@ -698,6 +698,63 @@ async fn narrow_to_organizations(
         .collect()
 }
 
+/// The cardinality-memory key for a website lookup, namespaced so it can never
+/// collide with a name.
+///
+/// The memory table is keyed by a normalized *name*, and this reuses it rather
+/// than growing a second table (a new `GraphStore` method is two backends plus a
+/// conformance suite, for a row shape that is already exactly right). The leading
+/// `@` is what makes sharing the key space safe: [`normalize::name_key`] trims
+/// non-alphanumerics from the edges of every word, so no name a caller can type
+/// normalizes to a string starting with `@`. A user searching for a band literally
+/// called `@website:uber.com` still cannot reach this row.
+fn website_memo_key(domain: &str) -> String {
+    format!("@website:{domain}")
+}
+
+/// The website crosswalk's **local** half: what a previous lookup proved about this
+/// domain, answered from the graph with zero external calls.
+///
+/// The resolved case needs no memory — the crosswalk binds the domain to the org's
+/// cluster, so a repeat is answered by an ordinary graph hit long before it reaches
+/// here. The *ambiguous* case writes nothing (neither QID may claim the origin), so
+/// without this it would re-spend a budget unit and a WDQS call on every identical
+/// retry, forever. Same brake the name path has, keyed on the domain instead.
+///
+/// A `Unique` row is never written here and is deliberately ignored if one ever
+/// appears: this function's job is to remember a REFUSAL, and answering a
+/// resolution from a memo would bypass the liveness the graph itself provides.
+///
+/// Like the name path's memory, this is a cache of a hub's verdict: a Wikidata edit
+/// that makes the domain unambiguous is not re-read until something invalidates the
+/// row. A stale refusal costs the caller a confirmation step, never a wrong bind.
+pub async fn resolve_by_website_local(
+    graph: &dyn GraphStore,
+    domain: &ExternalId,
+    query: &NameQuery,
+) -> Result<Option<ResolveOutput>> {
+    if domain.kind_tag() != "domain" || !org_shaped(query.entity_type.as_deref()) {
+        return Ok(None);
+    }
+    match graph
+        .name_cardinality(&website_memo_key(domain.value()), &[])
+        .await?
+    {
+        Some(NameCardinality::Ambiguous(stored)) => {
+            let candidates: Vec<Candidate> = stored
+                .into_iter()
+                .map(|(canonical_id, anchor, name)| Candidate {
+                    canonical_id,
+                    anchor,
+                    name,
+                })
+                .collect();
+            Ok(Some(ambiguous_output(query, candidates)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Reverse-resolve a **website** to the organization that publishes it.
 ///
 /// The org counterpart of the name search, and the stronger of the two: a name is
@@ -765,11 +822,14 @@ pub async fn resolve_by_website(
         return Ok(None);
     }
     if found.len() > 1 {
-        // Deliberately NOT written into the (name, qualifiers) cardinality memory:
-        // this ambiguity is a fact about the *website*, and filing it under the
-        // query's name would answer a later name query with a verdict no name
-        // search produced.
         let candidates = search_candidates(graph, &found).await?;
+        // Remembered under the DOMAIN, never under the query's name: this ambiguity
+        // is a fact about the website, and filing it under the name would answer a
+        // later name query with a verdict no name search produced. Keyed this way it
+        // brakes the repeat — nothing is written to the graph on an ambiguous
+        // verdict, so the retry would otherwise re-spend budget and re-call the hub
+        // for the same refusal forever. See `resolve_by_website_local`.
+        remember_ambiguity(graph, &website_memo_key(domain.value()), &[], &candidates).await?;
         return Ok(Some(ambiguous_output(query, candidates)));
     }
 
@@ -2993,6 +3053,130 @@ mod org_tests {
         // store directly — `resolve_id` would mint the very entity being denied.
         assert!(g.find(&domain.key()).await.unwrap().is_none());
         assert!(g.find("wikidata:Q1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_website_is_remembered_so_the_retry_costs_nothing() {
+        // An ambiguous verdict writes nothing to the graph — neither QID may claim
+        // the origin — so without a memo the identical retry re-spends a budget
+        // unit and a WDQS call on the same refusal, forever.
+        //
+        // The second call is made with a transport holding NO fixtures: reaching
+        // out would error, so an ambiguous answer here can only have come from
+        // local memory.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let two_items = json!({ "results": { "bindings": [
+            { "item": { "value": "http://www.wikidata.org/entity/Q1" },
+              "itemLabel": { "value": "Example Inc" },
+              "itemDescription": { "value": "company" } },
+            { "item": { "value": "http://www.wikidata.org/entity/Q2" },
+              "itemLabel": { "value": "Example Foundation" },
+              "itemDescription": { "value": "charitable foundation" } }
+        ]}});
+        let domain = ExternalId::new("domain", "example.org").unwrap();
+        let query = org_query("Example");
+        let mut hub_error = None;
+
+        let live = CompletionCtx::new(Arc::new(FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("example.org"),
+            two_items,
+        )])));
+        let first = resolve_by_website(&g, &domain, &query, &live, &mut hub_error)
+            .await
+            .unwrap()
+            .expect("the hub answered, ambiguously");
+        assert_eq!(first.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+
+        // The brake, consulted before any budget is reserved.
+        let replay = resolve_by_website_local(&g, &domain, &query)
+            .await
+            .unwrap()
+            .expect("the refusal is remembered");
+        assert_eq!(replay.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        assert_eq!(
+            replay.candidates.iter().map(|c| c.anchor.as_str()).collect::<Vec<_>>(),
+            vec!["wikidata:Q1", "wikidata:Q2"]
+        );
+        assert_eq!(replay.candidates[0].name.as_deref(), Some("Example Inc (company)"));
+
+        // Belt and braces: the full path with a transport that cannot answer still
+        // returns the remembered verdict rather than a hub error.
+        let dead = CompletionCtx::new(Arc::new(FixtureTransport::from_pairs(vec![])));
+        let mut retry_error = None;
+        let retry = resolve_by_website(&g, &domain, &query, &dead, &mut retry_error)
+            .await
+            .unwrap();
+        assert!(retry.is_none(), "the hub half has no answer without a fixture");
+        assert!(resolve_by_website_local(&g, &domain, &query)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn the_website_memo_cannot_collide_with_a_name_query() {
+        // The memo shares the name-cardinality table, so the key has to be one no
+        // name can normalize to. `name_key` trims non-alphanumerics from the edges
+        // of every word, so a leading `@` is unreachable from any user input.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let domain = ExternalId::new("domain", "example.org").unwrap();
+        let query = org_query("Example");
+        let two = json!({ "results": { "bindings": [
+            { "item": { "value": "http://www.wikidata.org/entity/Q1" } },
+            { "item": { "value": "http://www.wikidata.org/entity/Q2" } }
+        ]}});
+        let ctx = CompletionCtx::new(Arc::new(FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("example.org"),
+            two,
+        )])));
+        resolve_by_website(&g, &domain, &query, &ctx, &mut None)
+            .await
+            .unwrap();
+
+        // A name query for the literal key string must NOT find the memo.
+        for name in ["@website:example.org", "website:example.org", "example.org"] {
+            let q = NameQuery {
+                name: Some(name.into()),
+                entity_type: Some(ORG.into()),
+                ..Default::default()
+            };
+            assert!(
+                resolve_name_local(&g, &q).await.unwrap().is_none(),
+                "a name query reached the website memo: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_org_candidate_never_buys_a_type_gate_call() {
+        // The <2 short-circuit, pinned. The class query has NO fixture, so if the
+        // gate ran it would fail and report a `hub_error`; a clean resolution is
+        // proof it never ran. (With one candidate the hub has already given an
+        // unambiguous answer — there is nothing to disambiguate, and second-
+        // guessing the only answer we have is not what a disambiguator is for.)
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            (
+                "GET",
+                &search_url("Uber"),
+                json!({ "search": [
+                    { "id": "Q17431399", "label": "Uber",
+                      "description": "American transportation network company" }
+                ]}),
+            ),
+            ("GET", &forward_url("Q17431399"), uber_forward()),
+        ]);
+        let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
+            .await
+            .unwrap();
+        assert_eq!(out.anchor, "wikidata:Q17431399");
+        assert!(
+            out.hub_error.is_none(),
+            "the type gate must not have been called: {:?}",
+            out.hub_error
+        );
     }
 
     #[tokio::test]

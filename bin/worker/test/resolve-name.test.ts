@@ -428,6 +428,57 @@ it("a homepage with no name still gets its one lookup", async () => {
   expect(json.sameAs).toContain("wikidata:Q17431399");
 });
 
+it("an ambiguous homepage is refused once, then remembered", async () => {
+  // Two Wikidata items publish this origin (a company and its foundation), so
+  // neither may claim it and nothing is written. The retry must therefore be
+  // braked locally — otherwise the same refusal re-spends a budget unit and a
+  // WDQS call on every identical publish, forever.
+  const first = await resolveName({
+    name: "Example",
+    entity_type: "organization",
+    identifiers: ["https://example.org"],
+  });
+  expect(first.json.resolved_by).toBe("website");
+  expect(first.json.status).toBe("unresolved");
+  expect(first.json.confidence_reason).toBe("ambiguous_among_n");
+  expect(first.json.candidates.map((c) => c.anchor)).toEqual([
+    "wikidata:Q1",
+    "wikidata:Q2",
+  ]);
+  expect(first.json.hub_called).toBe(true);
+  expect(await budgetUsed()).toBe(1);
+
+  const again = await resolveName({
+    name: "Example",
+    entity_type: "organization",
+    identifiers: ["https://example.org"],
+  });
+  expect(again.json.resolved_by).toBe("website");
+  expect(again.json.hub_called).toBe(false);
+  expect(again.json.confidence_reason).toBe("ambiguous_among_n");
+  expect(again.json.candidates.map((c) => c.anchor)).toEqual([
+    "wikidata:Q1",
+    "wikidata:Q2",
+  ]);
+  // The brake sits ahead of the reservation, so the retry is free.
+  expect(await budgetUsed()).toBe(1);
+});
+
+it("only an organization's identifiers complete from the free hubs", async () => {
+  // The identifier step reaches out ONLY on the path it exists to serve. A
+  // movie-typed QID commits and stops — otherwise every novel identifier the
+  // route accepts would start an unbudgeted hub crawl, and the 429 message's
+  // promise about identifier lookups would be false.
+  const movie = await resolveName({
+    entity_type: "movie",
+    identifiers: ["wikidata:Q17431399"],
+  });
+  expect(movie.json.resolved_by).toBe("identifiers");
+  expect(movie.json.hub_called).toBe(false);
+  expect(movie.json.sameAs).toEqual(["wikidata:Q17431399"]);
+  expect(await budgetUsed()).toBe(0);
+});
+
 it("a place-shaped type never takes the website path", async () => {
   // The Souvla guard, at the route. `souvla.com` is the chain and the caller
   // meant one location; crosswalking it would give every location the SAME

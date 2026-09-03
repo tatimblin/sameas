@@ -35,7 +35,7 @@ pub mod transport;
 
 pub use complete::{
     complete_committed, name_not_found, org_shaped, resolve_and_complete, resolve_by_website,
-    resolve_name, resolve_name_local, CompletionCtx, NameQuery,
+    resolve_by_website_local, resolve_name, resolve_name_local, CompletionCtx, NameQuery,
 };
 pub use confidence::ConfidenceReason;
 pub use correct::{link, merge, split, LinkOutcome};

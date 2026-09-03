@@ -266,7 +266,10 @@ The rules, all of which are grain arguments rather than tuning:
 - **One item or none.** Two Wikidata items sharing a website (a company and its
   foundation) come back as `candidates`, never as a merge. The P856 match is an
   exact `VALUES` lookup of the canonical URL spellings — a substring test would
-  also match `notuber.com`.
+  also match `notuber.com`. That refusal is *remembered* (keyed on the domain), so
+  the identical retry is answered locally and costs no hub call — the same brake
+  the name path has. A resolved homepage needs no memo: the domain joins the org's
+  cluster, so the repeat is an ordinary graph hit.
 - **The type gate filters, it never chooses.** Several organizations still refuse
   with `ambiguous_among_n` + candidates, and a gate that answers nothing (or
   fails) leaves the hub's own ranking untouched.

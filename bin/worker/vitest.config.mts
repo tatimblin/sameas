@@ -128,6 +128,24 @@ function sparqlFixture(query: string): Record<string, unknown> | null {
     };
   }
   if (query.includes("VALUES ?anysite") && query.includes("?itemLabel")) {
+    if (query.includes("example.org")) {
+      // A company and its foundation on one origin: the ambiguous website case,
+      // which writes nothing and therefore needs a repeat brake of its own.
+      return {
+        results: {
+          bindings: [
+            item("Q1", {
+              itemLabel: { value: "Example Inc" },
+              itemDescription: { value: "company" },
+            }),
+            item("Q2", {
+              itemLabel: { value: "Example Foundation" },
+              itemDescription: { value: "charitable foundation" },
+            }),
+          ],
+        },
+      };
+    }
     if (!query.includes("uber.com")) {
       return { results: { bindings: [] } };
     }

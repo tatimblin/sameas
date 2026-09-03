@@ -11,8 +11,8 @@ use sameas_core::store::d1::D1Store;
 use sameas_core::transport::FetchTransport;
 use sameas_core::{
     commit_record, commit_record_with_opts, complete_committed, load_entity, name_not_found,
-    org_shaped, resolve_by_website, resolve_name_local, CommitOpts, CompletionCtx, EntityRecord,
-    ExternalId, GraphStore, ResolveOutput, Status,
+    org_shaped, resolve_by_website, resolve_by_website_local, resolve_name_local, CommitOpts,
+    CompletionCtx, EntityRecord, ExternalId, GraphStore, ResolveOutput, Status,
 };
 use serde_json::json;
 use worker::*;
@@ -309,14 +309,25 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
             // of its crosslinks — an organization QID with no P856 website, when the
             // QID/origin pair is the whole point of asking.
             //
-            // Two bounds make it free and quiet:
+            // Four bounds keep this from becoming unbudgeted, unbounded outbound
+            // work on a step that reserves nothing:
+            //   * **org-shaped types only.** This exists to complete an organization
+            //     to its P856 website; it is not a licence for every `imdb:` or
+            //     `tmdb:` identifier the route has ever accepted to start a hub
+            //     crawl. Scoping it to the path it serves is what keeps the rest of
+            //     the route exactly as local as its 429 message promises.
             //   * `new_edges > 0` — only a cluster that just grew is worth a hub
             //     call. A steady-state repeat of the same identifiers writes nothing
             //     and reaches nowhere, so this stays a local-first route.
+            //   * `max_hops = 1` — one crosswalk is all an org needs (QID → P856),
+            //     and the default 3 would let one request fan out over a cluster
+            //     that keeps growing. A cap that matches the need cannot surprise.
             //   * `free_hubs_only` — no budget is reserved on this step, so it must
             //     not be able to spend. Wikidata/TMDb run; Place Details does not.
-            let (out, hub_called) = if out.new_edges > 0 {
+            let completes = out.new_edges > 0 && org_shaped(parsed.query.entity_type.as_deref());
+            let (out, hub_called) = if completes {
                 let mut ctx = CompletionCtx::new(Arc::new(FetchTransport::new())).free_hubs_only();
+                ctx.max_hops = 1;
                 ctx.tmdb_key = HubKeys::read(env).tmdb;
                 let mut hub_calls = 0usize;
                 match complete_committed(&g, out.clone(), &ctx, &mut hub_calls).await {
@@ -401,6 +412,23 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
         Err(e) => return core_error(e),
     }
 
+    // 2a'. ...and the same brake for the website crosswalk, for the one verdict it
+    //      cannot leave in the graph: an ambiguous homepage writes nothing (neither
+    //      QID may claim the origin), so without this the identical retry re-spends
+    //      budget on the same refusal forever. AFTER the name lookup on purpose —
+    //      a local name hit is a resolution, and a resolution beats a remembered
+    //      ambiguity.
+    if let Some(domain) = &website_input {
+        match resolve_by_website_local(&g, domain, &parsed.query).await {
+            Ok(Some(out)) => {
+                let meta = Meta::local(Step::Website).with_identifier_hint(identifier_hint);
+                return answer(&g, &parsed, out, meta, &input_desc).await;
+            }
+            Ok(None) => {}
+            Err(e) => return core_error(e),
+        }
+    }
+
     // 2b. A hub call is now on the table. Route by entity type, then check that
     //     the hub is actually configured — before touching the budget.
     let hub = name_hub_for(parsed.query.entity_type.as_deref());
@@ -469,7 +497,9 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
                 &format!(
                     "daily hub-call budget exhausted for this caller ({limit}/day). Retry after \
                      00:00 UTC, or resolve with a stronger identifier — identifier lookups and \
-                     repeat name queries are served locally and are never budgeted."
+                     repeat name queries never reserve budget. (An organization committed by \
+                     identifier may still complete through the free Wikidata crosswalk; that \
+                     call is free and unmetered, and no metered hub is reachable from it.)"
                 ),
                 "quota_exhausted",
                 429,
