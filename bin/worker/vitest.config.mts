@@ -120,10 +120,20 @@ function sparqlFixture(query: string): Record<string, unknown> | null {
     ...extra,
   });
   if (query.includes("wdt:P31/wdt:P279*")) {
-    // Of whatever was asked about, only Uber the company is an organization.
+    // Every one of these is TYPED (they appear in the answer at all); only Uber
+    // the company reaches an organization root. The album and the preposition are
+    // positively contradicted, which is the only thing that may remove a
+    // candidate — an item absent from this answer has no P31 and survives.
+    const typed: [string, boolean][] = [
+      ["Q17431399", true],
+      ["Q7877036", false],
+      ["Q2475886", false],
+    ];
     return {
       results: {
-        bindings: query.includes("wd:Q17431399") ? [item("Q17431399")] : [],
+        bindings: typed
+          .filter(([qid]) => query.includes(`wd:${qid}`))
+          .map(([qid, org]) => item(qid, org ? { org: { value: "true" } } : {})),
       },
     };
   }

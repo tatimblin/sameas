@@ -632,26 +632,35 @@ pub fn org_shaped(entity_type: Option<&str>) -> bool {
     )
 }
 
-/// Narrow a Wikidata candidate list to the items Wikidata itself types as
-/// organizations (P31 → P279\* → one of the org class roots).
+/// Remove the candidates Wikidata **positively types as something other than an
+/// organization** (`P31 → P279*` reaching none of the org class roots).
 ///
-/// A **disambiguator, not a chooser** — the same contract as
-/// [`narrow_by_qualifiers`], and it bails at the same place: with fewer than two
-/// candidates the hub has given an unambiguous answer and there is nothing to
-/// disambiguate, so it buys a hub call to second-guess the only answer we have.
-/// Whatever survives is still subject to the ordinary "one resolves, several
-/// refuse with candidates" rule — this never breaks a tie.
+/// Only a positive contradiction removes a candidate. An item with no `P31` at
+/// all, or one whose subclass chain never reaches a root we listed, survives:
+/// absence of evidence is not evidence, and treating silence as a verdict would
+/// drop a real organization whose sibling merely happened to be better described.
+///
+/// It bails below two candidates, like [`narrow_by_qualifiers`]: with one
+/// candidate the hub has already given an unambiguous answer, and buying a hub
+/// call to second-guess the only answer we have is not what a disambiguator is
+/// for.
+///
+/// Whatever survives goes back to the ordinary rule — one resolves, several refuse
+/// with candidates. This never ranks and never breaks a tie; when it is what
+/// reduced the list to one, the caller says so with
+/// [`ConfidenceReason::TypeGateUniqueMatch`] rather than passing the survivor off
+/// as a lone hub answer. Returns `true` alongside the list when it removed
+/// anything, which is exactly that signal.
 ///
 /// **Fail-open in every direction**: a hub error, a response that types nothing,
-/// or a filter that would empty the list all leave the input list untouched. A
-/// narrowing that erases the right answer is worse than noise the caller can read.
+/// or a filter that would empty the list all leave the input list untouched.
 async fn narrow_to_organizations(
     found: Vec<HubCandidate>,
     ctx: &CompletionCtx,
     hub_error: &mut Option<String>,
-) -> Vec<HubCandidate> {
+) -> (Vec<HubCandidate>, bool) {
     if found.len() < 2 {
-        return found;
+        return (found, false);
     }
     // Every candidate must be a QID for the class query to speak about the whole
     // list; a mixed list is not this gate's shape.
@@ -661,20 +670,20 @@ async fn narrow_to_organizations(
         .map(|c| c.id.value().to_string())
         .collect();
     if qids.len() != found.len() {
-        return found;
+        return (found, false);
     }
-    let orgs = match WikidataClassResolver::new(qids, ctx.transport.clone())
-        .org_shaped()
+    let facts = match WikidataClassResolver::new(qids, ctx.transport.clone())
+        .classify()
         .await
     {
-        Ok(orgs) => orgs,
+        Ok(facts) => facts,
         Err(e) => {
             // Report, but do not clobber a failure the search itself already
             // recorded — that one explains more.
             if hub_error.is_none() {
                 *hub_error = Some(hub_failure(NameHub::Wikidata, &e));
             }
-            return found;
+            return (found, false);
         }
     };
     // Index-then-filter, like `narrow_by_qualifiers`, so the fail-open case still
@@ -684,18 +693,19 @@ async fn narrow_to_organizations(
     let keep: Vec<usize> = found
         .iter()
         .enumerate()
-        .filter(|(_, c)| orgs.contains(c.id.value()))
+        .filter(|(_, c)| !facts.is_typed_non_org(c.id.value()))
         .map(|(i, _)| i)
         .collect();
-    if keep.is_empty() {
-        return found;
+    if keep.is_empty() || keep.len() == found.len() {
+        return (found, false);
     }
-    found
+    let kept = found
         .into_iter()
         .enumerate()
         .filter(|(i, _)| keep.contains(i))
         .map(|(_, c)| c)
-        .collect()
+        .collect();
+    (kept, true)
 }
 
 /// The cardinality-memory key for a website lookup, namespaced so it can never
@@ -1074,11 +1084,12 @@ async fn search_branch(
     // organization query comes back mixed with albums and prepositions. Only for
     // org-shaped types, only on the free hub, and never a tie-breaker — see
     // `narrow_to_organizations`.
-    let found = if hub == NameHub::Wikidata && org_shaped(query.entity_type.as_deref()) {
-        narrow_to_organizations(found, ctx, hub_error).await
-    } else {
-        found
-    };
+    let (found, type_gate_narrowed) =
+        if hub == NameHub::Wikidata && org_shaped(query.entity_type.as_deref()) {
+            narrow_to_organizations(found, ctx, hub_error).await
+        } else {
+            (found, false)
+        };
 
     if found.is_empty() {
         return Ok(hub_miss(query, hub));
@@ -1105,8 +1116,15 @@ async fn search_branch(
     }
     // `PlaceUniqueMatch` is the "a text query resolved to a SINGLE hub result"
     // tier; the name is a leftover from when places were the only name hub (the
-    // gradient itself is type-agnostic — see `confidence.rs`).
-    let reason = ConfidenceReason::PlaceUniqueMatch;
+    // gradient itself is type-agnostic — see `confidence.rs`). When the TYPE GATE
+    // is what reduced the list to one, say so instead: the hub did not answer
+    // uniquely, we filtered its answer down, and a caller weighing whether to
+    // confirm with its user is entitled to know which of those happened.
+    let reason = if type_gate_narrowed {
+        ConfidenceReason::TypeGateUniqueMatch
+    } else {
+        ConfidenceReason::PlaceUniqueMatch
+    };
     out.confidence = score(&reason);
     out.confidence_reason = reason;
 
@@ -2849,10 +2867,19 @@ mod org_tests {
             "website": { "value": "https://www.uber.com/" }
         }]}})
     }
-    fn qids(v: &[&str]) -> Value {
+    /// A class-query answer. Each entry is `(qid, is_org)` and lists an item that
+    /// carries SOME `P31`; a QID left out of the list entirely is untyped, which
+    /// the gate must never treat as a verdict.
+    fn classified(v: &[(&str, bool)]) -> Value {
         json!({ "results": { "bindings":
-            v.iter().map(|q| json!({ "item": { "value":
-                format!("http://www.wikidata.org/entity/{q}") } })).collect::<Vec<_>>()
+            v.iter().map(|(q, org)| {
+                let mut row = json!({ "item": { "value":
+                    format!("http://www.wikidata.org/entity/{q}") } });
+                if *org {
+                    row["org"] = json!({ "value": "true" });
+                }
+                row
+            }).collect::<Vec<_>>()
         }})
     }
 
@@ -2887,11 +2914,11 @@ mod org_tests {
         let g = SqliteStore::open_in_memory().unwrap();
         let transport = FixtureTransport::from_pairs(vec![
             ("GET", &search_url("Uber"), uber_search()),
-            // The type gate: only the company is organization-shaped.
+            // The type gate: all three are typed, only the company is an org.
             (
                 "GET",
                 &class_url(&["Q17431399", "Q7877036", "Q2475886"]),
-                qids(&["Q17431399"]),
+                classified(&[("Q17431399", true), ("Q7877036", false), ("Q2475886", false)]),
             ),
             ("GET", &forward_url("Q17431399"), uber_forward()),
         ]);
@@ -2901,6 +2928,10 @@ mod org_tests {
 
         assert_eq!(out.status, Status::New);
         assert_eq!(out.anchor, "wikidata:Q17431399");
+        // The GATE reduced three to one, not the hub — and the answer says so
+        // rather than passing this off as a lone hub result.
+        assert_eq!(out.confidence_reason, ConfidenceReason::TypeGateUniqueMatch);
+        assert_eq!(out.confidence, crate::confidence::PLACE_UNIQUE);
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"wikidata:Q17431399".to_string()), "keys={keys:?}");
         assert!(
@@ -2937,7 +2968,12 @@ mod org_tests {
             (
                 "GET",
                 &class_url(&["Q308", "Q1090", "Q1130265", "Q6819103"]),
-                qids(&["Q1130265", "Q6819103"]),
+                classified(&[
+                    ("Q308", false),
+                    ("Q1090", false),
+                    ("Q1130265", true),
+                    ("Q6819103", true),
+                ]),
             ),
         ]);
         let out = resolve_name(
@@ -3177,6 +3213,50 @@ mod org_tests {
             "the type gate must not have been called: {:?}",
             out.hub_error
         );
+        // And a genuinely-unique HUB answer keeps the old reason: only the
+        // gate-narrowed path earns the new one.
+        assert_eq!(out.confidence_reason, ConfidenceReason::PlaceUniqueMatch);
+    }
+
+    #[tokio::test]
+    async fn an_untyped_candidate_survives_the_gate_and_keeps_the_answer_ambiguous() {
+        // The absence rule, and the reason it matters: only a POSITIVE
+        // contradiction removes a candidate. Three hits — a company (typed org),
+        // an album (typed, not an org), and an item Wikidata has never typed at
+        // all. The gate removes exactly the album.
+        //
+        // What is left is two, so the answer stays a refusal with candidates. The
+        // older behavior — remove anything not positively classified — would have
+        // dropped the untyped item too, narrowed to one, and auto-committed a
+        // resolution on the strength of a gap in Wikidata's coverage.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("GET", &search_url("Uber"), uber_search()),
+            (
+                "GET",
+                &class_url(&["Q17431399", "Q7877036", "Q2475886"]),
+                // Q2475886 is absent from the answer entirely: no P31 at all.
+                classified(&[("Q17431399", true), ("Q7877036", false)]),
+            ),
+        ]);
+        let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(
+            out.confidence_reason,
+            ConfidenceReason::AmbiguousAmongN(2),
+            "an untyped candidate must not be filtered into an auto-commit"
+        );
+        let anchors: Vec<&str> = out.candidates.iter().map(|c| c.anchor.as_str()).collect();
+        assert_eq!(anchors, vec!["wikidata:Q17431399", "wikidata:Q2475886"]);
+        assert!(
+            !anchors.contains(&"wikidata:Q7877036"),
+            "the album is the one thing Wikidata positively contradicted"
+        );
+        // Nothing was committed on the strength of a filtered list.
+        assert!(g.find("wikidata:Q17431399").await.unwrap().is_none());
     }
 
     #[tokio::test]

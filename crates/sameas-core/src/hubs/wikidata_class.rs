@@ -8,13 +8,21 @@
 //! worse answer than the hub can support, and it turns a resolvable query into a
 //! refusal the caller cannot act on.
 //!
-//! **This is a filter, never a chooser.** It removes candidates that Wikidata
-//! itself says are not organizations; it never ranks, scores, or breaks a tie
-//! among the survivors. If the filter leaves more than one, the answer is still
-//! `ambiguous_among_n` with candidates — refuse over guess is untouched. And it is
-//! **fail-open** at every step (a hub error, a shapeless response, or a filter
-//! that would empty the list leaves the original list alone), because a narrowing
-//! that erases the right answer is worse than noise the caller can read.
+//! **It removes only what Wikidata positively contradicts.** The question asked of
+//! each candidate is not "is this an organization?" but "does Wikidata say this is
+//! something else?" — and only a *yes* removes it. An item with no `P31` at all, or
+//! one whose subclass chain never reaches a root we know, is **kept**: absence of
+//! evidence is not evidence, and Wikidata's coverage is uneven enough that treating
+//! silence as a verdict would drop real organizations whose sibling happened to be
+//! better described. That distinction is why the query asks for two facts, not one
+//! (`?item wdt:P31 ?any` for *typed at all*, the OPTIONAL closure for *org*).
+//!
+//! It never ranks, scores, or breaks a tie among the survivors. Whatever is left
+//! goes back to the ordinary rule — one resolves, several refuse with candidates —
+//! and a survivor that reached one BECAUSE of this gate is labelled
+//! `type_gate_unique_match` rather than passed off as a lone hub answer. It is also
+//! **fail-open** at every step (a hub error, a shapeless response, or a filter that
+//! would empty the list leaves the original list alone).
 //!
 //! One SPARQL call for the whole candidate set (`VALUES ?item { … }`), on the free
 //! hub, so an org name query costs two Wikidata calls and no money.
@@ -47,6 +55,28 @@ const ENDPOINT: &str = "https://query.wikidata.org/sparql";
 ///   and a brand item carries the P856 the org path is after.
 const ORG_CLASS_ROOTS: &[&str] = &["Q43229", "Q4830453", "Q431289"];
 
+/// What one class query learned about a candidate set.
+///
+/// Two sets rather than one, because "not known to be an organization" and "known
+/// to be something else" are different answers and only the second may remove a
+/// candidate. An item missing from `typed` had no `P31` at all.
+#[derive(Debug, Default)]
+pub struct ClassFacts {
+    /// Items carrying at least one `P31` statement.
+    pub typed: HashSet<String>,
+    /// Items whose `P31/P279*` chain reaches one of [`ORG_CLASS_ROOTS`].
+    pub org: HashSet<String>,
+}
+
+impl ClassFacts {
+    /// The only question the gate is allowed to act on: does Wikidata positively
+    /// say this is something other than an organization? An untyped item answers
+    /// `false` — it is kept.
+    pub fn is_typed_non_org(&self, qid: &str) -> bool {
+        self.typed.contains(qid) && !self.org.contains(qid)
+    }
+}
+
 pub struct WikidataClassResolver {
     qids: Vec<String>,
     transport: Arc<dyn HttpTransport>,
@@ -70,11 +100,20 @@ impl WikidataClassResolver {
             .map(|c| format!("wd:{c}"))
             .collect::<Vec<_>>()
             .join(" ");
+        // `?item wdt:P31 ?any` is REQUIRED, so an item with no instance-of
+        // statement never appears in the results at all — that absence is the
+        // "untyped, keep it" signal. The org test is OPTIONAL on top, so a typed
+        // item that is not an organization comes back with `?org` unbound. One
+        // round trip, both facts.
         format!(
-            "SELECT ?item WHERE {{ \
+            "SELECT ?item ?org WHERE {{ \
                VALUES ?item {{ {items} }} \
-               VALUES ?class {{ {classes} }} \
-               ?item wdt:P31/wdt:P279* ?class. \
+               ?item wdt:P31 ?any. \
+               OPTIONAL {{ \
+                 VALUES ?class {{ {classes} }} \
+                 ?item wdt:P31/wdt:P279* ?class. \
+                 BIND(true AS ?org) \
+               }} \
              }}"
         )
     }
@@ -85,32 +124,46 @@ impl WikidataClassResolver {
         format!("{ENDPOINT}?format=json&query={encoded}")
     }
 
-    /// The subset of the input QIDs that are organization-shaped.
-    pub async fn org_shaped(&self) -> Result<HashSet<String>> {
+    /// What the hub knows about the class of each input QID.
+    pub async fn classify(&self) -> Result<ClassFacts> {
         if self.qids.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(ClassFacts::default());
         }
         let value = self.transport.get_json(&self.url()).await?;
         Ok(Self::parse(&value))
     }
 
-    /// Collect the `?item` bindings as normalized QID values. A subclass chain can
-    /// reach several roots, so one item can appear several times — a set.
-    pub fn parse(value: &Value) -> HashSet<String> {
+    /// Fold the bindings into [`ClassFacts`].
+    ///
+    /// An item appears once per `P31` value, and again per class root its chain
+    /// reaches, so the same QID arrives many times with `?org` bound on some rows
+    /// and not others. Aggregation is therefore a union, not a per-row verdict:
+    /// `?org` bound on ANY row means organization. Reading one row in isolation
+    /// would type a company as non-org whenever its first `P31` happened to sort
+    /// first.
+    pub fn parse(value: &Value) -> ClassFacts {
+        let mut facts = ClassFacts::default();
         let bindings = match value
             .get("results")
             .and_then(|r| r.get("bindings"))
             .and_then(|b| b.as_array())
         {
             Some(b) => b,
-            None => return HashSet::new(),
+            None => return facts,
         };
-        bindings
-            .iter()
-            .filter_map(|b| binding_value(b, "item"))
-            .filter_map(|item| ExternalId::new("wikidata", item).ok())
-            .map(|id| id.value().to_string())
-            .collect()
+        for b in bindings {
+            let qid = match binding_value(b, "item")
+                .and_then(|item| ExternalId::new("wikidata", item).ok())
+            {
+                Some(id) => id.value().to_string(),
+                None => continue,
+            };
+            if binding_value(b, "org").is_some() {
+                facts.org.insert(qid.clone());
+            }
+            facts.typed.insert(qid);
+        }
+        facts
     }
 }
 
@@ -120,24 +173,60 @@ mod tests {
     use crate::transport::FixtureTransport;
     use serde_json::json;
 
-    #[test]
-    fn parses_and_dedupes_item_bindings() {
-        let v = json!({ "results": { "bindings": [
-            { "item": { "value": "http://www.wikidata.org/entity/Q17431399" } },
-            // Reached through two class roots — one item, not two.
-            { "item": { "value": "http://www.wikidata.org/entity/Q17431399" } },
-            { "item": { "value": "http://www.wikidata.org/entity/Q95" } }
-        ]}});
-        let set = WikidataClassResolver::parse(&v);
-        assert_eq!(set.len(), 2);
-        assert!(set.contains("Q17431399"));
+    fn row(qid: &str, org: bool) -> Value {
+        let mut o = json!({ "item": { "value": format!("http://www.wikidata.org/entity/{qid}") } });
+        if org {
+            o["org"] = json!({ "value": "true" });
+        }
+        o
     }
 
     #[test]
-    fn a_shapeless_response_is_an_empty_set_not_an_error() {
-        // Fail-open depends on this: the caller reads "narrowed to nothing" and
-        // keeps the original list.
-        assert!(WikidataClassResolver::parse(&json!({})).is_empty());
+    fn org_is_a_union_over_rows_never_a_per_row_verdict() {
+        // One item arrives once per P31 value and once per class root reached, so
+        // the SAME qid shows up with `?org` bound on some rows and not others.
+        // Reading a row in isolation would type a company as non-org whenever its
+        // other P31 sorted first.
+        let v = json!({ "results": { "bindings": [
+            row("Q17431399", false),
+            row("Q17431399", true),
+            row("Q7877036", false)
+        ]}});
+        let facts = WikidataClassResolver::parse(&v);
+        assert!(!facts.is_typed_non_org("Q17431399"), "one org row is enough");
+        assert!(facts.is_typed_non_org("Q7877036"), "typed, and never an org");
+    }
+
+    #[test]
+    fn an_item_with_no_p31_is_not_typed_and_so_is_never_removed() {
+        // The absence rule. An untyped item never appears in the results at all,
+        // and silence must not read as "not an organization".
+        let facts = WikidataClassResolver::parse(&json!({ "results": { "bindings": [
+            row("Q17431399", true)
+        ]}}));
+        assert!(!facts.is_typed_non_org("Q2475886"));
+        assert!(!facts.typed.contains("Q2475886"));
+    }
+
+    #[test]
+    fn a_shapeless_response_removes_nothing() {
+        // Fail-open depends on this: nothing is typed, so nothing is removable.
+        let facts = WikidataClassResolver::parse(&json!({}));
+        assert!(facts.typed.is_empty() && facts.org.is_empty());
+        assert!(!facts.is_typed_non_org("Q1"));
+    }
+
+    #[test]
+    fn the_query_asks_for_typed_at_all_and_org_separately() {
+        let q = WikidataClassResolver::new(
+            vec!["Q1".into()],
+            Arc::new(FixtureTransport::from_pairs(vec![])),
+        )
+        .query();
+        // The required triple is the "typed at all" probe; the closure is optional
+        // on top. Collapsing them back into one would restore absence-removal.
+        assert!(q.contains("?item wdt:P31 ?any."), "q={q}");
+        assert!(q.contains("OPTIONAL") && q.contains("BIND(true AS ?org)"), "q={q}");
     }
 
     #[test]
@@ -156,10 +245,11 @@ mod tests {
     async fn an_empty_input_makes_no_call_at_all() {
         // The transport has no fixtures: a call would error, so this asserts the
         // short-circuit rather than just the result.
-        let set = WikidataClassResolver::new(vec![], Arc::new(FixtureTransport::from_pairs(vec![])))
-            .org_shaped()
-            .await
-            .unwrap();
-        assert!(set.is_empty());
+        let facts =
+            WikidataClassResolver::new(vec![], Arc::new(FixtureTransport::from_pairs(vec![])))
+                .classify()
+                .await
+                .unwrap();
+        assert!(facts.typed.is_empty());
     }
 }

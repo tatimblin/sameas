@@ -34,6 +34,7 @@ interface NameResponse {
   action: string;
   status: string;
   canonical_id: string | null;
+  confidence: number;
   confidence_reason: string;
   hint: string | null;
   identifier_hint: string | null;
@@ -343,8 +344,12 @@ it("an organization name resolves to a QID and carries its website", async () =>
   // Free hub only: the org path must never route to billable Places.
   expect(json.name_hub).toBe("wikidata");
   expect(json.status).toBe("new");
-  expect(json.confidence_reason).toBe("place_unique_match");
-  // The type gate did its work — without it, three candidates and a refusal.
+  // The GATE narrowed three hits to one — the hub did not answer uniquely — and
+  // the reason says which happened, so a consumer can decide whether to confirm
+  // with its user. The score is unchanged (0.8): same evidence, different
+  // provenance.
+  expect(json.confidence_reason).toBe("type_gate_unique_match");
+  expect(json.confidence).toBe(0.8);
   expect(json.candidates).toEqual([]);
   expect(json.sameAs).toContain("wikidata:Q17431399");
   // The P856 crosswalk: this pair is what lets a bare-origin citer and a QID

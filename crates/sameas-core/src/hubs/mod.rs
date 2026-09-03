@@ -35,7 +35,7 @@ pub use places::{PlaceCandidate, PlaceDetailsResolver, PlaceTextSearchResolver, 
 pub use tmdb::TmdbResolver;
 pub use tmdb_search::TmdbSearchResolver;
 pub use wikidata::WikidataResolver;
-pub use wikidata_class::WikidataClassResolver;
+pub use wikidata_class::{ClassFacts, WikidataClassResolver};
 pub use wikidata_search::WikidataSearchResolver;
 pub use wikidata_website::WikidataWebsiteResolver;
 

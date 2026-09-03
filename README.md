@@ -270,9 +270,16 @@ The rules, all of which are grain arguments rather than tuning:
   the identical retry is answered locally and costs no hub call — the same brake
   the name path has. A resolved homepage needs no memo: the domain joins the org's
   cluster, so the repeat is an ordinary graph hit.
-- **The type gate filters, it never chooses.** Several organizations still refuse
-  with `ambiguous_among_n` + candidates, and a gate that answers nothing (or
-  fails) leaves the hub's own ranking untouched.
+- **The type gate removes only what Wikidata contradicts.** It asks "does Wikidata
+  say this is something else?", and only a *yes* drops a candidate: an item with no
+  `P31` at all, or one whose subclass chain reaches no root we listed, survives —
+  silence is not a verdict. It never ranks or breaks a tie among the survivors, and
+  a gate that answers nothing (or fails) leaves the hub's own ranking untouched.
+  When the removals happen to leave **exactly one**, that survivor is committed
+  like any other unique answer, but labelled `type_gate_unique_match` rather than
+  `place_unique_match` — the hub did not answer uniquely, we narrowed it, and a
+  caller deciding whether to confirm with its user needs to tell those apart. Two
+  or more survivors still refuse with `ambiguous_among_n` + candidates.
 - **Free tier only.** Organizations route to Wikidata, which needs no key and
   costs nothing. Nothing on this path can reach Google Places.
 
