@@ -163,7 +163,10 @@ pub async fn resolve_and_complete(
 ) -> Result<ResolveOutput> {
     // 1. Local-first commit — establishes the canonical id + input confidence.
     let seed = commit_record_with_source(graph, input, "input").await?;
-    complete_committed(graph, seed, ctx).await
+    // The dispatch count is an observability signal for a front-end that has to
+    // tell a caller whether it went anywhere; this entry point has no one to tell.
+    let mut hub_calls = 0usize;
+    complete_committed(graph, seed, ctx, &mut hub_calls).await
 }
 
 /// The completion half of [`resolve_and_complete`], over a cluster that has
@@ -180,10 +183,17 @@ pub async fn resolve_and_complete(
 ///
 /// `seed` carries the input→entity attachment metadata (status, `matched_via`,
 /// confidence reason); this returns the reloaded cluster wearing it.
+///
+/// `hub_calls` counts the adapters actually **dispatched** — not the edges they
+/// produced. A front-end reports "did this request reach out" from it, and the two
+/// are different questions: most completions dispatch nothing at all (a Yelp slug
+/// has no forward crosswalk), and a hub that answers with nothing new still went
+/// out over the wire.
 pub async fn complete_committed(
     graph: &dyn GraphStore,
     seed: ResolveOutput,
     ctx: &CompletionCtx,
+    hub_calls: &mut usize,
 ) -> Result<ResolveOutput> {
     // Refused (no strong key) → nothing resolvable to complete.
     let canonical_id = match &seed.canonical_id {
@@ -213,6 +223,7 @@ pub async fn complete_committed(
                 if !ctx.allow_billable_hubs && hub_is_billable(hub) {
                     continue;
                 }
+                *hub_calls += 1;
                 if let Some(record) = run_hub(hub, id, ctx).await {
                     let out = commit_record_with_source(graph, &record, source_for(hub)).await?;
                     total_new_edges += out.new_edges;
@@ -773,7 +784,8 @@ pub async fn resolve_by_website(
         same_as: vec![only.id, domain.clone()],
     };
     let seed = commit_record_with_source(graph, &record, "wikidata").await?;
-    let mut out = complete_committed(graph, seed, ctx).await?;
+    let mut hub_calls = 0usize;
+    let mut out = complete_committed(graph, seed, ctx, &mut hub_calls).await?;
     if out.canonical_id.is_none() {
         // Unreachable: the record carries an Identity key, so the commit cannot
         // refuse. Falling through beats answering with a refusal we cannot explain.
@@ -3113,7 +3125,7 @@ mod org_tests {
         )
         .await
         .unwrap();
-        let out = complete_committed(&g, seed, &ctx).await.unwrap();
+        let out = complete_committed(&g, seed, &ctx, &mut 0).await.unwrap();
 
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"domain:uber.com".to_string()), "keys={keys:?}");

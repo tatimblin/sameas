@@ -46,6 +46,9 @@ const SOUVLA_PLACES: [string, string, string][] = [
  * entities colliding on a name — and (c) — one franchise, many works.
  */
 function hubFixture(url: URL): Record<string, unknown> | null {
+  if (url.hostname === "query.wikidata.org") {
+    return sparqlFixture(url.searchParams.get("query") ?? "");
+  }
   if (
     url.hostname === "www.wikidata.org" &&
     url.searchParams.get("action") === "wbsearchentities"
@@ -68,9 +71,87 @@ function hubFixture(url: URL): Record<string, unknown> | null {
         ],
       };
     }
+    if (search === "uber") {
+      // The organization case, and the reason the type gate exists: Wikidata's
+      // own ranking hands back a company, an album and a preposition.
+      return {
+        searchinfo: { search: "Uber" },
+        search: [
+          {
+            id: "Q17431399",
+            label: "Uber",
+            description: "American transportation network company",
+          },
+          {
+            id: "Q7877036",
+            label: "Uber",
+            description: "1998 album by Nomeansno",
+          },
+          { id: "Q2475886", label: "Über", description: "German preposition" },
+        ],
+      };
+    }
     // A hub that answers "nothing" is a legitimate, tested outcome (the route
     // must report a miss, not an error) and still costs no network.
     return { searchinfo: { search }, search: [] };
+  }
+  return null;
+}
+
+/**
+ * Canned SPARQL answers for the ORGANIZATION path, matched on the query text.
+ *
+ * Three different queries reach `query.wikidata.org` for one org resolution and
+ * they are told apart by shape, not by a URL: the encoded SPARQL string IS the
+ * request, and hand-writing three exact encodings here would break on any
+ * whitespace change in the adapters. What each one is for:
+ *
+ *   * `P31/P279*` — the type gate. `wbsearchentities` ranks by relevance, so
+ *     "Uber" comes back as a company, an album and a German preposition; this says
+ *     only the company is organization-shaped.
+ *   * `VALUES ?anysite` + `?itemLabel` — the website reverse lookup: who publishes
+ *     `uber.com`.
+ *   * `VALUES ?item { wd:… }` — the forward crosswalk, whose P856 is the payload
+ *     the whole path exists to fetch (the QID/origin pair a consumer clusters on).
+ */
+function sparqlFixture(query: string): Record<string, unknown> | null {
+  const item = (qid: string, extra: Record<string, unknown> = {}) => ({
+    item: { value: `http://www.wikidata.org/entity/${qid}` },
+    ...extra,
+  });
+  if (query.includes("wdt:P31/wdt:P279*")) {
+    // Of whatever was asked about, only Uber the company is an organization.
+    return {
+      results: {
+        bindings: query.includes("wd:Q17431399") ? [item("Q17431399")] : [],
+      },
+    };
+  }
+  if (query.includes("VALUES ?anysite") && query.includes("?itemLabel")) {
+    if (!query.includes("uber.com")) {
+      return { results: { bindings: [] } };
+    }
+    return {
+      results: {
+        bindings: [
+          item("Q17431399", {
+            itemLabel: { value: "Uber" },
+            itemDescription: {
+              value: "American transportation network company",
+            },
+          }),
+        ],
+      },
+    };
+  }
+  if (query.includes("VALUES ?item { wd:Q17431399 }")) {
+    return {
+      results: {
+        bindings: [
+          item("Q17431399", { website: { value: "https://www.uber.com/" } }),
+        ],
+      },
+    };
   }
   return null;
 }

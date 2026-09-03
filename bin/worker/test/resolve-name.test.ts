@@ -324,6 +324,136 @@ it("a free hub IS called, reserves budget, and returns candidates", async () => 
   expect(await budgetUsed()).toBe(1);
 });
 
+// --- The organization path ------------------------------------------------
+//
+// agent-web publishes `info.cursive.organization` records whose natural
+// identifier is a brand homepage. What the Worker adds over the core's own
+// fixture tests is the ORCHESTRATION: that an org name routes to the free hub
+// and completes, that a homepage is tried BEFORE the name, and that a
+// place-shaped type is never allowed near either.
+
+it("an organization name resolves to a QID and carries its website", async () => {
+  const { json } = await resolveName({
+    name: "Uber",
+    entity_type: "info.cursive.organization",
+    identifiers: [],
+  });
+
+  expect(json.resolved_by).toBe("name_search");
+  // Free hub only: the org path must never route to billable Places.
+  expect(json.name_hub).toBe("wikidata");
+  expect(json.status).toBe("new");
+  expect(json.confidence_reason).toBe("place_unique_match");
+  // The type gate did its work — without it, three candidates and a refusal.
+  expect(json.candidates).toEqual([]);
+  expect(json.sameAs).toContain("wikidata:Q17431399");
+  // The P856 crosswalk: this pair is what lets a bare-origin citer and a QID
+  // citer land in one cluster downstream.
+  expect(json.sameAs).toContain("domain:uber.com");
+  // ...but only the QID projects to a URL — `domain` has no URL form by design.
+  expect(json.sameAs_urls).toEqual([
+    "https://www.wikidata.org/wiki/Q17431399",
+  ]);
+  expect(json.hub_error).toBeNull();
+});
+
+it("an organization's homepage resolves to its QID, before any name search", async () => {
+  // The reverse path. A registrable domain is Affiliation grain, so step 1
+  // refuses it — correctly — and the caller is left holding an identifier that
+  // names the right thing and cannot resolve it. Wikidata's P856 turns it into
+  // the Identity key the caller could not supply.
+  const { json } = await resolveName({
+    name: "Uber",
+    entity_type: "info.cursive.organization",
+    identifiers: ["https://uber.com"],
+  });
+
+  expect(json.resolved_by).toBe("website");
+  expect(json.status).toBe("new");
+  expect(json.confidence_reason).toBe("hub_crosswalk");
+  expect(json.canonical_id).toBeTruthy();
+  expect(json.sameAs).toContain("wikidata:Q17431399");
+  expect(json.sameAs).toContain("domain:uber.com");
+  expect(await budgetUsed()).toBe(1);
+
+  // One-time cost: the origin now belongs to the org's cluster, so the identical
+  // publish never reaches a hub again and never spends budget again.
+  //
+  // It does NOT come back as a plain hit, and that is the strict grain rule
+  // working as designed rather than a gap: a bare domain that reaches an
+  // identity-bearing cluster is `ambiguous_among_n`, because the rule cannot know
+  // that THIS domain names the whole entity while `souvla.com` names a chain. The
+  // caller gets the one entity it means as a candidate — anchor and url both — and
+  // confirms it by echoing the `ref`. Relaxing this per type is a policy decision
+  // for the consumer's anchor policy, not something the resolver may assume.
+  const again = await resolveName({
+    name: "Uber",
+    entity_type: "info.cursive.organization",
+    identifiers: ["https://uber.com"],
+  });
+  expect(again.json.resolved_by).toBe("identifiers");
+  expect(again.json.hub_called).toBe(false);
+  expect(again.json.confidence_reason).toBe("ambiguous_among_n");
+  expect(again.json.candidates).toHaveLength(1);
+  expect(again.json.candidates[0].canonical_id).toBe(json.canonical_id);
+  expect(again.json.candidates[0].anchor).toBe("wikidata:Q17431399");
+  expect(again.json.candidates[0].url).toBe(
+    "https://www.wikidata.org/wiki/Q17431399",
+  );
+  expect(await budgetUsed()).toBe(1);
+  expect(await entityCount()).toBe(1);
+
+  // ...and echoing that ref back is a clean hit on the same entity.
+  const confirmed = await resolveName({
+    entity_type: "info.cursive.organization",
+    identifiers: [again.json.candidates[0].anchor],
+  });
+  expect(confirmed.json.status).toBe("hit");
+  expect(confirmed.json.canonical_id).toBe(json.canonical_id);
+  expect(confirmed.json.sameAs).toContain("domain:uber.com");
+  expect(await budgetUsed()).toBe(1);
+});
+
+it("a homepage with no name still gets its one lookup", async () => {
+  // Without the website path this request could not be answered at all: no name
+  // to search by, and an Affiliation-only identifier to refuse.
+  const { json } = await resolveName({
+    entity_type: "organization",
+    identifiers: ["https://uber.com"],
+  });
+  expect(json.resolved_by).toBe("website");
+  expect(json.sameAs).toContain("wikidata:Q17431399");
+});
+
+it("a place-shaped type never takes the website path", async () => {
+  // The Souvla guard, at the route. `souvla.com` is the chain and the caller
+  // meant one location; crosswalking it would give every location the SAME
+  // chain QID and fuse them. The type gate refuses before any lookup, so this
+  // still falls through to the (Places) name search.
+  const { json } = await resolveName({
+    name: "Souvla",
+    entity_type: "info.cursive.organization.restaurant",
+    identifiers: ["https://souvla.com"],
+  });
+  expect(json.resolved_by).not.toBe("website");
+  expect(json.name_hub).toBe("google_places");
+  expect(json.sameAs).not.toContain("wikidata:Q99999");
+});
+
+it("a confirmed candidate completes to its crosslinks", async () => {
+  // The retry: the caller picked a candidate and echoed its `ref`. The commit is
+  // strict, and the completion that follows is what turns a bare QID into the
+  // QID/origin pair. Free hubs only — no budget is reserved on this step.
+  const { json } = await resolveName({
+    entity_type: "organization",
+    identifiers: ["wikidata:Q17431399"],
+  });
+  expect(json.resolved_by).toBe("identifiers");
+  expect(json.hub_called).toBe(true);
+  expect(json.sameAs).toContain("domain:uber.com");
+  expect(await budgetUsed()).toBe(0);
+});
+
 it("a repeat query is answered locally, spending nothing", async () => {
   // The first brake: `resolve_name` writes the ambiguous verdict into the
   // cardinality memory, so the identical query never reaches a hub again.

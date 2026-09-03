@@ -318,6 +318,31 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
 
     if args.complete {
         let ctx = build_completion_ctx(args)?;
+        // An ORGANIZATION identified only by its homepage: a registrable domain is
+        // Affiliation grain, so on its own it mints a brand-level entity and learns
+        // nothing. `resolve_by_website` asks Wikidata who publishes the site and
+        // resolves on the QID instead. Guarded to org-shaped types inside — a
+        // restaurant's chain domain must never crosswalk. Kept here, and not inside
+        // `resolve_and_complete`, for the same reason the other reverse-resolvers
+        // are entry-point only: running it speculatively over every domain in a
+        // cluster is how a movie's website acquires a studio's QID.
+        if let (Some(domain), true) = (
+            &args.domain,
+            sameas_core::org_shaped(args.entity_type.as_deref()),
+        ) {
+            let query = NameQuery {
+                name: args.name.clone(),
+                entity_type: args.entity_type.clone(),
+                ..Default::default()
+            };
+            let id = ExternalId::domain(domain)?;
+            let mut hub_error = None;
+            if let Some(out) =
+                sameas_core::resolve_by_website(graph, &id, &query, &ctx, &mut hub_error).await?
+            {
+                return Ok(out);
+            }
+        }
         return resolve_and_complete(graph, &record, &ctx).await;
     }
     commit_record(graph, &record).await
