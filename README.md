@@ -233,6 +233,46 @@ distinct entities returns them as `candidates` (ambiguous) rather than guessing.
 Alias/typo tolerance (e.g. `SF` ↔ `San Francisco`) is a deferred, evidence-gated
 layer pointed *inward* at this index.
 
+## Resolving an organization
+
+An organization is the one entity type whose natural identifier is a **bare
+homepage** — and a registrable domain is `Grain::Affiliation`, so on its own it
+cannot resolve (it may name a chain). Two paths close that without weakening the
+grain rule, both on the free hub:
+
+```sh
+# By name: Wikidata search, then a P31/P279* type gate so the album and the
+# German preposition drop out and only the company is left.
+sameas resolve --name Uber --type organization --complete
+
+# By homepage: Wikidata's P856 (official website), read in reverse. The domain
+# does not resolve the entity — it buys the QID that does.
+sameas resolve --domain uber.com --type organization --complete
+```
+
+Both return the QID **and** the registrable domain in the cluster: an
+organization identified by a bare origin and one identified by its Wikidata page
+are the same entity, and that pair is what says so.
+
+The rules, all of which are grain arguments rather than tuning:
+
+- **Org-shaped types only** (the NSID leaf: `organization`, `corporation`, `ngo`,
+  …). A `restaurant` citing `souvla.com` must never crosswalk to the chain's QID
+  — every location would acquire the *same* QID and fuse into one entity. Place
+  types route to Google Places by name, as before.
+- **Never over an identity-bearing owner.** If the domain already belongs to a
+  cluster with an Identity key, that cluster is a specific thing and the domain
+  is its affiliation; the crosswalk declines.
+- **One item or none.** Two Wikidata items sharing a website (a company and its
+  foundation) come back as `candidates`, never as a merge. The P856 match is an
+  exact `VALUES` lookup of the canonical URL spellings — a substring test would
+  also match `notuber.com`.
+- **The type gate filters, it never chooses.** Several organizations still refuse
+  with `ambiguous_among_n` + candidates, and a gate that answers nothing (or
+  fails) leaves the hub's own ranking untouched.
+- **Free tier only.** Organizations route to Wikidata, which needs no key and
+  costs nothing. Nothing on this path can reach Google Places.
+
 ## CLI usage
 
 ```sh
