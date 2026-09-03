@@ -26,14 +26,18 @@ pub mod places;
 pub mod tmdb;
 pub mod tmdb_search;
 pub mod wikidata;
+pub mod wikidata_class;
 pub mod wikidata_search;
+pub mod wikidata_website;
 
 pub use placekey::PlacekeyResolver;
 pub use places::{PlaceCandidate, PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput};
 pub use tmdb::TmdbResolver;
 pub use tmdb_search::TmdbSearchResolver;
 pub use wikidata::WikidataResolver;
+pub use wikidata_class::WikidataClassResolver;
 pub use wikidata_search::WikidataSearchResolver;
+pub use wikidata_website::WikidataWebsiteResolver;
 
 /// Push a `tag:raw` identifier into a record, normalizing and de-duplicating.
 /// Best-effort: a value that fails to normalize is silently skipped (hub data

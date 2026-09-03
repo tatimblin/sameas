@@ -18,6 +18,41 @@ use crate::transport::HttpTransport;
 
 const ENDPOINT: &str = "https://query.wikidata.org/sparql";
 
+/// A SPARQL `VALUES` block binding `?anysite` to every canonical URL spelling of
+/// a registrable domain — the reverse index from `uber.com` back to the item
+/// whose P856 (official website) is that site.
+///
+/// **Why an enumeration and not a string test.** The obvious form is
+/// `FILTER(CONTAINS(STR(?site), "uber.com"))`, which is what this used to be, and
+/// it is wrong twice over:
+///
+/// * **It is a false-merge hazard, not a lossy match.** `CONTAINS` also matches
+///   `notuber.com`, `uber.com.br` and `myuber.company` — *different companies*.
+///   [`WikidataResolver::parse`] pushes every returned `?item` into ONE record, so
+///   a multi-item answer commits them as one entity. A substring collision here
+///   fuses unrelated organizations, which is the primary invariant this project
+///   exists to protect. (It survived this long only because `complete::hubs_for`
+///   never dispatched the domain arm; the moment it does, the hazard is live.)
+/// * **It cannot use the index.** `?item wdt:P856 ?site` with a string filter is a
+///   scan of every official-website statement in Wikidata. `VALUES` is an indexed
+///   lookup of a handful of exact IRIs, which is what makes this affordable from
+///   inside a Worker request.
+///
+/// The cost is a **conservative miss**: an item whose P856 is spelled with a path
+/// (`https://www.uber.com/us/en/`) or an unusual subdomain is not found, and the
+/// caller falls through to the name search. That is the house trade — a missed
+/// lookup costs a hub call, a wrong confident hit costs a fused entity.
+pub(crate) fn website_values(domain: &str) -> String {
+    let mut sites = Vec::with_capacity(8);
+    for host in [domain.to_string(), format!("www.{domain}")] {
+        for scheme in ["https", "http"] {
+            sites.push(format!("<{scheme}://{host}>"));
+            sites.push(format!("<{scheme}://{host}/>"));
+        }
+    }
+    format!("VALUES ?anysite {{ {} }}", sites.join(" "))
+}
+
 pub struct WikidataResolver {
     input: ExternalId,
     transport: Arc<dyn HttpTransport>,
@@ -36,11 +71,13 @@ impl WikidataResolver {
             "imdb" => format!("?item wdt:P345 {:?}.", self.input.value()),
             // Bind the item directly from its QID.
             "wikidata" => format!("VALUES ?item {{ wd:{} }}", self.input.value()),
-            // Website is stored as a full URL; match by registrable-domain
-            // substring (lossy — flagged).
+            // Website (P856) is stored as a full URL, so a registrable domain has
+            // to be widened back into the URL forms that spell it. See
+            // [`website_values`] for why that is a VALUES enumeration and not a
+            // substring test.
             "domain" => format!(
-                "?item wdt:P856 ?anysite. FILTER(CONTAINS(LCASE(STR(?anysite)), {:?}))",
-                self.input.value()
+                "{} ?item wdt:P856 ?anysite.",
+                website_values(self.input.value())
             ),
             other => bail!("wikidata: unsupported input kind {other:?}"),
         };
@@ -131,6 +168,22 @@ mod tests {
         assert!(keys.contains(&"imdb:tt0133093".to_string()));
         assert!(keys.contains(&"tmdb:603".to_string()));
         assert!(keys.contains(&"domain:warnerbros.com".to_string()));
+    }
+
+    #[test]
+    fn the_website_selector_is_an_exact_url_match() {
+        // `parse` folds every returned `?item` into ONE record, so a selector that
+        // matched `notuber.com` too would commit two companies as one entity.
+        // Regression pin on the shape, since the hazard is invisible in the JSON.
+        let q = WikidataResolver::new(
+            ExternalId::new("domain", "uber.com").unwrap(),
+            Arc::new(crate::transport::FixtureTransport::from_pairs(vec![])),
+        )
+        .query()
+        .unwrap();
+        assert!(!q.contains("CONTAINS"), "q={q}");
+        assert!(q.contains("VALUES ?anysite"), "q={q}");
+        assert!(q.contains("<https://uber.com/>"), "q={q}");
     }
 
     #[tokio::test]
