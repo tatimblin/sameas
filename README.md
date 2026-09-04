@@ -252,7 +252,11 @@ sameas resolve --domain uber.com --type organization --complete
 
 Both return the QID **and** the registrable domain in the cluster: an
 organization identified by a bare origin and one identified by its Wikidata page
-are the same entity, and that pair is what says so.
+are the same entity, and that pair is what says so. (One exception, and it
+self-heals: if the domain is already held by an identity-less row — a domain-only
+record from `ingest` — the first request returns the QID alone, because a held
+domain is never stolen for a QID the graph has not seen before, and the next
+request converges the two into one cluster.)
 
 The rules, all of which are grain arguments rather than tuning:
 
@@ -268,8 +272,9 @@ The rules, all of which are grain arguments rather than tuning:
   exact `VALUES` lookup of the canonical URL spellings — a substring test would
   also match `notuber.com`. That refusal is *remembered* (keyed on the domain), so
   the identical retry is answered locally and costs no hub call — the same brake
-  the name path has. A resolved homepage needs no memo: the domain joins the org's
-  cluster, so the repeat is an ordinary graph hit.
+  the name path has, and applied inside the crosswalk itself, so the CLI and the
+  HTTP route both get it. A resolved homepage needs no memo: the domain joins the
+  org's cluster, so the repeat is an ordinary graph hit.
 - **The type gate removes only what Wikidata contradicts.** It asks "does Wikidata
   say this is something else?", and only a *yes* drops a candidate: an item with no
   `P31` at all, or one whose subclass chain reaches no root we listed, survives —
