@@ -78,7 +78,7 @@ function hubFixture(url: URL): Record<string, unknown> | null {
         searchinfo: { search: "Uber" },
         search: [
           {
-            id: "Q17431399",
+            id: "Q780442",
             label: "Uber",
             description: "American transportation network company",
           },
@@ -125,7 +125,7 @@ function sparqlFixture(query: string): Record<string, unknown> | null {
     // positively contradicted, which is the only thing that may remove a
     // candidate — an item absent from this answer has no P31 and survives.
     const typed: [string, boolean][] = [
-      ["Q17431399", true],
+      ["Q780442", true],
       ["Q7877036", false],
       ["Q2475886", false],
     ];
@@ -162,7 +162,7 @@ function sparqlFixture(query: string): Record<string, unknown> | null {
     return {
       results: {
         bindings: [
-          item("Q17431399", {
+          item("Q780442", {
             itemLabel: { value: "Uber" },
             itemDescription: {
               value: "American transportation network company",
@@ -172,11 +172,11 @@ function sparqlFixture(query: string): Record<string, unknown> | null {
       },
     };
   }
-  if (query.includes("VALUES ?item { wd:Q17431399 }")) {
+  if (query.includes("VALUES ?item { wd:Q780442 }")) {
     return {
       results: {
         bindings: [
-          item("Q17431399", { website: { value: "https://www.uber.com/" } }),
+          item("Q780442", { website: { value: "https://www.uber.com/" } }),
         ],
       },
     };

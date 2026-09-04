@@ -83,7 +83,7 @@ pub struct WikidataClassResolver {
 }
 
 impl WikidataClassResolver {
-    /// `qids` are already-normalized QID values (`Q17431399`).
+    /// `qids` are already-normalized QID values (`Q780442`).
     pub fn new(qids: Vec<String>, transport: Arc<dyn HttpTransport>) -> Self {
         WikidataClassResolver { qids, transport }
     }
@@ -188,12 +188,12 @@ mod tests {
         // Reading a row in isolation would type a company as non-org whenever its
         // other P31 sorted first.
         let v = json!({ "results": { "bindings": [
-            row("Q17431399", false),
-            row("Q17431399", true),
+            row("Q780442", false),
+            row("Q780442", true),
             row("Q7877036", false)
         ]}});
         let facts = WikidataClassResolver::parse(&v);
-        assert!(!facts.is_typed_non_org("Q17431399"), "one org row is enough");
+        assert!(!facts.is_typed_non_org("Q780442"), "one org row is enough");
         assert!(facts.is_typed_non_org("Q7877036"), "typed, and never an org");
     }
 
@@ -202,7 +202,7 @@ mod tests {
         // The absence rule. An untyped item never appears in the results at all,
         // and silence must not read as "not an organization".
         let facts = WikidataClassResolver::parse(&json!({ "results": { "bindings": [
-            row("Q17431399", true)
+            row("Q780442", true)
         ]}}));
         assert!(!facts.is_typed_non_org("Q2475886"));
         assert!(!facts.typed.contains("Q2475886"));
@@ -232,13 +232,13 @@ mod tests {
     #[test]
     fn the_query_walks_the_subclass_closure_from_the_roots() {
         let q = WikidataClassResolver::new(
-            vec!["Q17431399".into(), "Q7877036".into()],
+            vec!["Q780442".into(), "Q7877036".into()],
             Arc::new(FixtureTransport::from_pairs(vec![])),
         )
         .query();
         assert!(q.contains("wdt:P31/wdt:P279*"), "q={q}");
         assert!(q.contains("wd:Q43229") && q.contains("wd:Q4830453"), "q={q}");
-        assert!(q.contains("wd:Q17431399") && q.contains("wd:Q7877036"), "q={q}");
+        assert!(q.contains("wd:Q780442") && q.contains("wd:Q7877036"), "q={q}");
     }
 
     #[tokio::test]

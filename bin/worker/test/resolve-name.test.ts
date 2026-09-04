@@ -351,13 +351,13 @@ it("an organization name resolves to a QID and carries its website", async () =>
   expect(json.confidence_reason).toBe("type_gate_unique_match");
   expect(json.confidence).toBe(0.8);
   expect(json.candidates).toEqual([]);
-  expect(json.sameAs).toContain("wikidata:Q17431399");
+  expect(json.sameAs).toContain("wikidata:Q780442");
   // The P856 crosswalk: this pair is what lets a bare-origin citer and a QID
   // citer land in one cluster downstream.
   expect(json.sameAs).toContain("domain:uber.com");
   // ...but only the QID projects to a URL — `domain` has no URL form by design.
   expect(json.sameAs_urls).toEqual([
-    "https://www.wikidata.org/wiki/Q17431399",
+    "https://www.wikidata.org/wiki/Q780442",
   ]);
   expect(json.hub_error).toBeNull();
 });
@@ -377,7 +377,7 @@ it("an organization's homepage resolves to its QID, before any name search", asy
   expect(json.status).toBe("new");
   expect(json.confidence_reason).toBe("hub_crosswalk");
   expect(json.canonical_id).toBeTruthy();
-  expect(json.sameAs).toContain("wikidata:Q17431399");
+  expect(json.sameAs).toContain("wikidata:Q780442");
   expect(json.sameAs).toContain("domain:uber.com");
   // Step 1's "that domain names a brand, supply something better" hint must NOT
   // ride along on a resolved answer — the domain is what identified the thing.
@@ -404,9 +404,9 @@ it("an organization's homepage resolves to its QID, before any name search", asy
   expect(again.json.confidence_reason).toBe("ambiguous_among_n");
   expect(again.json.candidates).toHaveLength(1);
   expect(again.json.candidates[0].canonical_id).toBe(json.canonical_id);
-  expect(again.json.candidates[0].anchor).toBe("wikidata:Q17431399");
+  expect(again.json.candidates[0].anchor).toBe("wikidata:Q780442");
   expect(again.json.candidates[0].url).toBe(
-    "https://www.wikidata.org/wiki/Q17431399",
+    "https://www.wikidata.org/wiki/Q780442",
   );
   expect(await budgetUsed()).toBe(1);
   expect(await entityCount()).toBe(1);
@@ -430,7 +430,7 @@ it("a homepage with no name still gets its one lookup", async () => {
     identifiers: ["https://uber.com"],
   });
   expect(json.resolved_by).toBe("website");
-  expect(json.sameAs).toContain("wikidata:Q17431399");
+  expect(json.sameAs).toContain("wikidata:Q780442");
 });
 
 it("an ambiguous homepage is refused once, then remembered", async () => {
@@ -476,11 +476,11 @@ it("only an organization's identifiers complete from the free hubs", async () =>
   // promise about identifier lookups would be false.
   const movie = await resolveName({
     entity_type: "movie",
-    identifiers: ["wikidata:Q17431399"],
+    identifiers: ["wikidata:Q780442"],
   });
   expect(movie.json.resolved_by).toBe("identifiers");
   expect(movie.json.hub_called).toBe(false);
-  expect(movie.json.sameAs).toEqual(["wikidata:Q17431399"]);
+  expect(movie.json.sameAs).toEqual(["wikidata:Q780442"]);
   expect(await budgetUsed()).toBe(0);
 });
 
@@ -505,7 +505,7 @@ it("a confirmed candidate completes to its crosslinks", async () => {
   // QID/origin pair. Free hubs only — no budget is reserved on this step.
   const { json } = await resolveName({
     entity_type: "organization",
-    identifiers: ["wikidata:Q17431399"],
+    identifiers: ["wikidata:Q780442"],
   });
   expect(json.resolved_by).toBe("identifiers");
   expect(json.hub_called).toBe(true);

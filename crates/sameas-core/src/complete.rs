@@ -2906,9 +2906,18 @@ mod org_tests {
 
     /// `wbsearchentities` for "Uber": the company, an album, a preposition — the
     /// real shape of a name search for an organization.
+    ///
+    /// **On the QIDs.** `Q780442` really is Uber (P856 `https://www.uber.com/`),
+    /// checked against wikidata.org — so the pairing this file asserts is true as
+    /// well as internally consistent. The SIBLINGS are illustrative placeholders,
+    /// not verified: what they have to be is *plausible non-organizations sharing a
+    /// name*, and nothing here depends on which items they actually are. Read them
+    /// as shapes, never as facts to copy — an earlier revision of this file used a
+    /// QID that turned out to be a national museum, and it read as ground truth to
+    /// everyone downstream until someone made the live call.
     fn uber_search() -> Value {
         json!({ "search": [
-            { "id": "Q17431399", "label": "Uber",
+            { "id": "Q780442", "label": "Uber",
               "description": "American transportation network company" },
             { "id": "Q7877036", "label": "Uber", "description": "1998 album by Nomeansno" },
             { "id": "Q2475886", "label": "Über", "description": "German preposition" }
@@ -2917,7 +2926,7 @@ mod org_tests {
     /// The forward SPARQL answer for the company: P856 is the payload.
     fn uber_forward() -> Value {
         json!({ "results": { "bindings": [{
-            "item": { "value": "http://www.wikidata.org/entity/Q17431399" },
+            "item": { "value": "http://www.wikidata.org/entity/Q780442" },
             "website": { "value": "https://www.uber.com/" }
         }]}})
     }
@@ -2971,23 +2980,23 @@ mod org_tests {
             // The type gate: all three are typed, only the company is an org.
             (
                 "GET",
-                &class_url(&["Q17431399", "Q7877036", "Q2475886"]),
-                classified(&[("Q17431399", true), ("Q7877036", false), ("Q2475886", false)]),
+                &class_url(&["Q780442", "Q7877036", "Q2475886"]),
+                classified(&[("Q780442", true), ("Q7877036", false), ("Q2475886", false)]),
             ),
-            ("GET", &forward_url("Q17431399"), uber_forward()),
+            ("GET", &forward_url("Q780442"), uber_forward()),
         ]);
         let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
             .await
             .unwrap();
 
         assert_eq!(out.status, Status::New);
-        assert_eq!(out.anchor, "wikidata:Q17431399");
+        assert_eq!(out.anchor, "wikidata:Q780442");
         // The GATE reduced three to one, not the hub — and the answer says so
         // rather than passing this off as a lone hub result.
         assert_eq!(out.confidence_reason, ConfidenceReason::TypeGateUniqueMatch);
         assert_eq!(out.confidence, crate::confidence::PLACE_UNIQUE);
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
-        assert!(keys.contains(&"wikidata:Q17431399".to_string()), "keys={keys:?}");
+        assert!(keys.contains(&"wikidata:Q780442".to_string()), "keys={keys:?}");
         assert!(
             keys.contains(&"domain:uber.com".to_string()),
             "the P856 crosswalk is what pairs the QID with the origin: keys={keys:?}"
@@ -2999,7 +3008,7 @@ mod org_tests {
         let doc = crate::json::resolve_output_json(&out, "resolve_name");
         assert_eq!(
             doc["sameAs_urls"][0],
-            "https://www.wikidata.org/wiki/Q17431399"
+            "https://www.wikidata.org/wiki/Q780442"
         );
     }
 
@@ -3084,12 +3093,12 @@ mod org_tests {
                 "GET",
                 &website_url("uber.com"),
                 json!({ "results": { "bindings": [{
-                    "item": { "value": "http://www.wikidata.org/entity/Q17431399" },
+                    "item": { "value": "http://www.wikidata.org/entity/Q780442" },
                     "itemLabel": { "value": "Uber" },
                     "itemDescription": { "value": "American transportation network company" }
                 }]}}),
             ),
-            ("GET", &forward_url("Q17431399"), uber_forward()),
+            ("GET", &forward_url("Q780442"), uber_forward()),
         ]);
         let ctx = CompletionCtx::new(Arc::new(transport));
         let domain = ExternalId::new("domain", "https://uber.com").unwrap();
@@ -3099,17 +3108,17 @@ mod org_tests {
             .unwrap()
             .expect("the website crosswalk answers");
 
-        assert_eq!(out.anchor, "wikidata:Q17431399");
+        assert_eq!(out.anchor, "wikidata:Q780442");
         assert_eq!(out.confidence_reason, ConfidenceReason::HubCrosswalk);
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
-        assert!(keys.contains(&"wikidata:Q17431399".to_string()), "keys={keys:?}");
+        assert!(keys.contains(&"wikidata:Q780442".to_string()), "keys={keys:?}");
         assert!(keys.contains(&"domain:uber.com".to_string()), "keys={keys:?}");
         assert!(hub_error.is_none());
 
         // And the crosswalk is a one-time cost: the origin now belongs to the org
         // cluster, so the same input resolves locally with no hub at all.
         let local = crate::resolve::resolve_id(&g, domain).await.unwrap();
-        assert_eq!(local.anchor, "wikidata:Q17431399");
+        assert_eq!(local.anchor, "wikidata:Q780442");
     }
 
     #[tokio::test]
@@ -3407,16 +3416,16 @@ mod org_tests {
                 "GET",
                 &search_url("Uber"),
                 json!({ "search": [
-                    { "id": "Q17431399", "label": "Uber",
+                    { "id": "Q780442", "label": "Uber",
                       "description": "American transportation network company" }
                 ]}),
             ),
-            ("GET", &forward_url("Q17431399"), uber_forward()),
+            ("GET", &forward_url("Q780442"), uber_forward()),
         ]);
         let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
             .await
             .unwrap();
-        assert_eq!(out.anchor, "wikidata:Q17431399");
+        assert_eq!(out.anchor, "wikidata:Q780442");
         assert!(
             out.hub_error.is_none(),
             "the type gate must not have been called: {:?}",
@@ -3443,9 +3452,9 @@ mod org_tests {
             ("GET", &search_url("Uber"), uber_search()),
             (
                 "GET",
-                &class_url(&["Q17431399", "Q7877036", "Q2475886"]),
+                &class_url(&["Q780442", "Q7877036", "Q2475886"]),
                 // Q2475886 is absent from the answer entirely: no P31 at all.
-                classified(&[("Q17431399", true), ("Q7877036", false)]),
+                classified(&[("Q780442", true), ("Q7877036", false)]),
             ),
         ]);
         let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
@@ -3459,13 +3468,13 @@ mod org_tests {
             "an untyped candidate must not be filtered into an auto-commit"
         );
         let anchors: Vec<&str> = out.candidates.iter().map(|c| c.anchor.as_str()).collect();
-        assert_eq!(anchors, vec!["wikidata:Q17431399", "wikidata:Q2475886"]);
+        assert_eq!(anchors, vec!["wikidata:Q780442", "wikidata:Q2475886"]);
         assert!(
             !anchors.contains(&"wikidata:Q7877036"),
             "the album is the one thing Wikidata positively contradicted"
         );
         // Nothing was committed on the strength of a filtered list.
-        assert!(g.find("wikidata:Q17431399").await.unwrap().is_none());
+        assert!(g.find("wikidata:Q780442").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3580,13 +3589,13 @@ mod org_tests {
         // that lets bare-origin citers and QID citers land together is missing.
         let g = SqliteStore::open_in_memory().unwrap();
         let transport =
-            FixtureTransport::from_pairs(vec![("GET", &forward_url("Q17431399"), uber_forward())]);
+            FixtureTransport::from_pairs(vec![("GET", &forward_url("Q780442"), uber_forward())]);
         let ctx = CompletionCtx::new(Arc::new(transport)).free_hubs_only();
 
         let record = EntityRecord {
             entity_type: Some(ORG.into()),
             name: Some("Uber".into()),
-            same_as: vec![ExternalId::new("wikidata", "Q17431399").unwrap()],
+            same_as: vec![ExternalId::new("wikidata", "Q780442").unwrap()],
         };
         let seed = crate::resolve::commit_record_with_opts(
             &g,
@@ -3602,7 +3611,7 @@ mod org_tests {
 
         let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
         assert!(keys.contains(&"domain:uber.com".to_string()), "keys={keys:?}");
-        assert_eq!(out.anchor, "wikidata:Q17431399");
+        assert_eq!(out.anchor, "wikidata:Q780442");
     }
 
     #[tokio::test]

@@ -96,7 +96,7 @@ impl WikidataWebsiteResolver {
                 Some(i) => i,
                 None => continue,
             };
-            // `http://www.wikidata.org/entity/Q17431399` → `Q17431399`, via the
+            // `http://www.wikidata.org/entity/Q780442` → `Q780442`, via the
             // registry's own normalizer — a value it rejects is not choosable.
             let id = match ExternalId::new("wikidata", item) {
                 Ok(id) => id,
@@ -128,11 +128,11 @@ mod tests {
 
     fn one_item() -> Value {
         json!({ "results": { "bindings": [
-            { "item": { "value": "http://www.wikidata.org/entity/Q17431399" },
+            { "item": { "value": "http://www.wikidata.org/entity/Q780442" },
               "itemLabel": { "value": "Uber" },
               "itemDescription": { "value": "American transportation company" } },
             // The same item again via its `www.` spelling — must collapse.
-            { "item": { "value": "http://www.wikidata.org/entity/Q17431399" },
+            { "item": { "value": "http://www.wikidata.org/entity/Q780442" },
               "itemLabel": { "value": "Uber" },
               "itemDescription": { "value": "American transportation company" } }
         ]}})
@@ -142,7 +142,7 @@ mod tests {
     fn duplicate_spellings_of_one_item_are_one_candidate() {
         let c = WikidataWebsiteResolver::parse(&one_item());
         assert_eq!(c.len(), 1, "one item, two P856 spellings");
-        assert_eq!(c[0].id.key(), "wikidata:Q17431399");
+        assert_eq!(c[0].id.key(), "wikidata:Q780442");
         assert_eq!(
             c[0].label().as_deref(),
             Some("Uber (American transportation company)")
