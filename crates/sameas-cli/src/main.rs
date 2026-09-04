@@ -259,6 +259,7 @@ fn describe_resolve(args: &ResolveArgs) -> String {
 async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<ResolveOutput> {
     // Geo/qualifier facets apply ONLY to the --name reverse-resolution path.
     // Combined with a typed source they would be silently ignored, so reject.
+    // (`--type` is the exception — see below.)
     if args.name.is_none() {
         let mut offenders: Vec<&str> = Vec::new();
         if args.address.is_some() {
@@ -276,7 +277,14 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
         if !args.qualifiers.is_empty() {
             offenders.push("--qualifier");
         }
-        if args.entity_type.is_some() {
+        // `--type` is NOT name-only any more: it is what tells `--domain` whether
+        // the domain names an organization (in which case its homepage may be
+        // crosswalked to a QID) or one location of a chain (in which case it must
+        // not be). Rejecting it there made the documented org command
+        // — `resolve --domain uber.com --type organization --complete` —
+        // unrunnable. Still rejected with any OTHER typed source, where it really
+        // would be ignored.
+        if args.entity_type.is_some() && args.domain.is_none() {
             offenders.push("--type");
         }
         if !offenders.is_empty() {
@@ -318,6 +326,41 @@ async fn do_resolve(graph: &dyn GraphStore, args: &ResolveArgs) -> Result<Resolv
 
     if args.complete {
         let ctx = build_completion_ctx(args)?;
+        // An ORGANIZATION identified only by its homepage: a registrable domain is
+        // Affiliation grain, so on its own it mints a brand-level entity and learns
+        // nothing. `resolve_by_website` asks Wikidata who publishes the site and
+        // resolves on the QID instead. Guarded to org-shaped types inside — a
+        // restaurant's chain domain must never crosswalk. Kept here, and not inside
+        // `resolve_and_complete`, for the same reason the other reverse-resolvers
+        // are entry-point only: running it speculatively over every domain in a
+        // cluster is how a movie's website acquires a studio's QID.
+        //
+        // Domain-only invocations ONLY. `--fixture`/`--fetch` mean the caller asked
+        // for the page to be harvested, and `build_input_record` has already turned
+        // it into a record carrying every `sameAs` the page advertised; returning
+        // the crosswalk's answer here would silently throw all of that away. When a
+        // harvest is on the table the harvested record IS the input, and it takes
+        // the ordinary path below. (The other `source` args cannot co-occur — clap's
+        // ArgGroup is `multiple(false)` — so this is the whole of the overlap.)
+        let domain_only = args.fixture.is_none() && !args.fetch;
+        if let (Some(domain), true, true) = (
+            &args.domain,
+            domain_only,
+            sameas_core::org_shaped(args.entity_type.as_deref()),
+        ) {
+            let query = NameQuery {
+                name: args.name.clone(),
+                entity_type: args.entity_type.clone(),
+                ..Default::default()
+            };
+            let id = ExternalId::domain(domain)?;
+            let mut hub_error = None;
+            if let Some(out) =
+                sameas_core::resolve_by_website(graph, &id, &query, &ctx, &mut hub_error).await?
+            {
+                return Ok(out);
+            }
+        }
         return resolve_and_complete(graph, &record, &ctx).await;
     }
     commit_record(graph, &record).await

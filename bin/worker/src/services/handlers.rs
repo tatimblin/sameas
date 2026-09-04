@@ -10,8 +10,9 @@ use sameas_core::json::resolve_output_json;
 use sameas_core::store::d1::D1Store;
 use sameas_core::transport::FetchTransport;
 use sameas_core::{
-    commit_record, commit_record_with_opts, load_entity, name_not_found, resolve_name_local,
-    CommitOpts, CompletionCtx, EntityRecord, ExternalId, GraphStore, ResolveOutput, Status,
+    commit_record, commit_record_with_opts, complete_committed, load_entity, name_not_found,
+    org_shaped, resolve_by_website, resolve_by_website_local, resolve_name_local, CommitOpts,
+    CompletionCtx, EntityRecord, ExternalId, GraphStore, ResolveOutput, Status,
 };
 use serde_json::json;
 use worker::*;
@@ -115,6 +116,8 @@ const NAME_ACTION: &str = "resolve_name";
 enum Step {
     /// The strict-grain commit over the request's `identifiers`.
     Identifiers,
+    /// The P856 reverse lookup: an organization identified by its homepage.
+    Website,
     /// The local graph answered the name query — zero external calls.
     NameLocal,
     /// The name search: hub-routed, or refused before reaching one.
@@ -125,6 +128,7 @@ impl Step {
     fn tag(self) -> &'static str {
         match self {
             Step::Identifiers => "identifiers",
+            Step::Website => "website",
             Step::NameLocal => "name_local",
             Step::NameSearch => "name_search",
         }
@@ -137,7 +141,9 @@ struct Meta {
     /// The hub the name query routed to, when it got that far.
     hub: Option<NameHub>,
     /// Whether an outbound hub call was actually attempted. `false` with a `hub`
-    /// present means the route refused to reach out (missing key).
+    /// present means the route refused to reach out (missing key). `true` with no
+    /// `hub` is the identifier step completing a fresh cluster from the free hubs
+    /// — a crosswalk, not a name search, so there is no name hub to name.
     hub_called: bool,
     /// This bucket's hub-call count for today, when a call was reserved.
     hub_calls_today: Option<u32>,
@@ -297,7 +303,58 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
         // list — so this test is exhaustive by construction.
         let fall_through = out.status == Status::Unresolved && out.candidates.is_empty();
         if !fall_through {
-            return answer(&g, &parsed, out, Meta::local(Step::Identifiers), &input_desc).await;
+            // The commit stands; now COMPLETE it. This is the confirm/retry path:
+            // the caller picked one of an earlier ambiguous answer's candidates and
+            // echoed its `ref` back, and without this it gets that bare key and none
+            // of its crosslinks — an organization QID with no P856 website, when the
+            // QID/origin pair is the whole point of asking.
+            //
+            // Four bounds keep this from becoming unbudgeted, unbounded outbound
+            // work on a step that reserves nothing:
+            //   * **org-shaped types only.** This exists to complete an organization
+            //     to its P856 website; it is not a licence for every `imdb:` or
+            //     `tmdb:` identifier the route has ever accepted to start a hub
+            //     crawl. Scoping it to the path it serves is what keeps the rest of
+            //     the route exactly as local as its 429 message promises.
+            //   * `new_edges > 0` — only a cluster that just grew is worth a hub
+            //     call. A steady-state repeat of the same identifiers writes nothing
+            //     and reaches nowhere, so this stays a local-first route.
+            //   * `max_hops = 1` — one crosswalk is all an org needs (QID → P856),
+            //     and the default 3 would let one request fan out over a cluster
+            //     that keeps growing. A cap that matches the need cannot surprise.
+            //   * `free_hubs_only` — no budget is reserved on this step, so it must
+            //     not be able to spend. Wikidata/TMDb run; Place Details does not.
+            let completes = out.new_edges > 0 && org_shaped(parsed.query.entity_type.as_deref());
+            let (out, hub_called) = if completes {
+                let mut ctx = CompletionCtx::new(Arc::new(FetchTransport::new())).free_hubs_only();
+                ctx.max_hops = 1;
+                ctx.tmdb_key = HubKeys::read(env).tmdb;
+                let mut hub_calls = 0usize;
+                match complete_committed(&g, out.clone(), &ctx, &mut hub_calls).await {
+                    // `hub_calls`, not "we tried": most identifiers have no forward
+                    // crosswalk at all (a Yelp slug, a bare `url:` key), and
+                    // reporting a call that never happened would make the budget
+                    // story unreadable.
+                    Ok(completed) => (completed, hub_calls > 0),
+                    // Best-effort, like every hub call: the commit already
+                    // succeeded, so answer with it rather than failing a resolution
+                    // over an enrichment.
+                    Err(e) => {
+                        console_warn!("completion failed after identifier commit: {e:#}");
+                        (out, hub_calls > 0)
+                    }
+                }
+            } else {
+                (out, false)
+            };
+            let meta = Meta {
+                step: Step::Identifiers,
+                hub: None,
+                hub_called,
+                hub_calls_today: None,
+                identifier_hint: None,
+            };
+            return answer(&g, &parsed, out, meta, &input_desc).await;
         }
         refused_by_identifiers = Some(out);
     }
@@ -308,8 +365,23 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
         .as_ref()
         .and_then(|out| out.hint.clone());
 
-    // --- Step 2: the name search.
-    if parsed.query.match_name().is_empty() {
+    // The one registrable domain the website crosswalk may spend a lookup on.
+    //
+    // Org-shaped types only (`org_shaped` carries the grain argument), and only the
+    // FIRST domain: a request may carry several, and one bounded lookup per request
+    // is the rule everywhere else on this route.
+    let website_input: Option<ExternalId> = if org_shaped(parsed.query.entity_type.as_deref()) {
+        parsed
+            .ids
+            .iter()
+            .find(|id| id.kind_tag() == "domain")
+            .cloned()
+    } else {
+        None
+    };
+
+    // --- Step 2: the name search (or, for an organization, its website first).
+    if parsed.query.match_name().is_empty() && website_input.is_none() {
         // No usable name to search by (absent, or punctuation that normalizes to
         // nothing). Hand back step 1's refusal rather than inventing a verdict.
         return match refused_by_identifiers {
@@ -338,6 +410,23 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
         }
         Ok(None) => {}
         Err(e) => return core_error(e),
+    }
+
+    // 2a'. ...and the same brake for the website crosswalk, for the one verdict it
+    //      cannot leave in the graph: an ambiguous homepage writes nothing (neither
+    //      QID may claim the origin), so without this the identical retry re-spends
+    //      budget on the same refusal forever. AFTER the name lookup on purpose —
+    //      a local name hit is a resolution, and a resolution beats a remembered
+    //      ambiguity.
+    if let Some(domain) = &website_input {
+        match resolve_by_website_local(&g, domain, &parsed.query).await {
+            Ok(Some(out)) => {
+                let meta = Meta::local(Step::Website).with_identifier_hint(identifier_hint);
+                return answer(&g, &parsed, out, meta, &input_desc).await;
+            }
+            Ok(None) => {}
+            Err(e) => return core_error(e),
+        }
     }
 
     // 2b. A hub call is now on the table. Route by entity type, then check that
@@ -408,7 +497,9 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
                 &format!(
                     "daily hub-call budget exhausted for this caller ({limit}/day). Retry after \
                      00:00 UTC, or resolve with a stronger identifier — identifier lookups and \
-                     repeat name queries are served locally and are never budgeted."
+                     repeat name queries never reserve budget. (An organization committed by \
+                     identifier may still complete through the free Wikidata crosswalk; that \
+                     call is free and unmetered, and no metered hub is reachable from it.)"
                 ),
                 "quota_exhausted",
                 429,
@@ -423,15 +514,91 @@ pub async fn resolve_name(req: &mut Request, env: &Env) -> Result<Response> {
         }
     };
 
-    // 2d. Reach out. `resolve_name` writes the verdict into the local name index
-    //     and cardinality memory, so the next identical query is local.
+    // `resolve_name` writes its verdict into the local name index and cardinality
+    // memory, so the next identical query is local.
     let mut ctx = CompletionCtx::new(Arc::new(FetchTransport::new()));
     ctx.google_key = keys.google;
     ctx.tmdb_key = keys.tmdb;
     ctx.placekey_key = keys.placekey;
 
+    // 2d. The website crosswalk, AHEAD of the name search — for an organization a
+    //     registrable domain is the stronger claim: `Mercury` is a bank, a planet
+    //     and a record label, `mercury.com` is one company. `Ok(None)` means "no
+    //     answer here" (guarded, hub miss, or hub error) and falls through to the
+    //     name search below; a hub failure is carried onto whatever answers instead
+    //     of vanishing with the fall-through.
+    let mut website_hub_error: Option<String> = None;
+    if let Some(domain) = &website_input {
+        match resolve_by_website(&g, domain, &parsed.query, &ctx, &mut website_hub_error).await {
+            Ok(Some(out)) => {
+                // Step 1's refusal hint says "that domain names a brand — supply an
+                // identifier for the individual thing". On a RESOLVED website answer
+                // that sentence is now false: the domain is exactly what identified
+                // the thing. Carry it only when the caller still has something to
+                // fix (an ambiguous or unresolved verdict).
+                let identifier_hint = match out.canonical_id {
+                    Some(_) => None,
+                    None => identifier_hint,
+                };
+                return answer(
+                    &g,
+                    &parsed,
+                    out,
+                    Meta {
+                        step: Step::Website,
+                        hub: Some(NameHub::Wikidata),
+                        hub_called: true,
+                        hub_calls_today: Some(used),
+                        identifier_hint,
+                    },
+                    &input_desc,
+                )
+                .await
+            }
+            Ok(None) => {}
+            Err(e) => return core_error(e),
+        }
+    }
+
+    // A website-only request (no usable name) has now had its one lookup. Hand back
+    // step 1's refusal rather than inventing a name search out of nothing.
+    if parsed.query.match_name().is_empty() {
+        return match refused_by_identifiers {
+            Some(mut out) => {
+                out.hub_error = out.hub_error.take().or(website_hub_error);
+                answer(
+                    &g,
+                    &parsed,
+                    out,
+                    Meta {
+                        step: Step::Website,
+                        hub: Some(NameHub::Wikidata),
+                        hub_called: true,
+                        hub_calls_today: Some(used),
+                        identifier_hint,
+                    },
+                    &input_desc,
+                )
+                .await
+            }
+            // Unreachable: `website_input` is `Some` only when an identifier was
+            // parsed, which means step 1 ran and refused. Kept total — a panic in
+            // wasm is a 500 with no body.
+            None => error_json(
+                "nothing to resolve: `name` did not survive normalization and the supplied \
+                 identifiers did not resolve",
+                "invalid_input",
+                400,
+            ),
+        };
+    }
+
+    // 2e. Reach out by name.
     match sameas_core::resolve_name(&g, &parsed.query, &ctx).await {
-        Ok(out) => {
+        Ok(mut out) => {
+            // A website lookup that failed before this one still degraded the
+            // answer; report it when the name search has no failure of its own.
+            out.hub_error = out.hub_error.take().or(website_hub_error);
             // A hub failure comes back as `Ok` — it is non-fatal by contract — so
             // without this line the *only* record of an outage would be in the
             // response body of whoever happened to trigger it. Warn-level because

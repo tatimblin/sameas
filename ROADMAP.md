@@ -185,8 +185,12 @@ ATProto AppView). Pure front-end — no new domain logic.
 - Shipped: `GET /resolve` (per-kind and `?id=kind:value`), `GET /entity/{id}`,
   `GET /stats`, `POST /ingest` (token-gated), and `POST /resolve/name`
   *(token-gated)* — the disambiguation route: a strict-grain commit over the
-  caller's identifiers, falling through to a hub-routed name search that returns
-  **candidates** rather than guessing which location/work was meant.
+  caller's identifiers (completed from the free hubs, so a confirmed candidate
+  arrives with its crosslinks), then — for an organization — a P856 website
+  crosswalk, then a hub-routed name search that returns **candidates** rather
+  than guessing which location/work was meant. See
+  [Resolving an organization](./README.md#resolving-an-organization) for why the
+  website path is org-shaped types only.
 - Still open: `POST /link` / `/merge` / `/split` — the correction ops exist in the
   core (`correct.rs`) and are reachable only from the CLI.
 - Hub API keys (`GOOGLE_PLACES_API_KEY`, `TMDB_API_KEY`, `PLACEKEY_API_KEY`) are

@@ -103,8 +103,8 @@ pub(crate) fn reason_bucket(tag: &str) -> Bucket {
         "direct_lookup" | "exact_strong_key" | "new_public_anchor" | "synthetic_strong_key" => {
             Bucket::Exact
         }
-        "hub_crosswalk" | "placekey_address" | "place_unique_match" | "local_name_match"
-        | "placekey_city_only" => Bucket::Hub,
+        "hub_crosswalk" | "placekey_address" | "place_unique_match"
+        | "type_gate_unique_match" | "local_name_match" | "placekey_city_only" => Bucket::Hub,
         // needs_stronger_identifier, ambiguous_among_n, phone_only, and anything
         // unrecognized.
         _ => Bucket::Miss,

@@ -1034,3 +1034,49 @@ fn stats_reports_miss_rate() {
     let miss_rate = v["miss_rate"].as_f64().unwrap();
     assert!((miss_rate - 0.33).abs() < 0.02, "miss_rate={miss_rate}");
 }
+
+/// A page harvest and the organization website crosswalk both want to answer for
+/// `--domain`. The harvest wins, because it is the one the caller asked for
+/// explicitly and it carries identifiers the crosswalk cannot know.
+///
+/// The regression: the crosswalk returned early, so `--fixture`'s harvested
+/// `sameAs` were built and then silently dropped on the floor.
+#[test]
+fn a_harvested_domain_keeps_its_identifiers_on_the_org_path() {
+    let h = Harness::new();
+    // A SPARQL answer that WOULD crosswalk, so this asserts the ordering and not
+    // a missing fixture.
+    let hubs = h.hub_dir(
+        "wd",
+        &[(
+            "wikidata_website.json",
+            r#"{"method":"GET","url":"https://query.wikidata.org/sparql","response":
+                {"results":{"bindings":[{
+                  "item":{"value":"http://www.wikidata.org/entity/Q4926426"},
+                  "itemLabel":{"value":"Blue Bottle Coffee"},
+                  "itemDescription":{"value":"coffee company"}}]}}}"#,
+        )],
+    );
+
+    let value = h.value(&[
+        "resolve",
+        "--domain",
+        "bluebottlecoffee.com",
+        "--type",
+        "organization",
+        "--fixture",
+        &fixture("blue-bottle.html"),
+        "--complete",
+        "--hub-fixtures",
+        &hubs,
+    ]);
+    let same_as = same_as_of(&value);
+    // The phone is the discriminator: it exists only on the page, so its presence
+    // proves the harvested record was committed rather than preempted. (The QID
+    // would prove nothing — the crosswalk fixture returns the same one.)
+    assert!(
+        same_as.contains(&"phone:+15106533394".to_string()),
+        "harvested identifiers must not be dropped: {same_as:?}"
+    );
+    assert!(same_as.contains(&"domain:bluebottlecoffee.com".to_string()));
+}

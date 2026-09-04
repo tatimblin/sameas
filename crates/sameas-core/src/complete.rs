@@ -23,8 +23,10 @@ use anyhow::Result;
 use crate::confidence::{score, ConfidenceReason};
 use crate::hubs::{
     HubCandidate, PlaceCandidate, PlaceDetailsResolver, PlaceTextSearchResolver, TextSearchInput,
-    TmdbResolver, TmdbSearchResolver, WikidataResolver, WikidataSearchResolver,
+    TmdbResolver, TmdbSearchResolver, WikidataClassResolver, WikidataResolver,
+    WikidataSearchResolver, WikidataWebsiteResolver,
 };
+use crate::kind::Grain;
 use crate::model::{EntityRecord, ExternalId};
 use crate::resolve::{
     commit_record_with_source, load_entity, Candidate, Resolver, ResolveOutput, Status,
@@ -35,12 +37,27 @@ use crate::transport::HttpTransport;
 /// Configuration for a completion run: the transport plus per-hub API keys and
 /// the hop cap. Keys are empty in offline/fixture mode (they are stripped from
 /// the fixture request signature) and populated from env vars in live mode.
+///
+/// `Clone` is cheap (the transport is an `Arc`) and exists so a caller holding a
+/// `&CompletionCtx` can derive a narrower one — `ctx.clone().free_hubs_only()` —
+/// without threading a second context through every signature.
+#[derive(Clone)]
 pub struct CompletionCtx {
     pub transport: Arc<dyn HttpTransport>,
     pub tmdb_key: String,
     pub google_key: String,
     pub placekey_key: String,
     pub max_hops: usize,
+    /// Whether the completion BFS may dispatch a hub that **costs money**
+    /// (today: Google Place Details, the only metered hub in the tree).
+    ///
+    /// `true` — the CLI/`--complete` behavior, where the operator asked for the
+    /// lookup and holds the key. `false` — a caller that wants completion but has
+    /// no budget reservation to spend: the free hubs (Wikidata, TMDb) still run,
+    /// the metered one is skipped, and the answer is thinner rather than billed.
+    /// See the Worker's identifier step, which completes a freshly committed
+    /// cluster without going anywhere near the per-caller hub budget.
+    pub allow_billable_hubs: bool,
 }
 
 impl CompletionCtx {
@@ -52,8 +69,23 @@ impl CompletionCtx {
             google_key: String::new(),
             placekey_key: String::new(),
             max_hops: 3,
+            allow_billable_hubs: true,
         }
     }
+
+    /// This context with the metered hubs switched off — see
+    /// [`CompletionCtx::allow_billable_hubs`].
+    pub fn free_hubs_only(mut self) -> Self {
+        self.allow_billable_hubs = false;
+        self
+    }
+}
+
+/// Does this hub cost money per call? Keyed on the hub tag rather than on a key
+/// being present, because "we happen to have a Google key configured" is not the
+/// same question as "may this caller spend it".
+fn hub_is_billable(hub: &str) -> bool {
+    matches!(hub, "place_details" | "place_text_search")
 }
 
 /// Forward hubs to try for a given identifier kind (speculative BFS dispatch).
@@ -136,6 +168,38 @@ pub async fn resolve_and_complete(
 ) -> Result<ResolveOutput> {
     // 1. Local-first commit — establishes the canonical id + input confidence.
     let seed = commit_record_with_source(graph, input, "input").await?;
+    // The dispatch count is an observability signal for a front-end that has to
+    // tell a caller whether it went anywhere; this entry point has no one to tell.
+    let mut hub_calls = 0usize;
+    complete_committed(graph, seed, ctx, &mut hub_calls).await
+}
+
+/// The completion half of [`resolve_and_complete`], over a cluster that has
+/// **already been committed**.
+///
+/// Split out because the commit and the completion answer to different policies.
+/// [`resolve_and_complete`] commits permissively (`CommitOpts::default`), which is
+/// right for ingest and the CLI and wrong for the publish path, where a bare brand
+/// domain must be refused. A caller that needs the strict grain rule commits it
+/// itself with [`commit_record_with_opts`](crate::resolve::commit_record_with_opts)
+/// and hands the result here — rather than the alternative, which was to have the
+/// committed-candidate path skip completion entirely and return a QID with none of
+/// its crosslinks.
+///
+/// `seed` carries the input→entity attachment metadata (status, `matched_via`,
+/// confidence reason); this returns the reloaded cluster wearing it.
+///
+/// `hub_calls` counts the adapters actually **dispatched** — not the edges they
+/// produced. A front-end reports "did this request reach out" from it, and the two
+/// are different questions: most completions dispatch nothing at all (a Yelp slug
+/// has no forward crosswalk), and a hub that answers with nothing new still went
+/// out over the wire.
+pub async fn complete_committed(
+    graph: &dyn GraphStore,
+    seed: ResolveOutput,
+    ctx: &CompletionCtx,
+    hub_calls: &mut usize,
+) -> Result<ResolveOutput> {
     // Refused (no strong key) → nothing resolvable to complete.
     let canonical_id = match &seed.canonical_id {
         Some(c) => c.clone(),
@@ -159,6 +223,12 @@ pub async fn resolve_and_complete(
                 if skip_if_present(hub, &members) {
                     continue;
                 }
+                // A caller with no budget reservation completes from the free
+                // hubs only; the metered one is skipped, not billed.
+                if !ctx.allow_billable_hubs && hub_is_billable(hub) {
+                    continue;
+                }
+                *hub_calls += 1;
                 if let Some(record) = run_hub(hub, id, ctx).await {
                     let out = commit_record_with_source(graph, &record, source_for(hub)).await?;
                     total_new_edges += out.new_edges;
@@ -517,6 +587,347 @@ pub fn name_hub_for(entity_type: Option<&str>) -> NameHub {
     }
 }
 
+/// Organization-shaped entity types, by NSID leaf (case-insensitive), matched the
+/// same way [`name_hub_for`] matches.
+///
+/// Two behaviors key on this, and both are grain arguments rather than
+/// conveniences:
+///
+/// * **The website reverse path** ([`resolve_by_website`]). A registrable domain
+///   is `Grain::Affiliation` — it names a chain, a studio, a brand. For an
+///   *organization* the brand IS the entity, so `uber.com` names the thing the
+///   caller means; for a *restaurant* it names the chain the caller did NOT mean,
+///   and resolving on it is exactly the brand-stands-in-for-a-location bug the
+///   strict commit exists to refuse. Hence: orgs only, never places.
+/// * **The P31 type gate** (`narrow_to_organizations`), which is meaningless
+///   without knowing that an organization is what was asked for.
+///
+/// Place-shaped leaves are absent on purpose, not by omission — they route to the
+/// Places hub anyway ([`name_hub_for`]), and `localBusiness` is precisely the type
+/// where a shared domain must stay non-identifying. An unlisted leaf simply gets
+/// today's behavior, so this list is additive: adding a leaf turns two features on
+/// for it and changes nothing else.
+///
+/// **Known cross-repo drift risk.** The consumer (agent-web) decides the same
+/// question from its own table — `anchorPolicy.allowBareOrigins` in
+/// `lexicons/schema-config.json` — because policy belongs with the schema that
+/// declares it, and neither repo can see the other's list at build time. They agree
+/// today. If a collection there opts into bare origins while its NSID leaf is
+/// missing here, its users are told to supply a homepage for a crosswalk this
+/// function never runs, and NO CI in either repo notices: the failure is a
+/// confusing refusal, not a broken build. Adding a type on one side is a prompt to
+/// check the other.
+pub fn org_shaped(entity_type: Option<&str>) -> bool {
+    let leaf = entity_type
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        leaf.as_str(),
+        "organization"
+            | "corporation"
+            | "airline"
+            | "brand"
+            | "consortium"
+            | "educationalorganization"
+            | "governmentorganization"
+            | "medicalorganization"
+            | "newsmediaorganization"
+            | "ngo"
+            | "nonprofit"
+            | "onlinebusiness"
+            | "performinggroup"
+            | "politicalparty"
+            | "researchorganization"
+            | "sportsorganization"
+            | "workersunion"
+    )
+}
+
+/// Remove the candidates Wikidata **positively types as something other than an
+/// organization** (`P31 → P279*` reaching none of the org class roots).
+///
+/// Only a positive contradiction removes a candidate. An item with no `P31` at
+/// all, or one whose subclass chain never reaches a root we listed, survives:
+/// absence of evidence is not evidence, and treating silence as a verdict would
+/// drop a real organization whose sibling merely happened to be better described.
+///
+/// It bails below two candidates, like [`narrow_by_qualifiers`]: with one
+/// candidate the hub has already given an unambiguous answer, and buying a hub
+/// call to second-guess the only answer we have is not what a disambiguator is
+/// for.
+///
+/// Whatever survives goes back to the ordinary rule — one resolves, several refuse
+/// with candidates. This never ranks and never breaks a tie; when it is what
+/// reduced the list to one, the caller says so with
+/// [`ConfidenceReason::TypeGateUniqueMatch`] rather than passing the survivor off
+/// as a lone hub answer. Returns `true` alongside the list when it removed
+/// anything, which is exactly that signal.
+///
+/// **Fail-open in every direction**: a hub error, a response that types nothing,
+/// or a filter that would empty the list all leave the input list untouched.
+async fn narrow_to_organizations(
+    found: Vec<HubCandidate>,
+    ctx: &CompletionCtx,
+    hub_error: &mut Option<String>,
+) -> (Vec<HubCandidate>, bool) {
+    if found.len() < 2 {
+        return (found, false);
+    }
+    // Every candidate must be a QID for the class query to speak about the whole
+    // list; a mixed list is not this gate's shape.
+    let qids: Vec<String> = found
+        .iter()
+        .filter(|c| c.id.kind_tag() == "wikidata")
+        .map(|c| c.id.value().to_string())
+        .collect();
+    if qids.len() != found.len() {
+        return (found, false);
+    }
+    let facts = match WikidataClassResolver::new(qids, ctx.transport.clone())
+        .classify()
+        .await
+    {
+        Ok(facts) => facts,
+        Err(e) => {
+            // Report, but do not clobber a failure the search itself already
+            // recorded — that one explains more.
+            if hub_error.is_none() {
+                *hub_error = Some(hub_failure(NameHub::Wikidata, &e));
+            }
+            return (found, false);
+        }
+    };
+    // Index-then-filter, like `narrow_by_qualifiers`, so the fail-open case still
+    // owns the ORIGINAL list: a gate that types nothing as an organization (a hub
+    // that answered but knows nothing about these items, an ontology we read
+    // wrong) must hand back what the search found, not an empty answer.
+    let keep: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !facts.is_typed_non_org(c.id.value()))
+        .map(|(i, _)| i)
+        .collect();
+    if keep.is_empty() || keep.len() == found.len() {
+        return (found, false);
+    }
+    let kept = found
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, c)| c)
+        .collect();
+    (kept, true)
+}
+
+/// The cardinality-memory key for a website lookup, namespaced so it can never
+/// collide with a name.
+///
+/// The memory table is keyed by a normalized *name*, and this reuses it rather
+/// than growing a second table (a new `GraphStore` method is two backends plus a
+/// conformance suite, for a row shape that is already exactly right). The leading
+/// `@` is what makes sharing the key space safe: [`normalize::name_key`] trims
+/// non-alphanumerics from the edges of every word, so no name a caller can type
+/// normalizes to a string starting with `@`. A user searching for a band literally
+/// called `@website:uber.com` still cannot reach this row.
+fn website_memo_key(domain: &str) -> String {
+    format!("@website:{domain}")
+}
+
+/// The website crosswalk's **local** half: what a previous lookup proved about this
+/// domain, answered from the graph with zero external calls.
+///
+/// The resolved case needs no memory — the crosswalk binds the domain to the org's
+/// cluster, so a repeat is answered by an ordinary graph hit long before it reaches
+/// here. The *ambiguous* case writes nothing (neither QID may claim the origin), so
+/// without this it would re-spend a budget unit and a WDQS call on every identical
+/// retry, forever. Same brake the name path has, keyed on the domain instead.
+///
+/// A `Unique` row is never written here and is deliberately ignored if one ever
+/// appears: this function's job is to remember a REFUSAL, and answering a
+/// resolution from a memo would bypass the liveness the graph itself provides.
+///
+/// Like the name path's memory, this is a cache of a hub's verdict: a Wikidata edit
+/// that makes the domain unambiguous is not re-read until something invalidates the
+/// row. A stale refusal costs the caller a confirmation step, never a wrong bind.
+pub async fn resolve_by_website_local(
+    graph: &dyn GraphStore,
+    domain: &ExternalId,
+    query: &NameQuery,
+) -> Result<Option<ResolveOutput>> {
+    if domain.kind_tag() != "domain" || !org_shaped(query.entity_type.as_deref()) {
+        return Ok(None);
+    }
+    match graph
+        .name_cardinality(&website_memo_key(domain.value()), &[])
+        .await?
+    {
+        Some(NameCardinality::Ambiguous(stored)) => {
+            let candidates: Vec<Candidate> = stored
+                .into_iter()
+                .map(|(canonical_id, anchor, name)| Candidate {
+                    canonical_id,
+                    anchor,
+                    name,
+                })
+                .collect();
+            Ok(Some(ambiguous_output(query, candidates)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Reverse-resolve a **website** to the organization that publishes it.
+///
+/// The org counterpart of the name search, and the stronger of the two: a name is
+/// shared by a bank, a planet and a record label, while a registrable domain is
+/// nearly unique. It exists because the natural identifier a caller has for an
+/// organization is its homepage, and a bare origin is `Grain::Affiliation`, so the
+/// strict commit refuses it — correctly — leaving the caller with an identifier
+/// that names the right thing and cannot resolve it. This converts that
+/// affiliation key into the Identity key (a QID) it could not supply, by asking an
+/// authority rather than by relaxing the rule.
+///
+/// **Three guards, all grain, all load-bearing:**
+///
+/// 1. **Org-shaped types only** ([`org_shaped`]). For a restaurant, `souvla.com` is
+///    the chain and the caller meant one location; crosswalking it would attach the
+///    chain's QID to a location's cluster — and since the chain QID is the *same*
+///    QID for every location, the next location to do it would fuse with the first.
+///    That is the false merge this project ranks above every other failure.
+/// 2. **Never over an identity-bearing cluster.** If the domain is already owned by
+///    a cluster that holds an Identity key, that cluster is a specific thing and the
+///    domain is its affiliation; importing a QID into it has the same fusing effect
+///    as (1). (The Worker never reaches here in that state — the strict commit
+///    already answered `ambiguous_among_n` with that cluster as a candidate — but
+///    this function must be safe on its own terms.)
+/// 3. **One item or none.** Two items sharing a website (a company and its
+///    foundation) is an ambiguity for the caller to resolve, never a merge. The
+///    exact-URL `VALUES` match in `hubs::wikidata_website` is what makes that count
+///    trustworthy.
+///
+/// Returns `Ok(None)` for "no answer here" — wrong type, guarded, hub miss, or hub
+/// error — which is the caller's cue to fall through to the name search. A hub
+/// error is additionally reported through `hub_error` (an out-parameter, as in the
+/// other branches) so a failure that produced a fall-through is still visible on
+/// whatever the caller ends up answering with.
+pub async fn resolve_by_website(
+    graph: &dyn GraphStore,
+    domain: &ExternalId,
+    query: &NameQuery,
+    ctx: &CompletionCtx,
+    hub_error: &mut Option<String>,
+) -> Result<Option<ResolveOutput>> {
+    if domain.kind_tag() != "domain" || !org_shaped(query.entity_type.as_deref()) {
+        return Ok(None);
+    }
+    // Guard 2: an identity-bearing owner keeps its domain to itself.
+    if let Some(cid) = graph.find(&domain.key()).await? {
+        let members = graph.members(&cid).await?;
+        if members.iter().any(|m| m.spec().grain == Grain::Identity) {
+            return Ok(None);
+        }
+    }
+
+    // Graph-first, exactly as `resolve_name` is: a refusal this domain has already
+    // earned is answered from memory with no hub call. Placed AFTER the ownership
+    // guard so a stale ambiguity can never mask a domain that has since acquired an
+    // owner, and inside the crosswalk (rather than only in the Worker's pre-budget
+    // step) so BOTH front-ends brake — the CLI calls this directly.
+    if let Some(remembered) = resolve_by_website_local(graph, domain, query).await? {
+        return Ok(Some(remembered));
+    }
+
+    let found = match WikidataWebsiteResolver::new(domain.value(), ctx.transport.clone())
+        .candidates()
+        .await
+    {
+        Ok(found) => found,
+        Err(e) => {
+            *hub_error = Some(hub_failure(NameHub::Wikidata, &e));
+            return Ok(None);
+        }
+    };
+
+    if found.is_empty() {
+        return Ok(None);
+    }
+    if found.len() > 1 {
+        let candidates = search_candidates(graph, &found).await?;
+        // Remembered under the DOMAIN, never under the query's name: this ambiguity
+        // is a fact about the website, and filing it under the name would answer a
+        // later name query with a verdict no name search produced. Keyed this way it
+        // brakes the repeat — nothing is written to the graph on an ambiguous
+        // verdict, so the retry would otherwise re-spend budget and re-call the hub
+        // for the same refusal forever. See `resolve_by_website_local`.
+        remember_ambiguity(graph, &website_memo_key(domain.value()), &[], &candidates).await?;
+        return Ok(Some(ambiguous_output(query, candidates)));
+    }
+
+    let only = found.into_iter().next().expect("len == 1");
+    // The domain rides along with the QID: it is true (the hub just said so), and
+    // it is what makes the NEXT request for this origin a local hit instead of a
+    // second crosswalk. Source `wikidata` — the identity in this record came from
+    // the hub, not from the caller, and provenance should say so.
+    //
+    // It joins the cluster on this pass UNLESS the domain is already held by an
+    // identity-LESS owner (a domain-only row from `/ingest` or the CLI). Guard 2
+    // above lets that through — correctly, there is no identity to protect — but
+    // the commit will not steal a held domain for a QID the graph has not seen
+    // before, so the first pass returns the QID alone and the SECOND converges
+    // (the QID now has an owner, the identity-hits branch absorbs the
+    // identity-less one, and both keys end up in one cluster). A transient split
+    // in the safe direction, never a merge. In practice one pass is usually
+    // enough: we found this item BY its P856, so the forward crosswalk on the same
+    // pass re-harvests that website and completes the absorption. Pinned by
+    // `an_identity_less_owner_of_the_domain_converges_on_the_next_request`.
+    let record = EntityRecord {
+        entity_type: query.entity_type.clone(),
+        // A name, always — falling back to the query's, then to the domain itself.
+        // A nameless entity is not merely untidy here: the next bare-origin publish
+        // gets `ambiguous_among_n(1)` whose single candidate has `name: null`, and a
+        // consumer that (reasonably) requires a label AND a ref to render a choice
+        // drops it — turning the org confirm flow into "you have not identified
+        // this" with nothing to confirm. The domain is a poor name and a perfectly
+        // good label: it is exactly what the user typed.
+        name: only
+            .name
+            .clone()
+            .or_else(|| query.name.clone())
+            .or_else(|| Some(domain.value().to_string())),
+        same_as: vec![only.id, domain.clone()],
+    };
+    let seed = commit_record_with_source(graph, &record, "wikidata").await?;
+    let mut hub_calls = 0usize;
+    // Free hubs only, structurally. The org path is documented as unable to reach
+    // Google Places, and today it cannot — but only because no hub on this path
+    // yields a `google_place_id` for the BFS to act on. That is an accident of the
+    // current hub set, not a guarantee; a future hub whose harvest includes a
+    // place_id would silently falsify the promise and bill a caller who reserved
+    // one free lookup. One word makes the promise structural.
+    let mut out = complete_committed(graph, seed, &ctx.clone().free_hubs_only(), &mut hub_calls)
+        .await?;
+    if out.canonical_id.is_none() {
+        // Unreachable: the record carries an Identity key, so the commit cannot
+        // refuse. Falling through beats answering with a refusal we cannot explain.
+        return Ok(None);
+    }
+    // An exact P856 match at the hub IS a hub crosswalk, whatever the commit made
+    // of it locally (a cluster that already held the QID reports `exact_strong_key`
+    // and adds no edges, which would understate how the identity was obtained).
+    let reason = ConfidenceReason::HubCrosswalk;
+    out.confidence = score(&reason);
+    out.confidence_reason = reason;
+
+    // Same write-through as the name branches: a later query by this name (if one
+    // was supplied) is served locally.
+    index_resolved_name(graph, query, &mut out, true).await?;
+    Ok(Some(out))
+}
+
 /// Resolve a name query: **graph-first** (see [`resolve_name_local`]), then, on a
 /// miss, reverse-resolve through the hub its `entity_type` routes to
 /// ([`name_hub_for`]) and **write the name+qualifiers into the local index** so
@@ -723,6 +1134,16 @@ async fn search_branch(
     });
 
     let found = narrow_by_qualifiers(found, &quals);
+    // The org type gate: Wikidata's search ranks by relevance, not by kind, so an
+    // organization query comes back mixed with albums and prepositions. Only for
+    // org-shaped types, only on the free hub, and never a tie-breaker — see
+    // `narrow_to_organizations`.
+    let (found, type_gate_narrowed) =
+        if hub == NameHub::Wikidata && org_shaped(query.entity_type.as_deref()) {
+            narrow_to_organizations(found, ctx, hub_error).await
+        } else {
+            (found, false)
+        };
 
     if found.is_empty() {
         return Ok(hub_miss(query, hub));
@@ -749,8 +1170,15 @@ async fn search_branch(
     }
     // `PlaceUniqueMatch` is the "a text query resolved to a SINGLE hub result"
     // tier; the name is a leftover from when places were the only name hub (the
-    // gradient itself is type-agnostic — see `confidence.rs`).
-    let reason = ConfidenceReason::PlaceUniqueMatch;
+    // gradient itself is type-agnostic — see `confidence.rs`). When the TYPE GATE
+    // is what reduced the list to one, say so instead: the hub did not answer
+    // uniquely, we filtered its answer down, and a caller weighing whether to
+    // confirm with its user is entitled to know which of those happened.
+    let reason = if type_gate_narrowed {
+        ConfidenceReason::TypeGateUniqueMatch
+    } else {
+        ConfidenceReason::PlaceUniqueMatch
+    };
     out.confidence = score(&reason);
     out.confidence_reason = reason;
 
@@ -2438,3 +2866,775 @@ mod tests {
         );
     }
 }
+
+
+/// The organization path, end to end.
+///
+/// agent-web publishes `info.cursive.organization` records whose natural
+/// identifier is a brand homepage, and asks this crate to turn a name (or that
+/// homepage) into a QID plus the org's completed identifier set. These pin the
+/// four shapes that contract is made of: a confident name, an ambiguous name, a
+/// website input, and the grain rule that must survive both.
+#[cfg(test)]
+mod org_tests {
+    use super::*;
+    use crate::hubs::{WikidataClassResolver, WikidataWebsiteResolver};
+    use crate::store::SqliteStore;
+    use crate::transport::FixtureTransport;
+    use serde_json::{json, Value};
+
+    /// `info.cursive.organization` — the caller's real string, leaf-matched.
+    const ORG: &str = "info.cursive.organization";
+
+    fn probe() -> Arc<dyn HttpTransport> {
+        Arc::new(FixtureTransport::from_pairs(vec![]))
+    }
+    fn search_url(q: &str) -> String {
+        WikidataSearchResolver::new(q, probe()).url()
+    }
+    fn class_url(qids: &[&str]) -> String {
+        WikidataClassResolver::new(qids.iter().map(|q| q.to_string()).collect(), probe()).url()
+    }
+    fn website_url(domain: &str) -> String {
+        WikidataWebsiteResolver::new(domain, probe()).url()
+    }
+    fn forward_url(qid: &str) -> String {
+        WikidataResolver::new(ExternalId::new("wikidata", qid).unwrap(), probe())
+            .url()
+            .unwrap()
+    }
+
+    /// `wbsearchentities` for "Uber": the company, an album, a preposition — the
+    /// real shape of a name search for an organization.
+    ///
+    /// **On the QIDs.** `Q780442` really is Uber (P856 `https://www.uber.com/`),
+    /// checked against wikidata.org — so the pairing this file asserts is true as
+    /// well as internally consistent. The SIBLINGS are illustrative placeholders,
+    /// not verified: what they have to be is *plausible non-organizations sharing a
+    /// name*, and nothing here depends on which items they actually are. Read them
+    /// as shapes, never as facts to copy — an earlier revision of this file used a
+    /// QID that turned out to be a national museum, and it read as ground truth to
+    /// everyone downstream until someone made the live call.
+    fn uber_search() -> Value {
+        json!({ "search": [
+            { "id": "Q780442", "label": "Uber",
+              "description": "American transportation network company" },
+            { "id": "Q7877036", "label": "Uber", "description": "1998 album by Nomeansno" },
+            { "id": "Q2475886", "label": "Über", "description": "German preposition" }
+        ]})
+    }
+    /// The forward SPARQL answer for the company: P856 is the payload.
+    fn uber_forward() -> Value {
+        json!({ "results": { "bindings": [{
+            "item": { "value": "http://www.wikidata.org/entity/Q780442" },
+            "website": { "value": "https://www.uber.com/" }
+        }]}})
+    }
+    /// A class-query answer. Each entry is `(qid, is_org)` and lists an item that
+    /// carries SOME `P31`; a QID left out of the list entirely is untyped, which
+    /// the gate must never treat as a verdict.
+    fn classified(v: &[(&str, bool)]) -> Value {
+        json!({ "results": { "bindings":
+            v.iter().map(|(q, org)| {
+                let mut row = json!({ "item": { "value":
+                    format!("http://www.wikidata.org/entity/{q}") } });
+                if *org {
+                    row["org"] = json!({ "value": "true" });
+                }
+                row
+            }).collect::<Vec<_>>()
+        }})
+    }
+
+    fn org_query(name: &str) -> NameQuery {
+        NameQuery {
+            name: Some(name.into()),
+            entity_type: Some(ORG.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn org_types_are_matched_by_nsid_leaf_and_never_include_places() {
+        assert!(org_shaped(Some(ORG)));
+        assert!(org_shaped(Some("Organization")));
+        assert!(org_shaped(Some("corporation")));
+        // The whole point of the gate: a place-shaped type must not get the
+        // website path, or a chain domain resolves in place of one location.
+        assert!(!org_shaped(Some("info.cursive.organization.restaurant")));
+        assert!(!org_shaped(Some("localBusiness")));
+        assert!(!org_shaped(Some("movie")));
+        assert!(!org_shaped(None));
+        // Orgs still route to the free hub — the org path must never bill.
+        assert_eq!(name_hub_for(Some(ORG)), NameHub::Wikidata);
+    }
+
+    #[tokio::test]
+    async fn org_name_resolves_to_a_qid_and_completes_to_its_website() {
+        // The happy path agent-web's publish depends on: one org name in, a
+        // cluster carrying BOTH the QID (the anchor) and the registrable domain
+        // (what a bare-origin citer would key on) out.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("GET", &search_url("Uber"), uber_search()),
+            // The type gate: all three are typed, only the company is an org.
+            (
+                "GET",
+                &class_url(&["Q780442", "Q7877036", "Q2475886"]),
+                classified(&[("Q780442", true), ("Q7877036", false), ("Q2475886", false)]),
+            ),
+            ("GET", &forward_url("Q780442"), uber_forward()),
+        ]);
+        let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, Status::New);
+        assert_eq!(out.anchor, "wikidata:Q780442");
+        // The GATE reduced three to one, not the hub — and the answer says so
+        // rather than passing this off as a lone hub result.
+        assert_eq!(out.confidence_reason, ConfidenceReason::TypeGateUniqueMatch);
+        assert_eq!(out.confidence, crate::confidence::PLACE_UNIQUE);
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"wikidata:Q780442".to_string()), "keys={keys:?}");
+        assert!(
+            keys.contains(&"domain:uber.com".to_string()),
+            "the P856 crosswalk is what pairs the QID with the origin: keys={keys:?}"
+        );
+        assert!(out.hub_error.is_none());
+        // The QID is on the wire as a URL, which is what a consumer writes into a
+        // record. (The domain is NOT — `domain` has no URL projection by design;
+        // see `KindSpec::to_url`.)
+        let doc = crate::json::resolve_output_json(&out, "resolve_name");
+        assert_eq!(
+            doc["sameAs_urls"][0],
+            "https://www.wikidata.org/wiki/Q780442"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_org_name_refuses_with_candidates() {
+        // Two organizations named Mercury. The type gate removes the planet and
+        // the element; what is left is a genuine ambiguity, and refusing with a
+        // choosable list is the answer — never a pick.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let search = json!({ "search": [
+            { "id": "Q308", "label": "Mercury", "description": "planet" },
+            { "id": "Q1090", "label": "Mercury", "description": "chemical element" },
+            { "id": "Q1130265", "label": "Mercury Records",
+              "description": "record label" },
+            { "id": "Q6819103", "label": "Mercury Financial",
+              "description": "American financial technology company" }
+        ]});
+        let transport = FixtureTransport::from_pairs(vec![
+            ("GET", &search_url("Mercury"), search),
+            (
+                "GET",
+                &class_url(&["Q308", "Q1090", "Q1130265", "Q6819103"]),
+                classified(&[
+                    ("Q308", false),
+                    ("Q1090", false),
+                    ("Q1130265", true),
+                    ("Q6819103", true),
+                ]),
+            ),
+        ]);
+        let out = resolve_name(
+            &g,
+            &org_query("Mercury"),
+            &CompletionCtx::new(Arc::new(transport)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.canonical_id, None);
+        assert_eq!(
+            out.confidence_reason,
+            ConfidenceReason::AmbiguousAmongN(2),
+            "the planet and the element are gone; the two companies remain"
+        );
+        let anchors: Vec<&str> = out.candidates.iter().map(|c| c.anchor.as_str()).collect();
+        assert_eq!(anchors, vec!["wikidata:Q1130265", "wikidata:Q6819103"]);
+        // Each candidate is choosable by a human, and echoable as a `ref`.
+        assert_eq!(
+            out.candidates[0].name.as_deref(),
+            Some("Mercury Records (record label)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_type_gate_leaves_the_hubs_ranking_alone() {
+        // Fail-open: the class query has no fixture (an outage), so the caller
+        // still gets the search's own list rather than an empty answer — and is
+        // TOLD the answer was computed on less than the full evidence.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport =
+            FixtureTransport::from_pairs(vec![("GET", &search_url("Uber"), uber_search())]);
+        let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
+            .await
+            .unwrap();
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(3));
+        assert!(
+            out.hub_error.as_deref().unwrap_or_default().contains("wikidata"),
+            "hub_error={:?}",
+            out.hub_error
+        );
+    }
+
+    #[tokio::test]
+    async fn an_org_website_resolves_to_its_qid_and_completes() {
+        // The reverse path: the caller's only identifier is the homepage. The
+        // domain is Affiliation grain and cannot resolve on its own, so we ask
+        // Wikidata who publishes it and resolve on the QID it hands back.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            (
+                "GET",
+                &website_url("uber.com"),
+                json!({ "results": { "bindings": [{
+                    "item": { "value": "http://www.wikidata.org/entity/Q780442" },
+                    "itemLabel": { "value": "Uber" },
+                    "itemDescription": { "value": "American transportation network company" }
+                }]}}),
+            ),
+            ("GET", &forward_url("Q780442"), uber_forward()),
+        ]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let domain = ExternalId::new("domain", "https://uber.com").unwrap();
+        let mut hub_error = None;
+        let out = resolve_by_website(&g, &domain, &org_query("Uber"), &ctx, &mut hub_error)
+            .await
+            .unwrap()
+            .expect("the website crosswalk answers");
+
+        assert_eq!(out.anchor, "wikidata:Q780442");
+        assert_eq!(out.confidence_reason, ConfidenceReason::HubCrosswalk);
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"wikidata:Q780442".to_string()), "keys={keys:?}");
+        assert!(keys.contains(&"domain:uber.com".to_string()), "keys={keys:?}");
+        assert!(hub_error.is_none());
+
+        // And the crosswalk is a one-time cost: the origin now belongs to the org
+        // cluster, so the same input resolves locally with no hub at all.
+        let local = crate::resolve::resolve_id(&g, domain).await.unwrap();
+        assert_eq!(local.anchor, "wikidata:Q780442");
+    }
+
+    #[tokio::test]
+    async fn a_website_shared_by_two_items_refuses_rather_than_merging_them() {
+        // A company and its foundation on one origin. Committing both QIDs would
+        // fuse two entities on an Affiliation key — the exact false merge the
+        // grain rule exists to prevent.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("example.org"),
+            json!({ "results": { "bindings": [
+                { "item": { "value": "http://www.wikidata.org/entity/Q1" },
+                  "itemLabel": { "value": "Example Inc" },
+                  "itemDescription": { "value": "company" } },
+                { "item": { "value": "http://www.wikidata.org/entity/Q2" },
+                  "itemLabel": { "value": "Example Foundation" },
+                  "itemDescription": { "value": "charitable foundation" } }
+            ]}}),
+        )]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let domain = ExternalId::new("domain", "example.org").unwrap();
+        let mut hub_error = None;
+        let out = resolve_by_website(&g, &domain, &org_query("Example"), &ctx, &mut hub_error)
+            .await
+            .unwrap()
+            .expect("an ambiguous answer is still an answer");
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(out.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        // Nothing was written: neither QID may claim the origin. Asked of the
+        // store directly — `resolve_id` would mint the very entity being denied.
+        assert!(g.find(&domain.key()).await.unwrap().is_none());
+        assert!(g.find("wikidata:Q1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_website_is_remembered_so_the_retry_costs_nothing() {
+        // An ambiguous verdict writes nothing to the graph — neither QID may claim
+        // the origin — so without a memo the identical retry re-spends a budget
+        // unit and a WDQS call on the same refusal, forever.
+        //
+        // The second call is made with a transport holding NO fixtures: reaching
+        // out would error, so an ambiguous answer here can only have come from
+        // local memory.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let two_items = json!({ "results": { "bindings": [
+            { "item": { "value": "http://www.wikidata.org/entity/Q1" },
+              "itemLabel": { "value": "Example Inc" },
+              "itemDescription": { "value": "company" } },
+            { "item": { "value": "http://www.wikidata.org/entity/Q2" },
+              "itemLabel": { "value": "Example Foundation" },
+              "itemDescription": { "value": "charitable foundation" } }
+        ]}});
+        let domain = ExternalId::new("domain", "example.org").unwrap();
+        let query = org_query("Example");
+        let mut hub_error = None;
+
+        let live = CompletionCtx::new(Arc::new(FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("example.org"),
+            two_items,
+        )])));
+        let first = resolve_by_website(&g, &domain, &query, &live, &mut hub_error)
+            .await
+            .unwrap()
+            .expect("the hub answered, ambiguously");
+        assert_eq!(first.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+
+        // The brake, consulted before any budget is reserved.
+        let replay = resolve_by_website_local(&g, &domain, &query)
+            .await
+            .unwrap()
+            .expect("the refusal is remembered");
+        assert_eq!(replay.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        assert_eq!(
+            replay.candidates.iter().map(|c| c.anchor.as_str()).collect::<Vec<_>>(),
+            vec!["wikidata:Q1", "wikidata:Q2"]
+        );
+        assert_eq!(replay.candidates[0].name.as_deref(), Some("Example Inc (company)"));
+
+        // The full path brakes too, not just the Worker's pre-budget step: with a
+        // transport holding NO fixtures — a call would error — the retry still
+        // returns the remembered verdict, and reports no hub failure because no hub
+        // was reached. This is what makes the CLI local-first here as well.
+        let dead = CompletionCtx::new(Arc::new(FixtureTransport::from_pairs(vec![])));
+        let mut retry_error = None;
+        let retry = resolve_by_website(&g, &domain, &query, &dead, &mut retry_error)
+            .await
+            .unwrap()
+            .expect("the crosswalk answers from memory");
+        assert_eq!(retry.confidence_reason, ConfidenceReason::AmbiguousAmongN(2));
+        assert!(retry_error.is_none(), "no hub was called: {retry_error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_identity_less_owner_of_the_domain_converges_on_the_next_request() {
+        // The third ownership state, between "nobody holds the domain" and "an
+        // identity-BEARING cluster holds it": a domain-only row, which is what
+        // `/ingest` and the CLI leave behind. Guard 2 lets it through — correctly,
+        // there is no identity to protect — but the commit will not hand a held
+        // domain to a QID the graph has never seen, so the QID/domain pair does not
+        // form on the first pass. It is a transient SPLIT (the safe direction),
+        // never a merge, and the second request converges.
+        //
+        // The forward crosswalk is deliberately given NO website here. That is what
+        // isolates this case: in the ordinary run we found the item BY its P856, so
+        // the same pass re-harvests that website and the absorption completes
+        // immediately (see `an_org_website_resolves_to_its_qid_and_completes`).
+        let g = SqliteStore::open_in_memory().unwrap();
+        let seeded = crate::resolve::commit_record(
+            &g,
+            &EntityRecord {
+                entity_type: Some(ORG.into()),
+                name: Some("Example".into()),
+                same_as: vec![ExternalId::new("domain", "example.org").unwrap()],
+            },
+        )
+        .await
+        .unwrap();
+        let seed_cid = seeded.canonical_id.clone().unwrap();
+
+        let website = json!({ "results": { "bindings": [{
+            "item": { "value": "http://www.wikidata.org/entity/Q1" },
+            "itemLabel": { "value": "Example Inc" }
+        }]}});
+        // The forward hop answers about the item but volunteers no P856.
+        let forward = json!({ "results": { "bindings": [{
+            "item": { "value": "http://www.wikidata.org/entity/Q1" }
+        }]}});
+        let transport = || {
+            Arc::new(FixtureTransport::from_pairs(vec![
+                ("GET", &website_url("example.org"), website.clone()),
+                ("GET", &forward_url("Q1"), forward.clone()),
+            ])) as Arc<dyn HttpTransport>
+        };
+        let domain = ExternalId::new("domain", "example.org").unwrap();
+        let query = org_query("Example");
+
+        // Pass 1: the QID resolves, but alone — the held domain is not stolen.
+        let first = resolve_by_website(
+            &g,
+            &domain,
+            &query,
+            &CompletionCtx::new(transport()),
+            &mut None,
+        )
+        .await
+        .unwrap()
+        .expect("the crosswalk answers");
+        assert_eq!(first.anchor, "wikidata:Q1");
+        let first_keys: Vec<String> = first.same_as.iter().map(|i| i.key()).collect();
+        assert_eq!(first_keys, vec!["wikidata:Q1".to_string()], "the pair has not formed yet");
+        assert_ne!(
+            first.canonical_id.as_deref(),
+            Some(seed_cid.as_str()),
+            "a transient split, not a merge into the brand row"
+        );
+
+        // Pass 2: the QID now has an owner, so the identity-hits branch absorbs the
+        // identity-less one and both keys land in a single cluster.
+        let second = resolve_by_website(
+            &g,
+            &domain,
+            &query,
+            &CompletionCtx::new(transport()),
+            &mut None,
+        )
+        .await
+        .unwrap()
+        .expect("the crosswalk answers again");
+        let second_keys: Vec<String> = second.same_as.iter().map(|i| i.key()).collect();
+        assert!(second_keys.contains(&"wikidata:Q1".to_string()), "keys={second_keys:?}");
+        assert!(
+            second_keys.contains(&"domain:example.org".to_string()),
+            "converged: keys={second_keys:?}"
+        );
+        // One entity owns both keys now — the split healed rather than persisting.
+        assert_eq!(
+            g.find("domain:example.org").await.unwrap(),
+            g.find("wikidata:Q1").await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nameless_item_still_gives_the_confirm_flow_a_label() {
+        // A website-only request (no `name`) for an item with no English label. The
+        // entity must not be minted nameless: the next bare-origin publish returns
+        // `ambiguous_among_n(1)`, and a candidate with `name: null` is dropped by a
+        // consumer that needs a label AND a ref to render a choice — leaving it with
+        // nothing to confirm and an "underspecified" refusal instead of the org flow.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            (
+                "GET",
+                &website_url("example.org"),
+                // No `itemLabel`, no `itemDescription` — the hub knows the item and
+                // can say nothing about it in English.
+                json!({ "results": { "bindings": [{
+                    "item": { "value": "http://www.wikidata.org/entity/Q1" }
+                }]}}),
+            ),
+            (
+                "GET",
+                &forward_url("Q1"),
+                json!({ "results": { "bindings": [{
+                    "item": { "value": "http://www.wikidata.org/entity/Q1" },
+                    "website": { "value": "https://example.org/" }
+                }]}}),
+            ),
+        ]);
+        let query = NameQuery {
+            entity_type: Some(ORG.into()),
+            ..Default::default()
+        };
+        let out = resolve_by_website(
+            &g,
+            &ExternalId::new("domain", "example.org").unwrap(),
+            &query,
+            &CompletionCtx::new(Arc::new(transport)),
+            &mut None,
+        )
+        .await
+        .unwrap()
+        .expect("resolved");
+        assert_eq!(
+            out.name.as_deref(),
+            Some("example.org"),
+            "a poor name, but a perfectly good label — and never null"
+        );
+
+        // The shape the consumer actually sees on the next bare-origin publish.
+        let repeat = crate::resolve::commit_record_with_opts(
+            &g,
+            &EntityRecord {
+                entity_type: Some(ORG.into()),
+                name: None,
+                same_as: vec![ExternalId::new("domain", "example.org").unwrap()],
+            },
+            "resolve_name",
+            crate::resolve::CommitOpts {
+                allow_affiliation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeat.confidence_reason, ConfidenceReason::AmbiguousAmongN(1));
+        assert_eq!(repeat.candidates[0].name.as_deref(), Some("example.org"));
+    }
+
+    #[tokio::test]
+    async fn the_website_memo_cannot_collide_with_a_name_query() {
+        // The memo shares the name-cardinality table, so the key has to be one no
+        // name can normalize to. `name_key` trims non-alphanumerics from the edges
+        // of every word, so a leading `@` is unreachable from any user input.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let domain = ExternalId::new("domain", "example.org").unwrap();
+        let query = org_query("Example");
+        let two = json!({ "results": { "bindings": [
+            { "item": { "value": "http://www.wikidata.org/entity/Q1" } },
+            { "item": { "value": "http://www.wikidata.org/entity/Q2" } }
+        ]}});
+        let ctx = CompletionCtx::new(Arc::new(FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("example.org"),
+            two,
+        )])));
+        resolve_by_website(&g, &domain, &query, &ctx, &mut None)
+            .await
+            .unwrap();
+
+        // A name query for the literal key string must NOT find the memo.
+        for name in ["@website:example.org", "website:example.org", "example.org"] {
+            let q = NameQuery {
+                name: Some(name.into()),
+                entity_type: Some(ORG.into()),
+                ..Default::default()
+            };
+            assert!(
+                resolve_name_local(&g, &q).await.unwrap().is_none(),
+                "a name query reached the website memo: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_single_org_candidate_never_buys_a_type_gate_call() {
+        // The <2 short-circuit, pinned. The class query has NO fixture, so if the
+        // gate ran it would fail and report a `hub_error`; a clean resolution is
+        // proof it never ran. (With one candidate the hub has already given an
+        // unambiguous answer — there is nothing to disambiguate, and second-
+        // guessing the only answer we have is not what a disambiguator is for.)
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            (
+                "GET",
+                &search_url("Uber"),
+                json!({ "search": [
+                    { "id": "Q780442", "label": "Uber",
+                      "description": "American transportation network company" }
+                ]}),
+            ),
+            ("GET", &forward_url("Q780442"), uber_forward()),
+        ]);
+        let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
+            .await
+            .unwrap();
+        assert_eq!(out.anchor, "wikidata:Q780442");
+        assert!(
+            out.hub_error.is_none(),
+            "the type gate must not have been called: {:?}",
+            out.hub_error
+        );
+        // And a genuinely-unique HUB answer keeps the old reason: only the
+        // gate-narrowed path earns the new one.
+        assert_eq!(out.confidence_reason, ConfidenceReason::PlaceUniqueMatch);
+    }
+
+    #[tokio::test]
+    async fn an_untyped_candidate_survives_the_gate_and_keeps_the_answer_ambiguous() {
+        // The absence rule, and the reason it matters: only a POSITIVE
+        // contradiction removes a candidate. Three hits — a company (typed org),
+        // an album (typed, not an org), and an item Wikidata has never typed at
+        // all. The gate removes exactly the album.
+        //
+        // What is left is two, so the answer stays a refusal with candidates. The
+        // older behavior — remove anything not positively classified — would have
+        // dropped the untyped item too, narrowed to one, and auto-committed a
+        // resolution on the strength of a gap in Wikidata's coverage.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![
+            ("GET", &search_url("Uber"), uber_search()),
+            (
+                "GET",
+                &class_url(&["Q780442", "Q7877036", "Q2475886"]),
+                // Q2475886 is absent from the answer entirely: no P31 at all.
+                classified(&[("Q780442", true), ("Q7877036", false)]),
+            ),
+        ]);
+        let out = resolve_name(&g, &org_query("Uber"), &CompletionCtx::new(Arc::new(transport)))
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, Status::Unresolved);
+        assert_eq!(
+            out.confidence_reason,
+            ConfidenceReason::AmbiguousAmongN(2),
+            "an untyped candidate must not be filtered into an auto-commit"
+        );
+        let anchors: Vec<&str> = out.candidates.iter().map(|c| c.anchor.as_str()).collect();
+        assert_eq!(anchors, vec!["wikidata:Q780442", "wikidata:Q2475886"]);
+        assert!(
+            !anchors.contains(&"wikidata:Q7877036"),
+            "the album is the one thing Wikidata positively contradicted"
+        );
+        // Nothing was committed on the strength of a filtered list.
+        assert!(g.find("wikidata:Q780442").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_website_path_never_runs_for_a_place_shaped_type() {
+        // The Souvla case. `souvla.com` is the chain; the caller meant one
+        // location. If this ever crosswalked, every location that cited the chain
+        // domain would acquire the SAME chain QID and fuse into one entity.
+        //
+        // The transport carries the answer that WOULD fuse them, so this asserts
+        // the guard and not merely the absence of a fixture.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport = FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("souvla.com"),
+            json!({ "results": { "bindings": [{
+                "item": { "value": "http://www.wikidata.org/entity/Q99999" },
+                "itemLabel": { "value": "Souvla" },
+                "itemDescription": { "value": "restaurant chain" }
+            }]}}),
+        )]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let domain = ExternalId::new("domain", "souvla.com").unwrap();
+        let mut hub_error = None;
+        for entity_type in ["info.cursive.organization.restaurant", "localBusiness", "movie"] {
+            let query = NameQuery {
+                name: Some("Souvla".into()),
+                entity_type: Some(entity_type.into()),
+                ..Default::default()
+            };
+            let out = resolve_by_website(&g, &domain, &query, &ctx, &mut hub_error)
+                .await
+                .unwrap();
+            assert!(out.is_none(), "{entity_type} must not crosswalk a shared domain");
+        }
+        assert!(hub_error.is_none(), "no hub was called at all");
+    }
+
+    #[tokio::test]
+    async fn a_shared_domain_never_fuses_two_disjoint_identities() {
+        // The grain-rule regression guard, on the new path.
+        //
+        // Two Souvla locations, each with its own Identity key, sharing one brand
+        // domain. Even asked as an ORGANIZATION — the type that does get the
+        // website path — the crosswalk must decline, because the domain is already
+        // owned by an identity-bearing cluster. The two locations stay distinct.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let hayes = EntityRecord {
+            entity_type: Some("restaurant".into()),
+            name: Some("Souvla Hayes Valley".into()),
+            same_as: vec![
+                ExternalId::google_place_id("ChIJhayes").unwrap(),
+                ExternalId::new("domain", "souvla.com").unwrap(),
+            ],
+        };
+        let marina = EntityRecord {
+            entity_type: Some("restaurant".into()),
+            name: Some("Souvla Marina".into()),
+            same_as: vec![
+                ExternalId::google_place_id("ChIJmarina").unwrap(),
+                ExternalId::new("domain", "souvla.com").unwrap(),
+            ],
+        };
+        let a = crate::resolve::commit_record(&g, &hayes).await.unwrap().canonical_id.unwrap();
+        let b = crate::resolve::commit_record(&g, &marina).await.unwrap().canonical_id.unwrap();
+        assert_ne!(a, b, "the pre-existing grain rule keeps them apart");
+
+        let transport = FixtureTransport::from_pairs(vec![(
+            "GET",
+            &website_url("souvla.com"),
+            json!({ "results": { "bindings": [{
+                "item": { "value": "http://www.wikidata.org/entity/Q99999" },
+                "itemLabel": { "value": "Souvla" },
+                "itemDescription": { "value": "restaurant chain" }
+            }]}}),
+        )]);
+        let ctx = CompletionCtx::new(Arc::new(transport));
+        let mut hub_error = None;
+        let out = resolve_by_website(
+            &g,
+            &ExternalId::new("domain", "souvla.com").unwrap(),
+            &org_query("Souvla"),
+            &ctx,
+            &mut hub_error,
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none(), "an identity-bearing owner keeps its domain");
+
+        // Still two entities, still their own anchors, and neither acquired a QID.
+        let hayes_now = crate::resolve::resolve_id(&g, ExternalId::google_place_id("ChIJhayes").unwrap())
+            .await
+            .unwrap();
+        let marina_now = crate::resolve::resolve_id(&g, ExternalId::google_place_id("ChIJmarina").unwrap())
+            .await
+            .unwrap();
+        assert_ne!(hayes_now.canonical_id, marina_now.canonical_id);
+        for e in [&hayes_now, &marina_now] {
+            assert!(
+                !e.same_as.iter().any(|i| i.kind_tag() == "wikidata"),
+                "no chain QID may reach a location: {:?}",
+                e.same_as.iter().map(|i| i.key()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_committed_candidate_completes_to_its_website() {
+        // The confirm/retry path. The caller picked a candidate from an ambiguous
+        // answer and echoed its `ref` back as an identifier; the Worker commits it
+        // under the STRICT grain rule, then completes. Without the completion the
+        // caller gets a QID and none of its crosslinks — and the origin/QID pair
+        // that lets bare-origin citers and QID citers land together is missing.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let transport =
+            FixtureTransport::from_pairs(vec![("GET", &forward_url("Q780442"), uber_forward())]);
+        let ctx = CompletionCtx::new(Arc::new(transport)).free_hubs_only();
+
+        let record = EntityRecord {
+            entity_type: Some(ORG.into()),
+            name: Some("Uber".into()),
+            same_as: vec![ExternalId::new("wikidata", "Q780442").unwrap()],
+        };
+        let seed = crate::resolve::commit_record_with_opts(
+            &g,
+            &record,
+            "resolve_name",
+            crate::resolve::CommitOpts {
+                allow_affiliation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        let out = complete_committed(&g, seed, &ctx, &mut 0).await.unwrap();
+
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert!(keys.contains(&"domain:uber.com".to_string()), "keys={keys:?}");
+        assert_eq!(out.anchor, "wikidata:Q780442");
+    }
+
+    #[tokio::test]
+    async fn free_hub_completion_never_reaches_the_billable_hub() {
+        // The budget invariant, structurally: a context with the metered hubs off
+        // must not call Place Details even when the cluster hands it a place_id.
+        // The fixture holds the answer that WOULD be harvested, so this asserts
+        // the gate rather than a missing fixture.
+        let g = SqliteStore::open_in_memory().unwrap();
+        let details = "https://places.googleapis.com/v1/places/ChIJN1";
+        let transport = FixtureTransport::from_pairs(vec![(
+            "GET",
+            details,
+            json!({ "websiteUri": "https://bluebottlecoffee.com/" }),
+        )]);
+        let ctx = CompletionCtx::new(Arc::new(transport)).free_hubs_only();
+        let record = EntityRecord {
+            same_as: vec![ExternalId::google_place_id("ChIJN1").unwrap()],
+            ..Default::default()
+        };
+        let out = resolve_and_complete(&g, &record, &ctx).await.unwrap();
+        let keys: Vec<String> = out.same_as.iter().map(|i| i.key()).collect();
+        assert_eq!(keys, vec!["google_place_id:ChIJN1".to_string()], "keys={keys:?}");
+    }
+}
+

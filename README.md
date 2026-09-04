@@ -233,6 +233,61 @@ distinct entities returns them as `candidates` (ambiguous) rather than guessing.
 Alias/typo tolerance (e.g. `SF` ↔ `San Francisco`) is a deferred, evidence-gated
 layer pointed *inward* at this index.
 
+## Resolving an organization
+
+An organization is the one entity type whose natural identifier is a **bare
+homepage** — and a registrable domain is `Grain::Affiliation`, so on its own it
+cannot resolve (it may name a chain). Two paths close that without weakening the
+grain rule, both on the free hub:
+
+```sh
+# By name: Wikidata search, then a P31/P279* type gate so the album and the
+# German preposition drop out and only the company is left.
+sameas resolve --name Uber --type organization --complete
+
+# By homepage: Wikidata's P856 (official website), read in reverse. The domain
+# does not resolve the entity — it buys the QID that does.
+sameas resolve --domain uber.com --type organization --complete
+```
+
+Both return the QID **and** the registrable domain in the cluster: an
+organization identified by a bare origin and one identified by its Wikidata page
+are the same entity, and that pair is what says so. (One exception, and it
+self-heals: if the domain is already held by an identity-less row — a domain-only
+record from `ingest` — the first request returns the QID alone, because a held
+domain is never stolen for a QID the graph has not seen before, and the next
+request converges the two into one cluster.)
+
+The rules, all of which are grain arguments rather than tuning:
+
+- **Org-shaped types only** (the NSID leaf: `organization`, `corporation`, `ngo`,
+  …). A `restaurant` citing `souvla.com` must never crosswalk to the chain's QID
+  — every location would acquire the *same* QID and fuse into one entity. Place
+  types route to Google Places by name, as before.
+- **Never over an identity-bearing owner.** If the domain already belongs to a
+  cluster with an Identity key, that cluster is a specific thing and the domain
+  is its affiliation; the crosswalk declines.
+- **One item or none.** Two Wikidata items sharing a website (a company and its
+  foundation) come back as `candidates`, never as a merge. The P856 match is an
+  exact `VALUES` lookup of the canonical URL spellings — a substring test would
+  also match `notuber.com`. That refusal is *remembered* (keyed on the domain), so
+  the identical retry is answered locally and costs no hub call — the same brake
+  the name path has, and applied inside the crosswalk itself, so the CLI and the
+  HTTP route both get it. A resolved homepage needs no memo: the domain joins the
+  org's cluster, so the repeat is an ordinary graph hit.
+- **The type gate removes only what Wikidata contradicts.** It asks "does Wikidata
+  say this is something else?", and only a *yes* drops a candidate: an item with no
+  `P31` at all, or one whose subclass chain reaches no root we listed, survives —
+  silence is not a verdict. It never ranks or breaks a tie among the survivors, and
+  a gate that answers nothing (or fails) leaves the hub's own ranking untouched.
+  When the removals happen to leave **exactly one**, that survivor is committed
+  like any other unique answer, but labelled `type_gate_unique_match` rather than
+  `place_unique_match` — the hub did not answer uniquely, we narrowed it, and a
+  caller deciding whether to confirm with its user needs to tell those apart. Two
+  or more survivors still refuse with `ambiguous_among_n` + candidates.
+- **Free tier only.** Organizations route to Wikidata, which needs no key and
+  costs nothing. Nothing on this path can reach Google Places.
+
 ## CLI usage
 
 ```sh
